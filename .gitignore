@@ -1,0 +1,24 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock  # keep for bins later; ignore for now while pre-code
+
+# Node (if a client/UI lands here)
+node_modules/
+dist/
+
+# Local secrets / crypto stores — NEVER commit
+*.env
+.env*
+*.key
+*.pem
+crypto-store/
+*.sqlite
+*.sqlite3
+*.db
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
