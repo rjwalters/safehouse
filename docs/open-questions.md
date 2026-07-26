@@ -3,13 +3,28 @@
 Things to resolve before (or early in) coding. Flagged by the 2026-07-26 research as *not* covered
 by verified claims — treat as unanswered, not answered-negatively.
 
-## Q-A. Prior art — don't reinvent (highest priority)
-The research corpus had **no verified evidence** on existing LLM-on-Matrix bots (baibot,
-matrix-chatgpt-bot, maubot plugins) or any agent-native / multi-agent-coordination-on-Matrix project,
-and nothing on combining an A2A-style task/handoff layer with a Matrix surface. **Do a dedicated
-prior-art scan before writing the daemon** — someone may have built most of `safehoused` already.
-- Look at: baibot, matrix-nio bot examples, mautrix-* stacks, maubot, matrix-rust-sdk bot examples.
-- Question: does anything already do "one device, many personas, local dispatch"?
+## Q-A. Prior art — ✅ ANSWERED (see research/2026-07-26-prior-art.md)
+**Nobody built the "one device, many keyless personas, local dispatch" daemon → BUILD FRESH** on
+matrix-rust-sdk. **CRIB `baibot` + `mxlink`** (etke.cc, Rust, active, AGPL-3.0) for the persistent-E2E
+skeleton; rebuild pantalaimon's proxy shape (archived) + Hermes's decrypt-and-dispatch pattern. No
+red-flag "stop, it exists" project. Remaining sub-gaps promoted to Q-G/Q-H/Q-I below.
+
+## Q-G. MSC4190 / headless cross-signing bootstrap (BIGGEST TECHNICAL RISK)
+Unverified: does matrix-rust-sdk support creating a device + bootstrapping cross-signing **without**
+user-interactive auth (dehydrated devices / MSC4190), and do baibot/mxlink already implement that
+headless-login + key-backup path? This is the daemon's login story — resolve early, it gates
+everything. Read baibot/mxlink source directly.
+
+## Q-H. Matrix MCP server (complement or partial substitute?)
+Does a maintained MCP-server-for-Matrix exist that a Claude Code agent could use as a tool — and if
+so, who holds the E2E keys? Could complement the daemon (agents reach Matrix via MCP through the local
+daemon) or partially substitute for it. Unanswered by research.
+
+## Q-I. License — AGPL-3.0 on baibot/mxlink
+baibot and mxlink are AGPL-3.0. Depending on `mxlink` as a crate (vs. reading it for patterns) makes
+`safehoused` AGPL — likely fine (safehouse is FOSS anyway) but **decide the license consciously**, and
+mind the daemon↔agent process boundary (agents talk to the daemon over a socket, so they're separate
+programs, not AGPL-linked — worth confirming).
 
 ## Q-B. Ephemeral-agent history visibility
 The daemon (one device) accumulates Megolm room keys and stays online, so it decrypts fine. But

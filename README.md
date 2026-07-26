@@ -53,14 +53,19 @@ their next run — while a human sees everything and can @-mention to intervene.
   ratchet (one writer → concurrency is trivial); is the always-online component so agents stay
   ephemeral behind it.
 
+**New agent picking this up? Start with [`docs/next-agent.md`](docs/next-agent.md).**
+
 See [`docs/design.md`](docs/design.md) for the full design, [`docs/decisions.md`](docs/decisions.md)
 for the choices and why, and [`docs/open-questions.md`](docs/open-questions.md) for what still needs
 answering before code.
 
 ## Status
 
-**Design phase.** No code yet. The architecture and stack below are backed by two deep-research
-passes (2026-07-26), archived under [`docs/research/`](docs/research/).
+**Design phase, ready to build.** No code yet. The architecture and stack are backed by three
+deep-research passes (2026-07-26) archived under [`docs/research/`](docs/research/): buy-vs-build,
+Matrix-as-foundation, and a prior-art scan. Prior-art verdict: **build `safehoused` fresh on
+matrix-rust-sdk, cribbing `baibot`/`mxlink`** — nobody has built the one-device/many-keyless-personas
+daemon.
 
 ## Chosen stack (provisional)
 
