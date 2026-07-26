@@ -13,7 +13,9 @@ daemon-per-host model sidesteps** (see [`../decisions.md#d5`](../decisions.md)).
 ### Homeserver
 - **conduwuit is obsolete.** Two live Rust successors, both "stable" per matrix.org:
   **continuwuity** (community continuation) and **tuwunel** (former maintainer's official successor).
-  Run on 64–256 MB RAM, single binary + SQLite.
+  Run on 64–256 MB RAM, single binary + SQLite. **⚠️ Corrected 2026-07-26 by
+  `2026-07-26-homeserver.md`: the RAM figure is wrong — cache defaults scale with core count, so
+  budget 2–4 GB and clamp the cache modifiers explicitly.**
   [continuwuity](https://codeberg.org/continuwuity/continuwuity) ·
   [tuwunel](https://github.com/matrix-construct/tuwunel) ·
   [matrix.org/ecosystem/servers](https://matrix.org/ecosystem/servers/)

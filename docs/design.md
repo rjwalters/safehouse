@@ -44,15 +44,53 @@ self-hosting the server too.
 
 The heart of the system and the reusable IP.
 
-- Owns **one Matrix device/identity per host**, verified/cross-signed **once** (by a human, from
-  their phone/Element).
-- Holds the **E2E crypto store** (vodozemac via matrix-rust-sdk). Persistent, crash-safe.
+- Owns **one Matrix device/identity per host**, on its **own dedicated Matrix account**
+  (`@safehoused:host`) — never a second device on the human's account (**D9**). It **cross-signs
+  itself** at first login; no human verification step is required (**D10**).
+- Holds the **E2E crypto store** (vodozemac via matrix-rust-sdk ≥ 0.18.0). Persistent, crash-safe,
+  encrypted at rest.
 - Runs the **sync loop**; performs **all** encrypt/decrypt.
 - **Serializes the ratchet** — a single daemon is a single writer, so concurrent sends from multiple
   local agents are trivially ordered (a strict improvement over many bot-devices fighting over keys).
 - Exposes a **local unix-socket RPC** to agents (perms-gated, never a network port):
   - `send(room, envelope)` — agent hands the daemon a plaintext message; daemon encrypts + posts.
   - `subscribe(room)` / dispatch — daemon delivers/wakes the agent on relevant inbound events.
+
+The socket is **AF_UNIX only, permission-gated, never a TCP listener**, and there is **no in-process
+plugin ABI**. That is a security property *and* — since it is what keeps third-party agents legally
+separate works — a licensing invariant (**D8**). Do not add a `--listen` flag.
+
+#### 4.1.1 Identity and key lifecycle (verified 2026-07-26, `research/2026-07-26-headless-login.md`)
+
+Fully headless. The **only** human action in the daemon's whole lifecycle is creating the bot account
+and handing over a password.
+
+**First run.** Log in with password → matrix-rust-sdk's initialization task uploads device keys,
+creates and uploads the cross-signing identity, and **uploads a self-signature over the daemon's own
+device**. No user-interactive auth challenge, because the Matrix spec (MSC3967, stable since v1.11)
+exempts a user's *first-ever* cross-signing upload. Then enable secret storage + key backup with the
+configured recovery passphrase.
+
+That self-signature is exactly the bar Element's "exclude insecure devices" enforces — **owner-signed,
+not interactively-verified**. This is why D9 matters: the exemption only applies to an account with no
+existing master key, so the daemon must be its own user.
+
+**Every later run.** Restore the persisted session against the *same* store passphrase and database
+directory. Bootstrap correctly no-ops. **Invariant:** if the session blob is missing but the SQLite
+store exists, the store is undecryptable — purge and cold-start. A half-written state here is the most
+likely way to brick the daemon.
+
+**Disaster recovery (crypto store lost, account intact).** Delete the store, cold-start. Bootstrap
+no-ops, then `recover(passphrase)` pulls the private self-signing key back from secret storage,
+**self-signs the replacement device**, re-enables backup, and pulls every room key down. Still no
+human. This is why the recovery passphrase is **required config, not optional** — without it a
+replacement device is permanently unsigned and invisible.
+
+**Non-negotiable settings** (SDK defaults are all wrong for us):
+`auto_enable_cross_signing: true`, `auto_enable_backups: true`,
+`backup_download_strategy: OneShot`, `recovery_reset_allowed: false` (reset orphans every room key
+already in backup), and `matrix-sdk ≥ 0.18.0` (CVE-2026-45056 is a to-device sender-binding gap fixed
+in 0.16.1 — directly our threat model).
 
 ### 4.2 Agents — ephemeral, behind the daemon
 
@@ -68,11 +106,22 @@ The heart of the system and the reusable IP.
   room.
 - Is a **remote control**, not just a mirror: @-mention an agent from your phone → the target host's
   daemon wakes that agent with your directive.
+- **Optional, cosmetic:** a one-time user-to-user verification of `@safehoused:host` from Element
+  gets a green check on the daemon's *user*. Operator confidence only — it is not required for
+  anything to work (D10). If we ever implement the daemon side of this, auto-confirming a SAS must be
+  gated behind an explicitly operator-opened window, or we'd auto-accept a MITM'd verification.
 
 ### 4.4 Homeserver
 
-- **Lightweight Rust** (continuwuity / tuwunel), **federation off**, single box.
+- **tuwunel ≥ v1.8.2** (lightweight Rust), **federation off**, single box. Chosen over continuwuity
+  on current machine-verified E2E conformance — see `decisions.md` D12.
 - Stores the encrypted log (durability + history + recovery for free).
+- **Federation must be off before first boot** (both servers warn that changing it later breaks
+  things), `allow_registration = false`, and the cache modifiers clamped explicitly — defaults scale
+  with core count and will happily eat 384 MB of block cache on a 4-core box. Budget **2–4 GB**, not
+  the 64–256 MB originally assumed.
+- **Avoid OIDC.** It breaks bot-token minting on continuwuity and forces a browser-visited approval
+  URL for cross-signing re-upload on tuwunel. Plain password auth for the daemon.
 
 ## 5. Message flow (one path for everyone)
 
@@ -101,13 +150,27 @@ dispatch to / spawn the target local agent.* No appservice, no push notification
 scale. (If a host's daemon ever needs to sleep, Sygnal/UnifiedPush push-wake of the daemon is the
 fallback — see open questions.)
 
+**How the agent is actually woken** is a v0-vs-v1 split. v0 is our own unix-socket dispatch. For v1,
+**Claude Code Channels** is the sanctioned mechanism for exactly this step: Claude Code spawns a
+channel as an MCP stdio subprocess and receives pushed notifications. The plan is
+`safehoused-channel`, a thin **keyless** shim that dials the daemon's socket and translates — the
+daemon stays the only device, only crypto store, and only enforcement point for `from`. Channels is
+still a research preview whose protocol contract may change, so it stays off the v0 critical path.
+See `research/2026-07-26-mcp-and-channels.md`.
+
 ## 7. Why this stack (research-backed, 2026-07-26)
 
 The 2026 Matrix research surfaced a central architectural trade:
 
 - **Encrypted appservices** (MSC3202/MSC4203) give the ideal "wake an idle agent over HTTP, with
-  E2E" — but they are **Synapse-only** (lightweight Rust servers and the matrix-rust-sdk appservice
-  crate do not support them; MSC3202 is still an unmerged, being-superseded proposal).
+  E2E" — but at the time we chose, they were **Synapse-only**, and MSC3202 was an unmerged,
+  being-superseded proposal.
+
+  *Updated 2026-07-26: tuwunel v1.8.2 shipped MSC3202 and MSC4203 on 2026-07-17, so "Synapse-only" is
+  no longer true. The conclusion is unaffected, and in fact better-supported — round-2 research found
+  that **there is no Rust appservice SDK at all** (`matrix-sdk-appservice` is a 2022 name
+  placeholder) and that **tuwunel's appservice device path is broken** (issue #327). The path stays
+  closed to us in practice. See `decisions.md` D5's amendment.*
 - **Persistent client-SDK bot** = natural E2E on any server, but "must stay online."
 
 **safehouse's daemon-per-host model dissolves this trade.** We already committed to an always-on
