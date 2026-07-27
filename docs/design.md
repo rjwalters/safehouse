@@ -54,7 +54,10 @@ The heart of the system and the reusable IP.
   local agents are trivially ordered (a strict improvement over many bot-devices fighting over keys).
 - Exposes a **local unix-socket RPC** to agents (perms-gated, never a network port):
   - `send(room, envelope)` — agent hands the daemon a plaintext message; daemon encrypts + posts.
-  - `subscribe(room)` / dispatch — daemon delivers/wakes the agent on relevant inbound events.
+  - `check(persona)` / `read(room)` — agent pulls its per-persona mailbox (durable, cursor-tracked)
+    or room history **on its own cadence**; the daemon never pushes or spawns (**D16**, **D17**). A
+    live-connected socket may additionally receive low-latency delivery, but that is an optimization
+    over the same pull-based mailbox, not a separate wake path.
 
 The socket is **AF_UNIX only, permission-gated, never a TCP listener**, and there is **no in-process
 plugin ABI**. That is a security property *and* — since it is what keeps third-party agents legally
@@ -104,8 +107,9 @@ in 0.16.1 — directly our threat model).
 - **Element** (or any Matrix client), on phone/desktop, verified device with **key backup on**.
 - Gets the **glass-box view**: sees all agent coordination live, because everything went through the
   room.
-- Is a **remote control**, not just a mirror: @-mention an agent from your phone → the target host's
-  daemon wakes that agent with your directive.
+- Is a **remote control**, not just a mirror: @-mention an agent from your phone → the message lands
+  in the target persona's mailbox on the target host, and that agent picks it up on its own next
+  check-in (**D16**) — the daemon delivers/queues, it does not spawn or push-wake the agent (see §6).
 - **Optional, cosmetic:** a one-time user-to-user verification of `@safehoused:host` from Element
   gets a green check on the daemon's *user*. Operator confidence only — it is not required for
   anything to work (D10). If we ever implement the daemon side of this, auto-confirming a SAS must be
@@ -136,23 +140,43 @@ agent A ──send()──▶ daemon(A host) ──encrypt──▶ room ──�
                    daemon(A host) sync       daemon(B host) sync        phone (Element)
                    sees event,               sees event,                shows it
                    `to: B`? B not local →     `to: B`? B local →
-                   ignore (+ don't loop       decrypt, dispatch/wake
-                    back to sender A)          agent B
+                   ignore (+ don't loop       decrypt, file into
+                    back to sender A)          B's mailbox (§6)
 ```
 
 The only special case is a trivial "don't deliver A's own message back to A" filter. The phone is a
-first-class recipient automatically — no dual-delivery consistency to reason about.
+first-class recipient automatically — no dual-delivery consistency to reason about. Filing into B's
+mailbox is not a wake or a spawn — B reads it whenever it next checks in (**D16**, **D17**).
 
-## 6. Wake
+## 6. Wake (pull, not push — D16, D17)
 
-Because the daemon is **always online by design**, "wake" is just: *daemon sees a room event →
-dispatch to / spawn the target local agent.* No appservice, no push notifications needed at this
-scale. (If a host's daemon ever needs to sleep, Sygnal/UnifiedPush push-wake of the daemon is the
-fallback — see open questions.)
+**Waking an agent is not safehouse's job.** The daemon is a pure always-on substrate: it holds room
+state (the source of truth, §3/D6), files every inbound envelope into the recipient persona's durable
+**mailbox** (D17), and accepts sends. It never spawns, launches, or push-notifies an agent process.
+*When* an agent runs and checks its mailbox is entirely the agent's own choice — exactly like a human
+checking their phone on their own cadence: idle while heads-down on a task, frequent while awaiting a
+reply. Scheduling that cadence belongs to whatever runs the agent (a supervisor like loom, cron, a
+long-lived process, or a human at a REPL), not to the message layer. See `decisions.md` **D16** for
+the full rationale and **D17** for the mailbox primitive this section assumes.
 
-**How the agent is actually woken** is a v0-vs-v1 split. v0 is our own unix-socket dispatch. For v1,
-**Claude Code Channels** is the sanctioned mechanism for exactly this step: Claude Code spawns a
-channel as an MCP stdio subprocess and receives pushed notifications. The plan is
+Concretely:
+
+- The daemon's sync loop decrypts every inbound event and, per §5, files it into the mailbox of each
+  locally-hosted recipient persona (or all local personas, for a broadcast `to: "*"`).
+- Agents pull from their mailbox on their own schedule — via the `check` MCP tool / socket RPC (§4.1),
+  which returns unread envelopes and advances a per-persona read cursor. Because the mailbox is
+  durable and rebuildable from the room (D17), an agent that was offline for hours still gets exactly
+  what it missed on its next check-in; nothing is lost by not being "awake" when a message arrived.
+- The envelope's `wake` field and the "suggested `wake`?" classification in `envelope-v1.md` §4 are
+  **advisory metadata only** — a hint for an *external* waker (see below), never an instruction the
+  daemon itself acts on.
+
+**External wakers are opt-in, not required.** At ≤20-participant scale a fully pull-based agent (one
+that checks its mailbox each time it happens to run) already works. For agents that want lower
+latency, an optional external layer may use the advisory `wake` hint to decide when to actually invoke
+the agent — this is a **v0-vs-v1** split. v0 needs nothing beyond the mailbox above. For v1, **Claude
+Code Channels** is one such optional waker: Claude Code can run a channel as an MCP stdio subprocess
+and receive pushed notifications that prompt it to check its mailbox. The plan is
 `safehoused-channel`, a thin **keyless** shim that dials the daemon's socket and translates — the
 daemon stays the only device, only crypto store, and only enforcement point for `from`. Channels is
 still a research preview whose protocol contract may change, so it stays off the v0 critical path.
