@@ -165,6 +165,178 @@ fn html_escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    // ---- valid_persona -------------------------------------------------
+
+    #[test]
+    fn valid_persona_accepts_lowercase_digits_underscore() {
+        assert!(valid_persona("writer_agent"));
+        assert!(valid_persona("agent1"));
+        assert!(valid_persona("a"));
+        assert!(valid_persona("a_b_c_123"));
+    }
+
+    #[test]
+    fn valid_persona_rejects_empty() {
+        assert!(!valid_persona(""));
+    }
+
+    #[test]
+    fn valid_persona_rejects_too_long() {
+        let ok = "a".repeat(64);
+        let too_long = "a".repeat(65);
+        assert!(valid_persona(&ok));
+        assert!(!valid_persona(&too_long));
+    }
+
+    #[test]
+    fn valid_persona_rejects_uppercase() {
+        assert!(!valid_persona("Writer_Agent"));
+    }
+
+    #[test]
+    fn valid_persona_rejects_hyphen() {
+        // Hyphens are only a rendering convenience (§8); the wire form is
+        // always underscored, so a hyphenated persona is invalid.
+        assert!(!valid_persona("writer-agent"));
+    }
+
+    #[test]
+    fn valid_persona_rejects_whitespace_and_symbols() {
+        assert!(!valid_persona("writer agent"));
+        assert!(!valid_persona("writer.agent"));
+        assert!(!valid_persona("@writer_agent"));
+    }
+
+    // ---- render ----------------------------------------------------------
+
+    fn env(from: &str, to: &str, kind: &str, body: &str) -> Envelope {
+        Envelope {
+            v: 1,
+            from: from.to_owned(),
+            to: to.to_owned(),
+            kind: kind.to_owned(),
+            task_id: None,
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn render_chat_omits_type_suffix() {
+        let (plain, html) = render(&env("writer_agent", "research_agent", "chat", "hi"));
+        assert_eq!(plain, "writer-agent → research-agent\nhi");
+        assert_eq!(html, "<b>writer-agent → research-agent</b><br/>hi");
+    }
+
+    #[test]
+    fn render_non_chat_includes_type_suffix() {
+        let (plain, html) = render(&env("writer_agent", "research_agent", "handoff", "go"));
+        assert_eq!(plain, "writer-agent → research-agent · handoff\ngo");
+        assert_eq!(
+            html,
+            "<b>writer-agent → research-agent</b> · <i>handoff</i><br/>go"
+        );
+    }
+
+    #[test]
+    fn render_hyphenates_underscored_personas() {
+        let (plain, _) = render(&env("writer_agent", "research_agent", "task", "x"));
+        assert!(plain.starts_with("writer-agent → research-agent"));
+    }
+
+    #[test]
+    fn render_broadcast_target_as_everyone() {
+        let (plain, html) = render(&env("writer_agent", "*", "chat", "hi all"));
+        assert!(plain.starts_with("writer-agent → everyone\n"));
+        assert!(html.starts_with("<b>writer-agent → everyone</b><br/>"));
+    }
+
+    #[test]
+    fn render_passes_matrix_user_ids_through_unhyphenated() {
+        // A human's `from`/`to` is a full Matrix user id and must not be
+        // mangled by the persona hyphenation rule.
+        let (plain, _) = render(&env("@robb:safehouse.local", "writer_agent", "chat", "hi"));
+        assert!(plain.starts_with("@robb:safehouse.local → writer-agent"));
+    }
+
+    #[test]
+    fn render_html_escapes_body_and_type() {
+        let (_, html) = render(&env(
+            "writer_agent",
+            "research_agent",
+            "<task>",
+            "a & b <tag>",
+        ));
+        assert!(html.contains("&lt;task&gt;"));
+        assert!(html.contains("a &amp; b &lt;tag&gt;"));
+        assert!(!html.contains("<tag>"));
+    }
+
+    #[test]
+    fn render_plain_body_not_html_escaped() {
+        let (plain, _) = render(&env(
+            "writer_agent",
+            "research_agent",
+            "chat",
+            "a & b <tag>",
+        ));
+        // The event `body` (plain) is not HTML — no escaping expected there.
+        assert!(plain.ends_with("a & b <tag>"));
+    }
+
+    // ---- from_event_json — envelope passthrough --------------------------
+
+    #[test]
+    fn from_event_json_passes_through_explicit_envelope() {
+        let content = json!({
+            "msgtype": "m.text",
+            "body": "irrelevant — agents read the envelope, not this",
+            ENVELOPE_KEY: {
+                "v": 1,
+                "from": "writer_agent",
+                "to": "research_agent",
+                "type": "handoff",
+                "task_id": "source_check",
+                "body": "Need the source list confirmed."
+            }
+        });
+        let (env, unknown) = from_event_json(&content, "@robb:safehouse.local", &[]);
+        assert_eq!(env.v, 1);
+        assert_eq!(env.from, "writer_agent");
+        assert_eq!(env.to, "research_agent");
+        assert_eq!(env.kind, "handoff");
+        assert_eq!(env.task_id.as_deref(), Some("source_check"));
+        assert_eq!(env.body, "Need the source list confirmed.");
+        assert!(unknown.is_none());
+    }
+
+    #[test]
+    fn from_event_json_malformed_envelope_falls_back_to_synthesis() {
+        // Missing required fields (`to`, `type`, `body`) — not a valid
+        // Envelope, so this must fall back to human-message synthesis rather
+        // than panicking or silently dropping the message.
+        let content = json!({
+            "body": "hmm, the timeline looks off",
+            ENVELOPE_KEY: { "v": 1, "from": "someone" }
+        });
+        let (env, unknown) = from_event_json(&content, "@robb:safehouse.local", &[]);
+        assert_eq!(env.from, "@robb:safehouse.local");
+        assert_eq!(env.to, "*");
+        assert_eq!(env.kind, "chat");
+        assert_eq!(env.body, "hmm, the timeline looks off");
+        assert!(unknown.is_none());
+    }
+
+    #[test]
+    fn from_event_json_no_body_field_defaults_to_empty() {
+        let content = json!({});
+        let (env, _unknown) = from_event_json(&content, "@robb:safehouse.local", &[]);
+        assert_eq!(env.body, "");
+        assert_eq!(env.to, "*");
+    }
+
+    // ---- from_event_json / synthesize_for_human — human synthesis
+    // (§5.1 / §5.3) -----------------------------------------------------
+
     fn personas() -> Vec<String> {
         vec!["research_agent".to_owned(), "writer_agent".to_owned()]
     }
@@ -220,6 +392,7 @@ mod tests {
         assert_eq!(env.to, "*");
         assert_eq!(env.from, "@robb:safehouse.local");
         assert_eq!(env.body, "hmm, the timeline looks off");
+        assert_eq!(env.task_id, None);
         assert!(unknown.is_none());
     }
 
@@ -230,6 +403,7 @@ mod tests {
     fn bare_at_sign_is_not_an_unknown_address() {
         let (env, unknown) = synthesize_for_human("@robb:safehouse.local", "@ hello", &personas());
         assert_eq!(env.to, "*");
+        assert_eq!(env.body, "@ hello");
         assert!(unknown.is_none());
     }
 
@@ -273,5 +447,32 @@ mod tests {
     fn unknown_persona_ack_with_no_personas_configured() {
         let ack = unknown_persona_ack("@robb:safehouse.local", "anything", &[]);
         assert!(ack.body.contains("none configured"));
+    }
+
+    // ---- additional §5.1 token-parsing edge cases -------------------------
+
+    fn human(body: &str) -> Envelope {
+        from_event_json(&json!({"body": body}), "@robb:safehouse.local", &personas()).0
+    }
+
+    #[test]
+    fn synthesize_explicit_address_comma_suffix() {
+        let env = human("@research_agent, confirm the source list");
+        assert_eq!(env.to, "research_agent");
+        assert_eq!(env.body, "confirm the source list");
+    }
+
+    #[test]
+    fn synthesize_explicit_address_no_trailing_body() {
+        let env = human("@research_agent");
+        assert_eq!(env.to, "research_agent");
+        assert_eq!(env.body, "");
+    }
+
+    #[test]
+    fn synthesize_explicit_address_colon_no_trailing_body() {
+        let env = human("@research_agent:");
+        assert_eq!(env.to, "research_agent");
+        assert_eq!(env.body, "");
     }
 }
