@@ -14,7 +14,7 @@ canonical handoff and points everywhere else (design, decisions D1–D17, open q
   config; see "things that will bite you" in `docs/next-agent.md` before touching boot code.
 
 <!-- BEGIN REPO-SKILLS -->
-This repository has [Repo Skills](https://github.com/rjwalters/repo) v0.5.0 installed —
+This repository has [Repo Skills](https://github.com/rjwalters/repo) v0.6.0 installed —
 general repository hygiene and environment commands invoked as `/repo:<command>`. Run
 `/repo:help` for the command list, or see `.claude/skills/repo/SKILL.md` for the full
 guide. Hygiene commands apply safe, reversible fixes by default and report each
