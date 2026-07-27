@@ -238,7 +238,8 @@ async fn on_message(
         .ok()
         .and_then(|v: Value| v.get("content").cloned())
         .unwrap_or(Value::Null);
-    let env = envelope::from_event_json(&content, event.sender.as_str(), &registry.personas);
+    let (env, unknown_persona) =
+        envelope::from_event_json(&content, event.sender.as_str(), &registry.personas);
 
     if !own_event {
         println!(
@@ -261,6 +262,22 @@ async fn on_message(
     // authoring persona — that's how same-host agent-to-agent traffic flows
     // while staying loop-free.
     registry.dispatch(&push.to_string(), own_event, &env.from).await;
+
+    // §5.1: a human addressed an unknown persona — post a visible ack rather
+    // than let the message silently fall back to a no-wake broadcast. The ack
+    // itself carries a real envelope, so the next sync round-trips through
+    // the early-return branch of `from_event_json` above and never re-enters
+    // this path.
+    if let Some(token) = unknown_persona {
+        let ack = envelope::unknown_persona_ack(&env.from, &token, &registry.personas);
+        let content = envelope::to_event_content(&ack);
+        if let Err(err) = room.send_raw("m.room.message", content).await {
+            eprintln!(
+                "safehoused: failed to post unknown-persona ack for @{token} in {}: {err:#}",
+                room.room_id()
+            );
+        }
+    }
 }
 
 /// An event that reaches this handler stayed encrypted after decryption was

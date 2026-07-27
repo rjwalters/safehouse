@@ -236,7 +236,8 @@ async fn handle_op(
                 }
                 let sender = parsed.get("sender").and_then(Value::as_str).unwrap_or("").to_owned();
                 let content = parsed.get("content").cloned().unwrap_or(Value::Null);
-                let env = envelope::from_event_json(&content, &sender, &registry.personas);
+                let (env, _unknown_persona) =
+                    envelope::from_event_json(&content, &sender, &registry.personas);
                 messages.push(json!({
                     "event_id": parsed.get("event_id"),
                     "sender": sender,
