@@ -4,8 +4,9 @@ Things to resolve before (or early in) coding.
 
 **Round 2 complete (2026-07-26).** Q-G, Q-H and Q-I are answered; provenance in `research/`. The
 headline: the biggest technical risk (Q-G) is **retired**, and Q-I found a **factual error in our own
-docs** that inverted the licensing answer. Q-F (envelope schema) is now answered by
-`protocol/envelope-v1.md`. What remains is one live integration test (Q-J).
+docs** that inverted the licensing answer. Q-F (envelope schema) is answered by
+`protocol/envelope-v1.md`, and **Q-J ran live on 2026-07-26 and passed** — nothing blocks building
+`safehoused` v0.
 
 ---
 
@@ -67,24 +68,21 @@ remain any-language; they only speak the socket protocol.
 
 ---
 
+### Q-J. Live integration test — ✅ **PASSED** (`research/2026-07-26-qj-integration-test.md`)
+Ran live against tuwunel v1.8.2 + matrix-sdk 0.18.0 (`spikes/qj-coldstart/`). Headless cold start,
+cross-signing self-bootstrap (MSC3967), warm start, and — the one that matters — **store-wipe
+disaster recovery** all pass: `recover(passphrase)` self-signs the replacement device and OneShot
+pulls every room key back. Q-G is now solved in practice, not just on paper.
+
+**New landmine found live:** a room key minted just before process exit may not have reached the
+server-side backup — the first recovery attempt lost a message permanently. The daemon's shutdown
+path MUST call `Backups::wait_for_steady_state()` (verified as the fix).
+
+Remaining sliver, needs Robb's phone: Element as `@robb`, accept the safehouse-test invite, confirm
+bot messages decrypt + what shield the self-signed bot gets (also covers Q-C). MSC4268
+historic-key-bundles remains unverified (only matters for pre-join history).
+
 ## 🔴 OPEN — resolve before / early in coding
-
-### Q-J. Live integration test *(NEW — the honest gap left by Q-G)*
-Everything in Q-G is **source- and spec-reading. None of it has been run.** Before building daemon
-code around it, do the one-evening test:
-
-1. Stand up the homeserver locally, federation off.
-2. Register `@safehoused:host`.
-3. Run a ~60-line binary through the cold-start sequence.
-4. Confirm the device reports **cross-signed** and that a human's Element sees its messages.
-5. **Wipe the crypto store**, cold-start again, and confirm passphrase recovery self-signs the new
-   device and pulls room keys back.
-
-Step 5 is the one that matters most — it's the disaster-recovery path, and it's the reason the
-recovery passphrase is mandatory config. Passing this converts Q-G from "solved on paper" to solved.
-
-Also unverified: whether MSC4268 historic-key-bundles-on-invite works on our homeserver (matters only
-if agents need pre-join history).
 
 ### Q-E. Wake-without-Synapse reliability *(only if the daemon ever sleeps)*
 Not needed while the daemon is always-on. If we ever want it to sleep: is Sygnal / UnifiedPush

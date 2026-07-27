@@ -11,11 +11,14 @@ inbound room events to **ephemeral local agents** that sit behind it over a **lo
 hold no keys. The **room is the single source of truth** so a human on Element gets full visibility +
 @-mention remote control. Threat model: compromised host/server, NOT agent-vs-agent.
 
-## Status: ready to build, one test away
+## Status: ready to build — Q-J passed live, Q-F accepted
 
-Two research rounds are done (7 passes, all 2026-07-26, archived in `research/`). **The biggest
-technical risk — headless login + cross-signing — is retired.** What's left before Rust is one live
-integration test (**Q-J**) and one design decision (**Q-F**, the envelope schema).
+Two research rounds are done (8 passes, all 2026-07-26, archived in `research/`). **The biggest
+technical risk — headless login + cross-signing — is retired, and as of 2026-07-26 it is verified
+live** (`research/2026-07-26-qj-integration-test.md`, spike in `spikes/qj-coldstart/`): cold start,
+warm start, and store-wipe disaster recovery all pass against tuwunel v1.8.2 + matrix-sdk 0.18.0.
+The envelope schema is accepted (`protocol/envelope-v1.md`). Nothing blocks `safehoused` v0 except
+the phone-side Element check (needs Robb).
 
 ## Decisions already made (don't relitigate without reason)
 
@@ -52,31 +55,18 @@ See `decisions.md` for all thirteen with rationale. The load-bearing ones:
    invariant (D8).
 7. **Budget 2–4 GB RAM for the homeserver**, not the 64–256 MB the old stack table claimed, and clamp
    the cache modifiers — defaults scale with core count.
+8. **Flush room-key backup uploads before shutdown** — `Backups::wait_for_steady_state()`. Found
+   live in Q-J: a key minted just before exit hadn't reached the server-side backup, and one message
+   was permanently lost to the store wipe. Backup upload is a background task; treat an unflushed
+   backup as not-yet-durable.
 
 ## Recommended first moves (in order)
 
-### 1. Q-J — the live integration test. Do this before writing daemon code.
-Everything in the headless-login research is **source- and spec-reading; none of it has been run.**
-This is cheap and converts "solved on paper" to solved:
+### 1. ~~Q-J — the live integration test~~ ✅ DONE 2026-07-26, all steps pass
+See `research/2026-07-26-qj-integration-test.md`. Only the phone-side check remains: Element as
+`@robb:safehouse.local`, accept the safehouse-test invite, confirm decryption + the bot's shield.
 
-1. Stand up tuwunel locally, federation off (config in `research/2026-07-26-homeserver.md`).
-2. Create two users: the human, and `safehouse-bot`.
-3. Write a ~60-line throwaway binary that runs the cold-start sequence
-   (`design.md` §4.1.1 has it as prose; `research/2026-07-26-headless-login.md` has the detail).
-4. Confirm the device reports **cross-signed**, and log in Element on your phone as the human and
-   confirm you see the bot's messages.
-5. **Wipe the crypto store and cold-start again.** Confirm passphrase recovery self-signs the
-   replacement device and pulls room keys back.
-
-Step 5 is the one that matters — it's the disaster-recovery path, and it's why the recovery
-passphrase is mandatory. If step 5 fails, stop and re-open Q-G before building anything.
-
-### 2. Q-F — design the envelope schema.
-The one part we get to invent, and the last open design decision. `from`, `to`, `type`, `task_id`,
-threading — and it must render **legibly for a human in Element**, not as JSON soup. Constraints
-already known: field names `[A-Za-z0-9_]`-safe (**`task_id`, not `task-id`**), gate on sender
-identity never room identity, and keep it a documented versioned language-agnostic wire format.
-Worth doing with Robb rather than deciding alone.
+### 2. ~~Q-F — design the envelope schema~~ ✅ DONE — accepted as `protocol/envelope-v1.md`
 
 ### 3. Spike `safehoused` v0.
 Cold/warm start, persistent encrypted crypto store, join the room, sync v2, decrypt inbound, print to

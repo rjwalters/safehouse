@@ -1,7 +1,6 @@
 # Rust
-/target/
+target/
 **/*.rs.bk
-Cargo.lock  # keep for bins later; ignore for now while pre-code
 
 # Node (if a client/UI lands here)
 node_modules/
