@@ -35,7 +35,7 @@ their next run — while a human sees everything and can @-mention to intervene.
 
 ```
  ephemeral agents ──local unix socket (plaintext)──▶  safehoused (one per host)
-   book-agent                                          • one Matrix device, verified once
+   book-agent                                          • one Matrix device, self-cross-signed headlessly
    family-tree-agent                                   • holds the E2E crypto store (vodozemac)
    …                                                   • runs the sync loop, does all encrypt/decrypt
                                                         • dispatches inbound room events to the
@@ -56,36 +56,41 @@ their next run — while a human sees everything and can @-mention to intervene.
 **New agent picking this up? Start with [`docs/next-agent.md`](docs/next-agent.md).**
 
 See [`docs/design.md`](docs/design.md) for the full design, [`docs/decisions.md`](docs/decisions.md)
-for the choices and why, and [`docs/open-questions.md`](docs/open-questions.md) for what still needs
-answering before code.
+for the choices and why, and [`docs/open-questions.md`](docs/open-questions.md) for the question log
+(all answered and live-verified as of 2026-07-26).
 
 ## Status
 
-**Research complete, ready to build.** No code yet. The architecture and stack are backed by six
-deep-research passes (2026-07-26) archived under [`docs/research/`](docs/research/): buy-vs-build,
-Matrix-as-foundation, a prior-art scan, headless login, MCP/Channels, and licensing.
+**Built and running.** The full chain — agent MCP tool call → keyless shim → `safehoused` →
+encrypted room → human's phone — is verified live against a production homeserver. The design is
+backed by eight research passes (2026-07-26) archived under [`docs/research/`](docs/research/).
 
-- **Prior art:** nobody has built the one-device/many-keyless-personas daemon → **build fresh** on
-  matrix-rust-sdk. Read `baibot`/`mxlink` for patterns; depend on neither.
-- **Biggest technical risk (headless login) is retired.** The daemon can create its device,
-  self-cross-sign, and enable key backup with **zero human interaction** — via MSC3967, not the
-  MSC4190 path we originally expected. The only human step is creating the bot account.
-- **What's left before Rust:** one live integration test against a real homeserver
-  ([Q-J](docs/open-questions.md)), and the envelope schema
-  ([Q-F](docs/open-questions.md)) — the one part we get to invent.
+- **Q-J, the live integration test, passed** (`docs/research/2026-07-26-qj-integration-test.md`):
+  headless cold start, cross-signing self-bootstrap (MSC3967, zero human interaction), and — the
+  one that matters — store-wipe disaster recovery via the mandatory passphrase. One landmine found
+  live: room-key backup must be flushed before shutdown (`Backups::wait_for_steady_state`).
+- **Envelope v1 is accepted** — [`docs/protocol/envelope-v1.md`](docs/protocol/envelope-v1.md), a
+  versioned, language-agnostic wire format; the daemon stamps sender identity and enforces the
+  persona allowlist.
+- **Workspace:** [`safehoused/`](safehoused/) (the daemon: boot + recovery, sync v2, decrypt,
+  unix-socket RPC, envelope dispatch), [`safehouse-mcp/`](safehouse-mcp/) (keyless stdio MCP shim:
+  `safehouse_send` / `safehouse_read` / `safehouse_create_room` / `safehouse_list_rooms`), and
+  [`spikes/qj-coldstart/`](spikes/qj-coldstart/) (Q-J provenance).
+- ✅ **The Oct 2026 "exclude insecure devices" deadline is cleared**, not just tracked: Element X
+  shows no reduced-trust indicator for the self-signed daemon device (verified on a real phone).
 
-⏳ **Deadline in view:** Element's "exclude insecure devices" rollout lands ~**Oct 2026**. A daemon
-without cross-signing bootstrap silently stops working then — so that's v0 scope, not v1.
+**Next:** wire the first real agent through the stack, and the loom fleet integration
+([loom#3997–3999](https://github.com/rjwalters/loom/issues/3997)).
 
-## Chosen stack (provisional)
+## Chosen stack (verified live)
 
 | Layer | Choice | Why |
 |---|---|---|
 | Homeserver | **tuwunel ≥ v1.8.2** — lightweight Rust | static musl binary, federation off. Chosen over continuwuity on *current, machine-verified* E2E conformance: tuwunel is the only one of the two running complement-crypto against real matrix-rust-sdk clients, while continuwuity's baseline is 5 months stale and fails every local-user device-list test. conduwuit is archived; Conduit/Dendrite are life-support |
 | Daemon sync | **classic `/sync` (v2)**, not sliding sync | the one open E2E bug on both servers is in the sliding-sync to-device extension; sync v2 is spec-frozen and dodges the Aug–Oct 2026 MSC4186 churn |
 | Daemon crypto | **matrix-rust-sdk ≥ 0.18.0** (vodozemac) | production-ready, bot-oriented, libolm is deprecated; **pantalaimon is archived — do not use**. Floor is not stylistic: CVE-2026-45056 (to-device sender-binding, fixed 0.16.1) is directly in our threat model |
-| Wake | **persistent daemon, local dispatch** | the daemon is always-online by design, so we avoid the encrypted-appservice path entirely — and there is still no Rust appservice SDK. Claude Code Channels is the v1 upgrade |
-| Human client | **Element** (verified, key-backup on) | glass-box view + @-mention remote control |
+| Wake | **persistent daemon, local dispatch** | the daemon is always-online by design, so we avoid the encrypted-appservice path entirely — and there is still no Rust appservice SDK. `safehouse-mcp` gives polling agents tools today; Claude Code Channels push-wake is the v1 upgrade |
+| Human client | **Element X** (key-backup on) | glass-box view + @-mention remote control; no interactive verification needed — the daemon's self-signed device is trusted as-is |
 
 The key insight: because we already committed to an always-on **per-host daemon**, the usual
 "client-SDK bot must stay online" cost is one we happily pay — which lets us skip encrypted
