@@ -42,10 +42,9 @@ async fn main() -> Result<()> {
     let store_pass = required("QJ_STORE_PASS")?;
     // Mandatory, not Option — the only headless path back after a store loss (D10 / handoff §2).
     let recovery_pass = required("QJ_RECOVERY_PASS")?;
-    let invite: OwnedUserId = env::var("QJ_INVITE")
-        .unwrap_or_else(|_| "@robb:safehouse.local".into())
+    let invite: OwnedUserId = required("QJ_INVITE")?
         .try_into()
-        .context("QJ_INVITE is not a valid user id")?;
+        .map_err(|_| anyhow::anyhow!("QJ_INVITE is not a valid user id"))?;
     let state_dir = PathBuf::from(env::var("QJ_STATE_DIR").unwrap_or_else(|_| "qj-state".into()));
 
     let store_dir = state_dir.join("store");
@@ -151,6 +150,10 @@ async fn main() -> Result<()> {
         room.room_id(),
         room.latest_encryption_state().await?.is_encrypted()
     );
+    if room.get_member(&invite).await?.is_none() {
+        room.invite_user_by_id(&invite).await?;
+        println!("room: invited {invite}");
+    }
 
     // On warm/recovered runs, prove the room keys are present: history must decrypt.
     if run_kind != "cold" {
