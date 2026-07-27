@@ -77,7 +77,10 @@ async fn run() -> Result<()> {
     let client = boot(&config).await?;
 
     for persona in &config.personas {
-        anyhow::ensure!(envelope::valid_persona(persona), "invalid persona {persona:?} in config");
+        anyhow::ensure!(
+            envelope::valid_persona(persona),
+            "invalid persona {persona:?} in config"
+        );
     }
     let registry = Registry::new(config.personas.clone());
     let socket_path = config
@@ -104,7 +107,11 @@ async fn run() -> Result<()> {
     // A room key minted moments ago may not have reached the server-side
     // backup yet; exiting without flushing makes it unrecoverable after a
     // store loss. Found live in Q-J.
-    client.encryption().backups().wait_for_steady_state().await?;
+    client
+        .encryption()
+        .backups()
+        .wait_for_steady_state()
+        .await?;
     println!("safehoused: room-key backup flushed; bye");
     Ok(())
 }
@@ -152,7 +159,10 @@ async fn boot(config: &Config) -> Result<Client> {
             .login_username(&config.username, &config.password)
             .initial_device_display_name("safehoused")
             .await?;
-        let session = client.matrix_auth().session().context("no session after login")?;
+        let session = client
+            .matrix_auth()
+            .session()
+            .context("no session after login")?;
         fs::create_dir_all(&config.state_dir)?;
         let tmp = session_path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_string(&session)?)?;
@@ -160,7 +170,10 @@ async fn boot(config: &Config) -> Result<Client> {
         println!("safehoused: cold start, new device");
     }
 
-    client.encryption().wait_for_e2ee_initialization_tasks().await;
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
     client
         .sync_once(SyncSettings::default())
         .await
@@ -173,7 +186,10 @@ async fn boot(config: &Config) -> Result<Client> {
             // First run ever for this account: mint secret storage guarded by
             // the passphrase. The minted key is intentionally not printed —
             // the passphrase is the operator's handle.
-            recovery.enable().with_passphrase(&config.recovery_passphrase).await?;
+            recovery
+                .enable()
+                .with_passphrase(&config.recovery_passphrase)
+                .await?;
             println!("safehoused: recovery enabled with configured passphrase");
         }
         state @ (RecoveryState::Incomplete | RecoveryState::Unknown) => {
@@ -216,11 +232,17 @@ async fn boot(config: &Config) -> Result<Client> {
 /// The room is invite-only from our side: the sealed homeserver has no open
 /// registration, so any invite comes from a user the operator controls.
 async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client) {
-    let Some(own_user) = client.user_id() else { return };
+    let Some(own_user) = client.user_id() else {
+        return;
+    };
     if event.state_key != own_user || room.state() != RoomState::Invited {
         return;
     }
-    println!("safehoused: invited to {} by {}, joining", room.room_id(), event.sender);
+    println!(
+        "safehoused: invited to {} by {}, joining",
+        room.room_id(),
+        event.sender
+    );
     if let Err(err) = room.join().await {
         eprintln!("safehoused: joining {} failed: {err:#}", room.room_id());
     }
@@ -238,8 +260,6 @@ async fn on_message(
         .ok()
         .and_then(|v: Value| v.get("content").cloned())
         .unwrap_or(Value::Null);
-    let (env, unknown_persona) =
-        envelope::from_event_json(&content, event.sender.as_str(), &registry.personas);
 
     if !own_event {
         println!(
@@ -249,6 +269,28 @@ async fn on_message(
             event.content.body()
         );
     }
+
+    // §7.2/§9: gate on envelope version. An unsupported `v` is never dispatched
+    // or guess-parsed — it is logged and surfaced to the human once per sender.
+    let (env, unknown_persona) =
+        match envelope::from_event_json(&content, event.sender.as_str(), &registry.personas) {
+            envelope::Inbound::Envelope(env, unknown_persona) => (env, unknown_persona),
+            envelope::Inbound::UnsupportedVersion(v) => {
+                eprintln!(
+                "safehoused: ignoring unsupported envelope version {v} from {} in {} (event {})",
+                event.sender,
+                room.room_id(),
+                event.event_id
+            );
+                if registry
+                    .mark_unsupported_surfaced(event.sender.as_str(), v)
+                    .await
+                {
+                    surface_unsupported_version(&room, &client, event.sender.as_str(), v).await;
+                }
+                return;
+            }
+        };
 
     let push = json!({
         "event": "message",
@@ -261,7 +303,9 @@ async fn on_message(
     // §7 refined: own events still dispatch to local agents, skipping only the
     // authoring persona — that's how same-host agent-to-agent traffic flows
     // while staying loop-free.
-    registry.dispatch(&push.to_string(), own_event, &env.from).await;
+    registry
+        .dispatch(&push.to_string(), own_event, &env.from)
+        .await;
 
     // §5.1: a human addressed an unknown persona — post a visible ack rather
     // than let the message silently fall back to a no-wake broadcast. The ack
@@ -277,6 +321,34 @@ async fn on_message(
                 room.room_id()
             );
         }
+    }
+}
+
+/// Post a human-legible notice to the room that a message used an envelope
+/// version this daemon can't speak (§7.2). The notice is itself a valid v1
+/// envelope stamped from the daemon's own Matrix user, so Element renders it in
+/// the timeline the human is already reading. Send failures are logged, never
+/// fatal — surfacing is best-effort.
+async fn surface_unsupported_version(room: &Room, client: &Client, sender: &str, v: u64) {
+    let from = client
+        .user_id()
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "safehoused".to_owned());
+    let env = envelope::Envelope {
+        v: envelope::SUPPORTED_VERSION,
+        from,
+        to: "*".to_owned(),
+        kind: "ack".to_owned(),
+        task_id: None,
+        body: format!(
+            "Ignored a message from {sender} using unsupported safehouse envelope version {v} \
+             (this daemon speaks v{}). It was not delivered to any agent.",
+            envelope::SUPPORTED_VERSION
+        ),
+    };
+    let content = envelope::to_event_content(&env);
+    if let Err(err) = room.send_raw("m.room.message", content).await {
+        eprintln!("safehoused: failed to surface unsupported-version notice for {sender}: {err:#}");
     }
 }
 
