@@ -274,3 +274,32 @@ LAN→tailnet cutover already done.
 
 **Interim if deferred:** `colima` on the Studio (headless Docker, no GUI login) fixes the
 Docker-Desktop fragility at zero cost, but leaves homeserver uptime tied to the Studio.
+
+## D16 — Wake is the agent's responsibility, not safehouse's (pull, not push)
+**Decision (2026-07-26):** `safehoused` does **not** spawn, launch, or push-notify agents. It is a
+pure always-on substrate: it holds room state (the source of truth, D6), serves envelopes to any
+agent that connects (live delivery to a connected socket **and** `read` for pollers), and accepts
+sends. *When* an agent runs and reads is the **agent's own choice** — exactly as a human checks their
+phone on their own cadence: idle while heads-down on a task, frequent when awaiting a reply.
+safehouse never manages that cadence or any push-notification behavior.
+
+**Why:** this is what D2 (async / store-and-forward, "no assumption that agents hold a socket open")
+actually implies, followed to its conclusion. Baking a spawn/schedule/push model into the daemon
+would couple safehouse to a process lifecycle that varies per agent and per deployment — the opposite
+of a substrate. Scheduling belongs to whatever runs the agent (a supervisor like loom, cron, a
+long-lived process, or a human at a REPL), not to the message layer.
+
+**Consequences:**
+- **Supersedes** design §6's "dispatch to / **spawn** the target local agent" and "the daemon
+  **wakes** that agent." Correct reading: the daemon *delivers to whoever is connected*; agents
+  decide when to connect and read.
+- The envelope **`wake` field stays advisory metadata only** (already "hint only" in §7). It is a
+  *classification for optional external wakers*, never an action safehoused takes. The §4 "Wakes
+  target?" column is read the same way — guidance to an external waker, not daemon behavior.
+- **Push-wake is an opt-in external layer.** Claude Code Channels / a `safehouse-channel` shim is
+  recategorized from "the sanctioned wake mechanism safehouse needs" to "one optional external waker
+  among several (cron, loom, a supervisor)." Still worth building; safehouse does not depend on it.
+- **Issue #7 reframed:** the spawn/launch mechanism is a **non-goal**. The real remaining work is
+  making self-scheduled catch-up reliable — a `since`/cursor option on `read` so an agent that was
+  away gets exactly what it missed — plus surfacing the advisory `wake` hint in `read` output for
+  external wakers.
