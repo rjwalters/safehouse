@@ -1,0 +1,71 @@
+# safehoused example config — copy to config.toml, fill in the real values,
+# and run: safehoused config.toml   (or set SAFEHOUSED_CONFIG=/path/to/config.toml)
+#
+# This file documents every field the daemon's Config struct accepts
+# (safehoused/src/main.rs). Config parsing uses #[serde(deny_unknown_fields)],
+# so a typo'd or removed field name will fail fast at startup rather than
+# silently doing nothing.
+#
+# See ../README.md "Running it" for the end-to-end walkthrough (create the
+# bot user on the homeserver, write this file, run the daemon, invite it to
+# a room).
+
+# --- Mandatory fields --------------------------------------------------
+
+# The homeserver's client-server API base URL. Point this at your own
+# instance — see docs/research/2026-07-26-homeserver.md for the tuwunel
+# setup this project targets.
+homeserver = "https://matrix.example.com"
+
+# The bot's own Matrix account, created ahead of time on the homeserver
+# (the daemon never registers itself — see "Running it" in the README).
+# This is a login, not a Matrix user ID: no "@" prefix, no ":server" suffix.
+username = "safehouse-bot"
+password = "change-me"
+
+# Where the daemon keeps its persistent state: the encrypted sqlite crypto
+# store (state_dir/store) and the session blob (state_dir/session.json).
+# Created on first (cold) start. Must persist across restarts — losing it
+# means the daemon shows up as a brand-new, unverified device next boot.
+state_dir = "/var/lib/safehoused"
+
+# Passphrase used to encrypt the sqlite store at rest. Distinct from
+# recovery_passphrase below: this one only protects the on-disk database
+# file and never leaves the host.
+store_passphrase = "change-me-too"
+
+# The ONLY headless way back after losing the crypto store (disk failure,
+# state_dir wiped, etc). This is mandatory config, not optional — the
+# daemon has no other path to recover room keys and re-establish a trusted
+# device after a store loss (see docs/decisions.md D10). On first-ever boot
+# for this account the daemon mints secret storage and locks it behind this
+# passphrase; on every subsequent boot after a store wipe, this passphrase
+# is what lets the new device recover the old one's keys instead of coming
+# up as an unverified stranger. Treat it like the recovery phrase for a
+# hardware wallet: write it down somewhere durable, off this host.
+recovery_passphrase = "change-me-as-well"
+
+# --- Optional fields (all have safe defaults) ---------------------------
+
+# Destructive escape hatch. If recovery with recovery_passphrase ever fails
+# (e.g. wrong passphrase, corrupted secret storage) the only remaining path
+# is to reset recovery — which orphans every room key currently held in
+# server-side backup, permanently. Defaults to false; only flip this to
+# true if you have accepted that loss and understand the daemon will log a
+# startup warning while it's armed.
+# recovery_reset_allowed = false
+
+# Allowlist of local agent personas permitted to attach over the unix
+# socket (see docs/protocol/envelope-v1.md §6). Each entry must be
+# lowercase ASCII letters, digits, or underscores, 1-64 chars
+# (safehoused/src/envelope.rs::valid_persona) — the daemon refuses to
+# start if any entry fails that check. Defaults to an empty list, which
+# means NO agent can connect over the socket; the daemon still joins
+# rooms and mirrors traffic to stdout even with zero personas configured.
+# personas = ["writer_agent", "research_agent"]
+
+# Unix-domain socket path the daemon listens on for local agent RPC
+# (hello/send/create_room/list_rooms/read — see safehoused/src/rpc.rs).
+# AF_UNIX only, by design — never a TCP listener (docs/decisions.md D8).
+# Defaults to "<state_dir>/safehoused.sock" when omitted.
+# socket_path = "/var/lib/safehoused/safehoused.sock"
