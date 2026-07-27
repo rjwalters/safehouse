@@ -75,7 +75,7 @@ MUST read `org.safehouse.envelope.body` and MUST NOT parse the header out of the
 | `type` | ✅ | string | One of `chat`, `task`, `handoff`, `ack`. See §4. |
 | `task_id` | — | string | Stable, human-meaningful task identifier, `[A-Za-z0-9_]`. Groups related messages independently of Matrix threading. |
 | `body` | ✅ | string | The message content, as the agent should receive it. Plain text. |
-| `wake` | — | boolean | Hint only. The **daemon decides** (§7); an agent cannot force a spawn on another host. |
+| `wake` | — | boolean | Advisory hint only, for an *optional external waker* — safehouse itself never spawns or pushes an agent, on any host (`decisions.md` D16). §4's "suggested `wake`?" column and §7's classification describe the recommended default for such a waker to apply; they are not daemon behavior. |
 | `in_reply_to` | — | string | `task_id`-scoped logical reply target, when Matrix threading isn't sufficient. |
 
 Unknown fields MUST be preserved when relaying and ignored when not understood — this is the
@@ -86,7 +86,13 @@ daemon stamps them (§6).
 
 ## 4. Message types
 
-| `type` | Meaning | Wakes target? |
+Every `type` gets delivered into the recipient's mailbox regardless of the column below (D17) — the
+daemon itself never withholds or defers delivery based on `type`. The **"suggested `wake`?"** column
+is advisory classification for an *optional external waker* deciding whether this message is worth
+invoking the agent for sooner rather than at its next self-scheduled check-in (D16); it is not
+something safehoused acts on.
+
+| `type` | Meaning | Suggested `wake`? |
 |---|---|---|
 | `chat` | Conversational. Context, thinking out loud, questions. | Only if explicitly addressed |
 | `task` | A unit of work with a lifecycle. SHOULD carry `task_id`. | Yes |
@@ -108,8 +114,11 @@ is addressed to that persona. The token is stripped from the synthesized `body`.
 ```
 Human types:  @research-agent confirm the source list
 Synthesized:  { v:1, from:"@robb:safehouse.local", to:"research_agent",
-                type:"chat", body:"confirm the source list" }   → wakes it
+                type:"chat", body:"confirm the source list", wake:true }
 ```
+
+`wake:true` here is the advisory hint an external waker would act on (D16); the message lands in
+`research_agent`'s mailbox either way, and it is picked up whenever that agent next checks in (D17).
 
 Personas are not Matrix users, so Element will **not** autocomplete the token, and a typo addresses
 nobody. The daemon MUST post a visible `ack` from itself when a message addresses an unknown
@@ -119,16 +128,20 @@ persona — silent misdelivery is the worst possible failure here.
 with no token required. This carries the great majority of follow-up traffic and is why the token
 only has to be typed once per task.
 
-**5.3 — Unaddressed, main timeline.** Becomes a broadcast that **does not wake anyone**:
+**5.3 — Unaddressed, main timeline.** Becomes a broadcast for which the advisory hint is
+**`wake:false`** — an external waker SHOULD NOT treat it as worth an early check-in:
 
 ```
 Human types:  hmm, the timeline looks off
-Synthesized:  { v:1, from:"@robb:...", to:"*", type:"chat", body:"hmm, the timeline looks off" }
+Synthesized:  { v:1, from:"@robb:...", to:"*", type:"chat", body:"hmm, the timeline looks off",
+                wake:false }
 ```
 
-Agents receive it as context on their next run; nothing spawns. This keeps the room a place a human
-can think out loud without spawning compute. **Known trade-off:** an agent may act on this context
-much later, when it is stale. Agents SHOULD treat broadcast `chat` as background, not instruction.
+Every local agent's mailbox still gets the message (D17); nothing about delivery changes based on
+this hint — it only affects whether an *optional* external waker bothers invoking an agent early
+(D16). This keeps the room a place a human can think out loud without triggering unnecessary early
+check-ins. **Known trade-off:** an agent may act on this context much later, when it is stale. Agents
+SHOULD treat broadcast `chat` as background, not instruction.
 
 ## 6. Identity and trust
 
@@ -151,7 +164,9 @@ authorization decisions MUST key on the pair, never on `from` alone.
 ## 7. Routing and dispatch
 
 Dispatch is driven by the **room event stream from sync**, not by local send calls (D6) — one code
-path for same-host, cross-host, and human traffic.
+path for same-host, cross-host, and human traffic. Per **D16**/**D17**, "dispatch" here means *filing
+into the recipient persona's durable mailbox*, never spawning or push-notifying an agent process —
+delivery and waking are separate concerns (see `design.md` §6).
 
 For each inbound event, the daemon:
 
@@ -163,11 +178,15 @@ For each inbound event, the daemon:
    agent-to-agent delivery.)*
 2. Ignores it if `v` is unsupported (and surfaces it to the human).
 3. Resolves `to`:
-   - a persona **hosted locally** → deliver, and wake per §4
+   - a persona **hosted locally** → file into that persona's mailbox (D17); the recommended `wake`
+     classification is per §4
    - a persona **not local** → ignore; another host's daemon will handle it
-   - `"*"` → deliver to all local agents, **wake none**
+   - `"*"` → file into every local persona's mailbox, with a **`wake:false`** recommendation
    - a Matrix user ID → not for agents; the human's client already rendered it
-4. Applies the wake rule. **`to: "*"` never wakes**, regardless of the `wake` hint.
+4. Records the advisory `wake` classification alongside the delivered envelope for any external waker
+   to read (§3/§4). **`to: "*"` is always classified `wake:false`**, regardless of the sender-supplied
+   `wake` hint. The daemon itself takes no action based on this classification — it is metadata for an
+   optional external waker, not an instruction (D16).
 
 ## 8. Rendering rules
 
