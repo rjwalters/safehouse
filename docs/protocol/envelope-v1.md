@@ -155,8 +155,12 @@ path for same-host, cross-host, and human traffic.
 
 For each inbound event, the daemon:
 
-1. Ignores it if the Matrix sender is **itself** (the don't-loop-back filter). This is the only
-   special case in the whole flow.
+1. Applies the **don't-loop-back filter**: if the Matrix sender is **itself**, the event is still
+   dispatched to local agents — same-host agent-to-agent traffic flows through the room like
+   everything else (D6) — but delivery **skips the authoring persona** (`envelope.from`). This is
+   the only special case in the whole flow. *(Refined 2026-07-26 during implementation: the
+   original wording dropped own events entirely, which would have silenced same-host
+   agent-to-agent delivery.)*
 2. Ignores it if `v` is unsupported (and surfaces it to the human).
 3. Resolves `to`:
    - a persona **hosted locally** → deliver, and wake per §4

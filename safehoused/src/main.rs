@@ -6,13 +6,17 @@
 //! sync v2 loop (D13), decrypt inbound room messages and print them to
 //! stdout. No agents, no unix socket yet — that's the next step.
 
-use std::{env, fs, path::PathBuf, process::ExitCode};
+mod envelope;
+mod rpc;
+
+use std::{env, fs, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     encryption::{recovery::RecoveryState, BackupDownloadStrategy, EncryptionSettings},
+    event_handler::{Ctx, RawEvent},
     ruma::events::room::{
         encrypted::OriginalSyncRoomEncryptedEvent, member::StrippedRoomMemberEvent,
         message::OriginalSyncRoomMessageEvent,
@@ -20,6 +24,9 @@ use matrix_sdk::{
     Client, Room, RoomState,
 };
 use serde::Deserialize;
+use serde_json::{json, Value};
+
+use crate::rpc::Registry;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +43,13 @@ struct Config {
     /// enabled by the operator.
     #[serde(default)]
     recovery_reset_allowed: bool,
+    /// Personas allowed to attach over the unix socket (§6). Empty = no
+    /// agents can connect; the daemon still mirrors the room to stdout.
+    #[serde(default)]
+    personas: Vec<String>,
+    /// Unix socket path; defaults to `<state_dir>/safehoused.sock`.
+    #[serde(default)]
+    socket_path: Option<PathBuf>,
 }
 
 fn load_config() -> Result<Config> {
@@ -62,16 +76,30 @@ async fn run() -> Result<()> {
     let config = load_config()?;
     let client = boot(&config).await?;
 
+    for persona in &config.personas {
+        anyhow::ensure!(envelope::valid_persona(persona), "invalid persona {persona:?} in config");
+    }
+    let registry = Registry::new(config.personas.clone());
+    let socket_path = config
+        .socket_path
+        .clone()
+        .unwrap_or_else(|| config.state_dir.join("safehoused.sock"));
+
     client.add_event_handler(on_invite);
     client.add_event_handler(on_message);
     client.add_event_handler(on_undecryptable);
+    client.add_event_handler_context(registry.clone());
+
+    let rpc = tokio::spawn(rpc::serve(client.clone(), registry, socket_path.clone()));
 
     println!("safehoused: entering sync loop (sync v2); ctrl-c to stop");
     let sync = client.sync(SyncSettings::default());
     tokio::select! {
         result = sync => result.context("sync loop exited")?,
+        result = rpc => result.context("rpc task panicked")?.context("rpc server exited")?,
         _ = tokio::signal::ctrl_c() => println!("safehoused: shutdown requested"),
     }
+    let _ = fs::remove_file(&socket_path);
 
     // A room key minted moments ago may not have reached the server-side
     // backup yet; exiting without flushing makes it unrecoverable after a
@@ -198,16 +226,41 @@ async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client) {
     }
 }
 
-async fn on_message(event: OriginalSyncRoomMessageEvent, room: Room, client: Client) {
-    if Some(event.sender.as_ref()) == client.user_id() {
-        return; // the don't-loop-back filter — the only special case (envelope §7)
+async fn on_message(
+    event: OriginalSyncRoomMessageEvent,
+    room: Room,
+    client: Client,
+    raw: RawEvent,
+    Ctx(registry): Ctx<Arc<Registry>>,
+) {
+    let own_event = Some(event.sender.as_ref()) == client.user_id();
+    let content: Value = serde_json::from_str(raw.get())
+        .ok()
+        .and_then(|v: Value| v.get("content").cloned())
+        .unwrap_or(Value::Null);
+    let env = envelope::from_event_json(&content, event.sender.as_str(), &registry.personas);
+
+    if !own_event {
+        println!(
+            "[{}] {}: {}",
+            room.name().unwrap_or_else(|| room.room_id().to_string()),
+            event.sender,
+            event.content.body()
+        );
     }
-    println!(
-        "[{}] {}: {}",
-        room.name().unwrap_or_else(|| room.room_id().to_string()),
-        event.sender,
-        event.content.body()
-    );
+
+    let push = json!({
+        "event": "message",
+        "room_id": room.room_id(),
+        "room_name": room.name(),
+        "sender": event.sender,
+        "event_id": event.event_id,
+        "envelope": env,
+    });
+    // §7 refined: own events still dispatch to local agents, skipping only the
+    // authoring persona — that's how same-host agent-to-agent traffic flows
+    // while staying loop-free.
+    registry.dispatch(&push.to_string(), own_event, &env.from).await;
 }
 
 /// An event that reaches this handler stayed encrypted after decryption was

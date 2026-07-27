@@ -73,8 +73,15 @@ Cold/warm/recovery boot, encrypted sqlite store, auto-join invites, sync v2, dec
 prints to stdout, shutdown flushes room-key backup. Verified live: joined on invite from a second
 user and decrypted a cross-user encrypted message. Refuses to run if the device fails to self-sign.
 
-### 4. Add the unix-socket RPC + envelope.
-`send(room, envelope)` and inbound dispatch. Enforce the `from` allowlist **in the daemon**.
+### 4. ~~Add the unix-socket RPC + envelope~~ ✅ DONE 2026-07-26
+JSON-lines over `<state_dir>/safehoused.sock`: `hello` (persona gated by the config `personas`
+allowlist, enforced in the daemon), `send` (daemon stamps `from`, renders envelope v1),
+`create_room`, `list_rooms`, `read`, plus inbound push lines. **`safehouse-mcp`** (workspace
+member) is the keyless stdio MCP shim over it — tools `safehouse_send` / `safehouse_create_room` /
+`safehouse_list_rooms` / `safehouse_read` — pulled forward from the v1 plan. Verified live
+end-to-end: MCP tool call → socket → encrypted room → phone, allowlist rejection included.
+Envelope §7's loop-back rule was refined during implementation (own events dispatch to non-author
+personas; see the note in `protocol/envelope-v1.md`).
 
 ### 5. Wire one real agent and retire the copy-paste relay.
 Start with the nitas-mama or family-tree handoff use case that motivated all this.

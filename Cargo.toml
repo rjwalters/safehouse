@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["safehoused", "spikes/qj-coldstart"]
+members = ["safehoused", "safehouse-mcp", "spikes/qj-coldstart"]
 
 [workspace.dependencies]
 matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite"] }
