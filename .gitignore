@@ -68,3 +68,6 @@ crypto-store/
 .loom/*.sock
 .loom/logs/
 # <<< loom-managed <<<
+
+# repo:handoff session notes (one-shot, never committed)
+.claude/handoff.md
