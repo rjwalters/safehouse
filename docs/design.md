@@ -96,7 +96,7 @@ in 0.16.1 — directly our threat model).
 
 - Spawn and die freely (per-task). **Never touch keys, never verify, never hit "unable to decrypt."**
 - Talk **plaintext** to the local daemon over the unix socket (inside the trust boundary).
-- Identified by an **envelope field** (`from: book-agent`, `to: family-tree-agent | @human | room`),
+- Identified by an **envelope field** (`from: writer-agent`, `to: research-agent | @human | room`),
   not by a Matrix identity. The daemon multiplexes many agent personas over its one device.
 
 ### 4.3 Human client

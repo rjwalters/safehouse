@@ -1,8 +1,8 @@
 # Start here — handoff to the safehouse agent
 
-You're picking up **safehouse** with **research complete and no code written**. Everything below is
-committed. Read in this order: this file → `../README.md` → `design.md` → `decisions.md` →
-`open-questions.md` → `research/` as needed.
+You're picking up **safehouse** with the **core stack built and verified live** — daemon, envelope,
+MCP shim, production homeserver. Everything below is committed. Read in this order: this file →
+`../README.md` → `design.md` → `decisions.md` → `open-questions.md` → `research/` as needed.
 
 ## What safehouse is (30 seconds)
 A FOSS, E2E, bot-first messaging substrate on **Matrix** for small rooms (≤20). A **per-host daemon
@@ -11,18 +11,19 @@ inbound room events to **ephemeral local agents** that sit behind it over a **lo
 hold no keys. The **room is the single source of truth** so a human on Element gets full visibility +
 @-mention remote control. Threat model: compromised host/server, NOT agent-vs-agent.
 
-## Status: ready to build — Q-J passed live, Q-F accepted
+## Status: steps 1–4 done and verified live; next is the first real agent
 
-Two research rounds are done (8 passes, all 2026-07-26, archived in `research/`). **The biggest
-technical risk — headless login + cross-signing — is retired, and as of 2026-07-26 it is verified
-live** (`research/2026-07-26-qj-integration-test.md`, spike in `spikes/qj-coldstart/`): cold start,
-warm start, and store-wipe disaster recovery all pass against tuwunel v1.8.2 + matrix-sdk 0.18.0.
-The envelope schema is accepted (`protocol/envelope-v1.md`). Nothing blocks `safehoused` v0 except
-the phone-side Element check (needs Robb).
+Two research rounds are done (8 passes, all 2026-07-26, archived in `research/`). **Every question
+is answered and live-verified**, including the phone check on the production stack: cold start, warm
+start, store-wipe disaster recovery (`research/2026-07-26-qj-integration-test.md`), envelope v1
+accepted and implemented, socket RPC + `safehouse-mcp` shipped, and the full chain proven —
+MCP tool call → unix socket → encrypted room → the human's Element X. The production homeserver
+(tuwunel, federation off) runs on an always-on host, reachable only over the fleet's tailnet, TLS
+via Caddy DNS-01 (D14).
 
 ## Decisions already made (don't relitigate without reason)
 
-See `decisions.md` for all thirteen with rationale. The load-bearing ones:
+See `decisions.md` for all fourteen with rationale. The load-bearing ones:
 
 - **Matrix, not a hand-rolled Signal clone.** Never hand-write crypto — vodozemac via
   matrix-rust-sdk. (D3)
@@ -62,9 +63,9 @@ See `decisions.md` for all thirteen with rationale. The load-bearing ones:
 
 ## Recommended first moves (in order)
 
-### 1. ~~Q-J — the live integration test~~ ✅ DONE 2026-07-26, all steps pass
-See `research/2026-07-26-qj-integration-test.md`. Only the phone-side check remains: Element as
-`@robb:safehouse.local`, accept the safehouse-test invite, confirm decryption + the bot's shield.
+### 1. ~~Q-J — the live integration test~~ ✅ DONE 2026-07-26, all steps pass, phone included
+See `research/2026-07-26-qj-integration-test.md` and the phone-check addendum in
+`open-questions.md` Q-J — Element X shows no reduced-trust indicator for the self-signed daemon.
 
 ### 2. ~~Q-F — design the envelope schema~~ ✅ DONE — accepted as `protocol/envelope-v1.md`
 
@@ -84,18 +85,17 @@ Envelope §7's loop-back rule was refined during implementation (own events disp
 personas; see the note in `protocol/envelope-v1.md`).
 
 ### 5. Wire one real agent and retire the copy-paste relay.
-Start with the nitas-mama or family-tree handoff use case that motivated all this.
+Start with the two-project handoff use case that motivated all this: one agent writing a long-form document, another holding the facts it needs, today bridged by a human copy-pasting.
 
 ## Deferred, with a deadline
-- **D11 — CLA vs. DCO.** Must be decided **before merging any outside contribution**; after that,
-  relicensing needs every contributor's consent.
-- **Claude Code Channels / MCP** is a **v1** item (`safehoused-channel`, a keyless stdio shim). It's
-  the sanctioned wake mechanism and worth building — but it's a research preview with a changeable
-  protocol contract, so keep it off the v0 critical path.
+- ~~**D11 — CLA vs. DCO.**~~ ✅ Decided 2026-07-26: **DCO** (`CONTRIBUTING.md`, D11).
+- **Claude Code Channels push-wake** remains a **v1** item. `safehouse-mcp` covers the tools story
+  today (polling via `safehouse_read`); Channels is the sanctioned *wake* mechanism — still a
+  research preview with a changeable protocol contract, so still off the critical path.
 
 ## Housekeeping
 - Repo is local only. Public repo `rjwalters/safehouse` to be created when Robb says go
   (`gh repo create rjwalters/safehouse --public --source . --push`).
-- Provenance for every decision lives in `research/` — seven passes, all 2026-07-26.
+- Provenance for every decision lives in `research/` — eight passes, all 2026-07-26.
 - Reference source (baibot, rust-mxlink, matrix-rust-sdk, tuwunel, continuwuity) was cloned to a
   scratchpad during research; re-clone as needed. Remember: read, don't copy.

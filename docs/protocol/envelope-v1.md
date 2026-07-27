@@ -37,18 +37,18 @@ ignore the prose. This is the same idiom Matrix bridges use.
   "msgtype": "m.text",
 
   // Human-facing. Element renders this. MUST be legible on its own.
-  "body": "book-agent → family-tree-agent · handoff\nNeed the Mueller lineage confirmed before I can close chapter 3.",
+  "body": "writer-agent → research-agent · handoff\nNeed the source list confirmed before I can close chapter 3.",
   "format": "org.matrix.custom.html",
-  "formatted_body": "<b>book-agent → family-tree-agent</b> · <i>handoff</i><br/>Need the Mueller lineage confirmed before I can close chapter 3.",
+  "formatted_body": "<b>writer-agent → research-agent</b> · <i>handoff</i><br/>Need the source list confirmed before I can close chapter 3.",
 
   // Machine-facing.
   "org.safehouse.envelope": {
     "v": 1,
-    "from": "book_agent",
-    "to": "family_tree_agent",
+    "from": "writer_agent",
+    "to": "research_agent",
     "type": "handoff",
-    "task_id": "mueller_lineage",
-    "body": "Need the Mueller lineage confirmed before I can close chapter 3."
+    "task_id": "source_check",
+    "body": "Need the source list confirmed before I can close chapter 3."
   },
 
   // Native Matrix threading, so Element shows a real thread.
@@ -70,7 +70,7 @@ MUST read `org.safehouse.envelope.body` and MUST NOT parse the header out of the
 | Field | Required | Type | Meaning |
 |---|---|---|---|
 | `v` | ✅ | integer | Envelope version. `1`. Receivers MUST ignore envelopes with a `v` they don't support, and SHOULD surface them to the human as unhandled. |
-| `from` | ✅ | string | Sending persona, e.g. `book_agent`. For a human, the full Matrix user ID (`@robb:safehouse.local`). **Stamped by the daemon — never taken from the agent.** See §6. |
+| `from` | ✅ | string | Sending persona, e.g. `writer_agent`. For a human, the full Matrix user ID (`@robb:safehouse.local`). **Stamped by the daemon — never taken from the agent.** See §6. |
 | `to` | ✅ | string | Target persona, a Matrix user ID, or `"*"` for room-broadcast. |
 | `type` | ✅ | string | One of `chat`, `task`, `handoff`, `ack`. See §4. |
 | `task_id` | — | string | Stable, human-meaningful task identifier, `[A-Za-z0-9_]`. Groups related messages independently of Matrix threading. |
@@ -106,9 +106,9 @@ rules, in priority order:
 is addressed to that persona. The token is stripped from the synthesized `body`.
 
 ```
-Human types:  @family-tree-agent confirm the Mueller lineage
-Synthesized:  { v:1, from:"@robb:safehouse.local", to:"family_tree_agent",
-                type:"chat", body:"confirm the Mueller lineage" }   → wakes it
+Human types:  @research-agent confirm the source list
+Synthesized:  { v:1, from:"@robb:safehouse.local", to:"research_agent",
+                type:"chat", body:"confirm the source list" }   → wakes it
 ```
 
 Personas are not Matrix users, so Element will **not** autocomplete the token, and a typo addresses
@@ -136,7 +136,7 @@ much later, when it is stale. Agents SHOULD treat broadcast `chat` as background
 once at socket handshake; the daemon stamps every outbound envelope itself. The socket connection —
 not a field in the message — is the identity. This is the only place the guarantee can be enforced.
 
-**Across hosts, identity is a pair.** A message from another host carries `from: book_agent` while
+**Across hosts, identity is a pair.** A message from another host carries `from: writer_agent` while
 its *Matrix* sender is `@safehoused-hostb:server`. The persona claim is only as trustworthy as that
 host's daemon.
 
@@ -178,7 +178,7 @@ The event `body` MUST be legible standing alone, because that is all a human see
 <body>
 ```
 
-- Personas render with hyphens for readability (`book_agent` → `book-agent`) — cosmetic only; the
+- Personas render with hyphens for readability (`writer_agent` → `writer-agent`) — cosmetic only; the
   wire form is always underscored.
 - `to: "*"` renders as `everyone`.
 - `type: chat` MAY omit the ` · <type>` suffix, since it's the default and the header is noise.

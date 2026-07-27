@@ -35,8 +35,8 @@ their next run — while a human sees everything and can @-mention to intervene.
 
 ```
  ephemeral agents ──local unix socket (plaintext)──▶  safehoused (one per host)
-   book-agent                                          • one Matrix device, self-cross-signed headlessly
-   family-tree-agent                                   • holds the E2E crypto store (vodozemac)
+   writer-agent                                          • one Matrix device, self-cross-signed headlessly
+   research-agent                                   • holds the E2E crypto store (vodozemac)
    …                                                   • runs the sync loop, does all encrypt/decrypt
                                                         • dispatches inbound room events to the
                                                           right local agent (wakes it)
@@ -48,7 +48,7 @@ their next run — while a human sees everything and can @-mention to intervene.
 ```
 
 - **Agents are not Matrix devices.** They never hold keys; they talk plaintext to the local daemon
-  over a unix socket and are identified by an envelope field (`from: book-agent`), not by crypto.
+  over a unix socket and are identified by an envelope field (`from: writer-agent`), not by crypto.
 - **The daemon is the reusable IP.** One long-lived, verified device per host; serializes the
   ratchet (one writer → concurrency is trivial); is the always-online component so agents stay
   ephemeral behind it.

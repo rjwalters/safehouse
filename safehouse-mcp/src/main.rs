@@ -147,7 +147,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "safehouse_send",
-            "description": "Send a message into a safehouse room. The daemon stamps your persona as the sender; `to` is a persona (e.g. family_tree_agent), a Matrix user id, or \"*\" for room broadcast. Types: chat (conversational), task (unit of work, use task_id), handoff (transfer of responsibility), ack (completion).",
+            "description": "Send a message into a safehouse room. The daemon stamps your persona as the sender; `to` is a persona (e.g. research_agent), a Matrix user id, or \"*\" for room broadcast. Types: chat (conversational), task (unit of work, use task_id), handoff (transfer of responsibility), ack (completion).",
             "inputSchema": {
                 "type": "object",
                 "properties": {

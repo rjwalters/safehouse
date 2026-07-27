@@ -27,7 +27,7 @@ link vodozemac.**
 sit behind it over a local unix socket and hold no keys.
 **Why:** collapses the ephemeral-agent key-lifecycle problem to nothing (agents aren't devices),
 serializes the ratchet (single writer), and matches the threat model (machine = unit of trust).
-Attribution moves to the message envelope (`from: book-agent`), not the crypto identity.
+Attribution moves to the message envelope (`from: writer-agent`), not the crypto identity.
 
 ## D5 — Lightweight Rust homeserver + persistent client-SDK daemon (NOT encrypted appservice / Synapse)
 **Decision:** run a lightweight Rust homeserver with federation off; the daemon is a persistent
@@ -158,13 +158,16 @@ Optional and cosmetic: a one-time human user-to-user verification from Element g
 `@safehoused:host`. Operator confidence only. If we ever implement the daemon side, auto-`confirm()`
 must be gated behind an explicitly operator-opened window — otherwise we'd auto-accept a MITM'd SAS.
 
-## D11 — DEFERRED: CLA vs. DCO
-**Status:** consciously deferred, with a deadline.
-**Deadline:** must be resolved **before merging any outside contribution.** Once outside work is
-merged under bare inbound=outbound Apache-2.0, relicensing becomes impossible without tracking down
-every contributor. DCO is simpler and community-friendly but forecloses relicensing; a CLA preserves
-dual-licensing/commercial options but deters casual contributors. Zero cost while Robb is sole
-author; the only real risk is forgetting when the first PR arrives.
+## D11 — **DCO** (decided 2026-07-26, before going public)
+**Decision:** contributions are accepted under the **Developer Certificate of Origin** —
+`Signed-off-by` on every commit, inbound = outbound Apache-2.0. See `CONTRIBUTING.md`.
+
+**Why:** DCO is the Apache-community norm and zero-friction for contributors; a CLA's only real
+purchase is preserving proprietary dual-licensing, which this project deliberately does not want —
+D8 chose Apache-2.0 exactly to keep every downstream option open rather than to hold one back.
+Known trade-off, accepted: once outside DCO'd work is merged, relicensing requires every
+contributor's consent. Decided before the repo went public so the first drive-by PR can't land in
+the gap.
 
 ## D12 — Homeserver: **tuwunel**, pinned ≥ v1.8.2 (reverses the provisional pick)
 **Decision:** run **tuwunel** ≥ v1.8.2, federation off. Runner-up continuwuity v26.6.2.
@@ -213,16 +216,16 @@ The blast radius is asymmetric and that's the point: on the phone, the worst cas
 hang cleared by restarting the app; in the daemon, to-device loss means missing room keys.
 
 
-## D14 — Deployment: server_name is `safehouse.2amlogic.com`, TLS via Caddy + Cloudflare DNS-01
-**Decision (2026-07-26):** the production homeserver runs on the Mac Studio with the **permanent**
-`server_name = safehouse.2amlogic.com` (a domain we control, in the dedicated 2AM Logic Cloudflare
-account). TLS is terminated by **Caddy** (custom build with the `caddy-dns/cloudflare` module) using
+## D14 — Deployment: server_name on a domain we own, TLS via Caddy + Cloudflare DNS-01
+**Decision (2026-07-26):** the production homeserver runs on an always-on host with a **permanent**
+`server_name` on a subdomain of a domain we control (held in a dedicated DNS account, separate from
+personal zones). TLS is terminated by **Caddy** (custom build with the `caddy-dns/cloudflare` module) using
 **DNS-01**, so certificate issuance never requires public reachability. tuwunel itself stays bound to
 loopback and serves `/.well-known/matrix/client`.
 
 **Why this shape:** `server_name` is immutable (D12 research, risk 7), so it must not encode a
 machine, a network tool, or an exposure decision. DNS-01 decouples *naming* from *reachability*:
-the `safehouse.2amlogic.com` A record can point at a LAN IP (today), a Tailscale IP, or a public
+the safehouse A record can point at a LAN IP (today), a Tailscale IP, or a public
 port-forward (for family devices without Tailscale) — in any order, reversibly, with no server wipe.
 A `*.ts.net` server_name was rejected because it welds the Matrix identity to Tailscale forever and
 forces every client device onto the tailnet; public-from-day-one was rejected as unnecessary

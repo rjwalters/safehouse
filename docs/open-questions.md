@@ -79,7 +79,7 @@ server-side backup — the first recovery attempt lost a message permanently. Th
 path MUST call `Backups::wait_for_steady_state()` (verified as the fix).
 
 **Phone check done 2026-07-26, production stack** (Element X on Android → tailnet →
-`safehouse.2amlogic.com` on the Studio): the human's encrypted message was decrypted and printed by
+the production homeserver): the human's encrypted message was decrypted and printed by
 `safehoused` end-to-end, and the bot's post-join messages decrypt on the phone. Pre-join history
 shows as undecryptable on the phone as expected — MSC4268 historic-key-bundles remains the open
 item there (only matters if pre-join history should be readable). Shield check (observed by Robb,
