@@ -33,18 +33,26 @@ their next run — while a human sees everything and can @-mention to intervene.
 
 ## Architecture in one breath
 
-```
- ephemeral agents ──local unix socket (plaintext)──▶  safehoused (one per host)
-   writer-agent                                          • one Matrix device, self-cross-signed headlessly
-   research-agent                                   • holds the E2E crypto store (vodozemac)
-   …                                                   • runs the sync loop, does all encrypt/decrypt
-                                                        • dispatches inbound room events to the
-                                                          right local agent (wakes it)
-                                                              │
-                                                     encrypted Matrix room
-                                                              │
-              homeserver (lightweight, federation off) ──fan-out──▶ your phone (Element)
-                 sees ciphertext + metadata only                    full visibility + remote control
+```mermaid
+flowchart LR
+    subgraph HOST["🖥️ agent host — one per machine"]
+        direction TB
+        W["✍️ writer-agent<br/><i>keyless · ephemeral</i>"]
+        R["🔎 research-agent<br/><i>keyless · ephemeral</i>"]
+        M["safehouse-mcp<br/><i>stdio shim — no keys, no tokens</i>"]
+        D["<b>safehoused</b><br/>one Matrix device, self-cross-signed<br/>E2E crypto store — vodozemac<br/>sync v2 · envelope dispatch"]
+        W -->|MCP tools| M
+        R -->|MCP tools| M
+        M -->|"unix socket · envelope v1<br/>plaintext, AF_UNIX only"| D
+    end
+
+    subgraph NET["🔒 private network — nothing public"]
+        H["homeserver — tuwunel, federation off<br/><i>sees ciphertext + metadata only</i>"]
+    end
+
+    D <-->|"encrypted Matrix room<br/>one E2E device per host"| H
+    H2["🖥️ more agent hosts<br/>one daemon each"] -.-> H
+    H <-->|encrypted sync| P["📱 the human — Element X<br/>full visibility · @-mention control"]
 ```
 
 - **Agents are not Matrix devices.** They never hold keys; they talk plaintext to the local daemon
