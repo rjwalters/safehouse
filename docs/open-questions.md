@@ -82,8 +82,11 @@ path MUST call `Backups::wait_for_steady_state()` (verified as the fix).
 `safehouse.2amlogic.com` on the Studio): the human's encrypted message was decrypted and printed by
 `safehoused` end-to-end, and the bot's post-join messages decrypt on the phone. Pre-join history
 shows as undecryptable on the phone as expected — MSC4268 historic-key-bundles remains the open
-item there (only matters if pre-join history should be readable). Still to note informally: which
-trust shield Element X renders on the self-signed bot.
+item there (only matters if pre-join history should be readable). Shield check (observed by Robb,
+2026-07-26): **Element X shows no reduced-trust indicator at all** for the self-signed,
+never-interactively-verified bot — the headless bootstrap is treated as first-class, better than
+the "gray shield at worst" prediction. (Cosmetic note: tuwunel appends a 💕 display-name suffix to
+new users by default — disabled via `new_user_displayname_suffix = ""`.)
 
 ## 🔴 OPEN — resolve before / early in coding
 
