@@ -68,9 +68,10 @@ See `research/2026-07-26-qj-integration-test.md`. Only the phone-side check rema
 
 ### 2. ~~Q-F — design the envelope schema~~ ✅ DONE — accepted as `protocol/envelope-v1.md`
 
-### 3. Spike `safehoused` v0.
-Cold/warm start, persistent encrypted crypto store, join the room, sync v2, decrypt inbound, print to
-stdout. No agents yet. ~400 lines for the boot path — write it yourself, don't reach for mxlink.
+### 3. ~~Spike `safehoused` v0~~ ✅ DONE 2026-07-26 — `safehoused/` (workspace member)
+Cold/warm/recovery boot, encrypted sqlite store, auto-join invites, sync v2, decrypts inbound and
+prints to stdout, shutdown flushes room-key backup. Verified live: joined on invite from a second
+user and decrypted a cross-user encrypted message. Refuses to run if the device fails to self-sign.
 
 ### 4. Add the unix-socket RPC + envelope.
 `send(room, envelope)` and inbound dispatch. Enforce the `from` allowlist **in the daemon**.
