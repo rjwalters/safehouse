@@ -241,8 +241,12 @@ LaunchDaemon before the household depends on it.
 **Decision (2026-07-26):** the tuwunel homeserver will move off the Mac Studio to a dedicated,
 always-on Linux cloud host (AWS EC2, ~4 GB / t4g.medium-class per the 2–4 GB footprint in
 `research/2026-07-26-homeserver.md`). The Studio reverts to a pure loom **worker** (compute), no
-longer double-duty as the coordination hub. **Not yet executed** — tracked as an issue; this records
-the direction and rationale.
+longer double-duty as the coordination hub. **Executed 2026-07-27 (#14):** EC2 t4g.medium
+(`safehouse-homeserver`, us-west-2, 2amlogic account), tuwunel v1.8.2 deb under systemd bound to
+loopback, Caddy (cloudflare DNS-01) as the TLS terminator, tailscaled as a systemd unit
+(`tag:homeserver`, tailnet IP 100.126.56.42). RocksDB data migrated intact (same version, login +
+E2E send verified); `server_name` unchanged; DNS A record flipped — rollback remains a DNS flip
+while the Studio keeps its data-dir backup.
 
 **Why:**
 - **Removes the GUI-session fragility.** On macOS the homeserver ran under Docker Desktop, which only

@@ -18,8 +18,9 @@ is answered and live-verified**, including the phone check on the production sta
 start, store-wipe disaster recovery (`research/2026-07-26-qj-integration-test.md`), envelope v1
 accepted and implemented, socket RPC + `safehouse-mcp` shipped, and the full chain proven —
 MCP tool call → unix socket → encrypted room → the human's Element X. The production homeserver
-(tuwunel, federation off) runs on an always-on host, reachable only over the fleet's tailnet, TLS
-via Caddy DNS-01 (D14).
+(tuwunel, federation off) runs on a dedicated always-on EC2 host (D15, executed 2026-07-27),
+reachable only over the fleet's tailnet, TLS via Caddy DNS-01 (D14); the Studio is a pure fleet
+worker again.
 
 ## Decisions already made (don't relitigate without reason)
 
