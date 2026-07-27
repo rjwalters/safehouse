@@ -87,15 +87,50 @@ pub fn render(env: &Envelope) -> (String, String) {
     (plain, html)
 }
 
-/// Full `m.room.message` content carrying the envelope.
-pub fn to_event_content(env: &Envelope) -> Value {
+/// Full `m.room.message` content carrying the envelope. `relates_to`, when
+/// present, is native Matrix `m.thread` threading (§2) — see
+/// [`thread_relation`]. Callers that never thread (daemon-generated notices)
+/// pass `None`.
+pub fn to_event_content(env: &Envelope, relates_to: Option<Value>) -> Value {
     let (plain, html) = render(env);
-    json!({
+    let mut content = json!({
         "msgtype": "m.text",
         "body": plain,
         "format": "org.matrix.custom.html",
         "formatted_body": html,
         ENVELOPE_KEY: env,
+    });
+    if let Some(relates_to) = relates_to {
+        content["m.relates_to"] = relates_to;
+    }
+    content
+}
+
+/// If `content` carries an `m.relates_to` with `rel_type: m.thread`, return
+/// the referenced thread-root event id. `None` means this event either isn't
+/// part of a thread, or — per §2 — is itself the first message of one (its
+/// own event id becomes the root once observed).
+pub fn thread_root_from_content(content: &Value) -> Option<String> {
+    let relates_to = content.get("m.relates_to")?;
+    if relates_to.get("rel_type").and_then(Value::as_str) != Some("m.thread") {
+        return None;
+    }
+    relates_to
+        .get("event_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Build the `m.relates_to` value for §2's native `m.thread` relation:
+/// `root_event_id` is the task's thread root, `latest_event_id` is the most
+/// recent event in that thread (used for the `is_falling_back` rich-reply
+/// fallback so non-threading clients still see a sane reply chain).
+pub fn thread_relation(root_event_id: &str, latest_event_id: &str) -> Value {
+    json!({
+        "rel_type": "m.thread",
+        "event_id": root_event_id,
+        "is_falling_back": true,
+        "m.in_reply_to": { "event_id": latest_event_id },
     })
 }
 
@@ -115,7 +150,18 @@ pub fn to_event_content(env: &Envelope) -> Value {
 /// already carried an envelope (agent traffic) never produce a token — the
 /// caller uses it to post the visible ack §5.1 requires; silent misdelivery
 /// is explicitly disallowed there.
-pub fn from_event_json(content: &Value, sender: &str, personas: &[String]) -> Inbound {
+///
+/// `thread_agent` is the persona the caller has already resolved (from its
+/// own thread-tracking state) as "the agent for the thread this event
+/// belongs to" — `None` when the event isn't part of any tracked thread.
+/// Only consulted for human-message synthesis (§5.2); ignored for events that
+/// already carry an envelope.
+pub fn from_event_json(
+    content: &Value,
+    sender: &str,
+    personas: &[String],
+    thread_agent: Option<&str>,
+) -> Inbound {
     if let Some(raw) = content.get(ENVELOPE_KEY) {
         // Read `v` before attempting to interpret the rest. An envelope with a
         // present-but-unsupported integer `v` is never guess-parsed and never
@@ -137,14 +183,18 @@ pub fn from_event_json(content: &Value, sender: &str, personas: &[String]) -> In
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let (env, unknown_persona) = synthesize_for_human(sender, body, personas);
+    let (env, unknown_persona) = synthesize_for_human(sender, body, personas, thread_agent);
     Inbound::Envelope(env, unknown_persona)
 }
 
+/// §5 synthesis, in priority order: §5.1 explicit `@token` address, §5.2
+/// thread reply (routes to `thread_agent` with no token needed), §5.3
+/// unaddressed broadcast.
 fn synthesize_for_human(
     sender: &str,
     body: &str,
     personas: &[String],
+    thread_agent: Option<&str>,
 ) -> (Envelope, Option<String>) {
     if let Some(rest) = body.strip_prefix('@') {
         let token: String = rest
@@ -176,6 +226,23 @@ fn synthesize_for_human(
             // silently.
             return (broadcast(sender, body), Some(token));
         }
+    }
+    // §5.2 — no explicit token, but the message is inside a thread the
+    // caller has already resolved to an agent: route there, no token
+    // required. This is the majority of follow-up traffic — the whole point
+    // is the token only has to be typed once per task.
+    if let Some(agent) = thread_agent {
+        return (
+            Envelope {
+                v: 1,
+                from: sender.to_owned(),
+                to: agent.to_owned(),
+                kind: "chat".to_owned(),
+                task_id: None,
+                body: body.to_owned(),
+            },
+            None,
+        );
     }
     // §5.3 — unaddressed human message: broadcast, wakes no one.
     (broadcast(sender, body), None)
@@ -246,7 +313,7 @@ mod tests {
     #[test]
     fn supported_version_parses_to_envelope() {
         let content = envelope_content(u64::from(SUPPORTED_VERSION));
-        match from_event_json(&content, "@robb:safehouse.local", &personas()) {
+        match from_event_json(&content, "@robb:safehouse.local", &personas(), None) {
             Inbound::Envelope(env, unknown) => {
                 assert_eq!(env.v, SUPPORTED_VERSION);
                 assert_eq!(env.from, "writer_agent");
@@ -264,7 +331,7 @@ mod tests {
         // Regression for #6: a well-formed-but-future envelope must NOT be
         // guess-parsed or synthesized as a human message — it is gated on `v`.
         let content = envelope_content(2);
-        match from_event_json(&content, "@robb:safehouse.local", &personas()) {
+        match from_event_json(&content, "@robb:safehouse.local", &personas(), None) {
             Inbound::UnsupportedVersion(v) => assert_eq!(v, 2),
             other => panic!("expected UnsupportedVersion(2), got {other:?}"),
         }
@@ -274,7 +341,7 @@ mod tests {
     fn large_future_version_preserved_without_truncation() {
         let big = u64::from(u32::MAX) + 5;
         let content = envelope_content(big);
-        match from_event_json(&content, "@robb:safehouse.local", &personas()) {
+        match from_event_json(&content, "@robb:safehouse.local", &personas(), None) {
             Inbound::UnsupportedVersion(v) => assert_eq!(v, big),
             other => panic!("expected UnsupportedVersion({big}), got {other:?}"),
         }
@@ -284,7 +351,7 @@ mod tests {
     fn addressed_human_message_synthesizes_envelope() {
         let content =
             json!({ "msgtype": "m.text", "body": "@research-agent confirm the source list" });
-        match from_event_json(&content, "@robb:safehouse.local", &personas()) {
+        match from_event_json(&content, "@robb:safehouse.local", &personas(), None) {
             Inbound::Envelope(env, unknown) => {
                 assert_eq!(env.v, SUPPORTED_VERSION);
                 assert_eq!(env.from, "@robb:safehouse.local");
@@ -300,7 +367,7 @@ mod tests {
     #[test]
     fn unaddressed_human_message_broadcasts() {
         let content = json!({ "msgtype": "m.text", "body": "hmm, the timeline looks off" });
-        match from_event_json(&content, "@robb:safehouse.local", &personas()) {
+        match from_event_json(&content, "@robb:safehouse.local", &personas(), None) {
             Inbound::Envelope(env, unknown) => {
                 assert_eq!(env.to, "*");
                 assert_eq!(env.kind, "chat");
@@ -445,7 +512,7 @@ mod tests {
                 "body": "Need the source list confirmed."
             }
         });
-        match from_event_json(&content, "@robb:safehouse.local", &[]) {
+        match from_event_json(&content, "@robb:safehouse.local", &[], None) {
             Inbound::Envelope(env, unknown) => {
                 assert_eq!(env.v, 1);
                 assert_eq!(env.from, "writer_agent");
@@ -468,7 +535,7 @@ mod tests {
             "body": "hmm, the timeline looks off",
             ENVELOPE_KEY: { "v": 1, "from": "someone" }
         });
-        match from_event_json(&content, "@robb:safehouse.local", &[]) {
+        match from_event_json(&content, "@robb:safehouse.local", &[], None) {
             Inbound::Envelope(env, unknown) => {
                 assert_eq!(env.from, "@robb:safehouse.local");
                 assert_eq!(env.to, "*");
@@ -483,7 +550,7 @@ mod tests {
     #[test]
     fn from_event_json_no_body_field_defaults_to_empty() {
         let content = json!({});
-        match from_event_json(&content, "@robb:safehouse.local", &[]) {
+        match from_event_json(&content, "@robb:safehouse.local", &[], None) {
             Inbound::Envelope(env, _unknown) => {
                 assert_eq!(env.body, "");
                 assert_eq!(env.to, "*");
@@ -503,6 +570,7 @@ mod tests {
             "@robb:safehouse.local",
             "@research-agent confirm the source list",
             &personas(),
+            None,
         );
         assert_eq!(env.to, "research_agent");
         assert_eq!(env.body, "confirm the source list");
@@ -519,6 +587,7 @@ mod tests {
             "@robb:safehouse.local",
             "@research-agent: hello",
             &personas(),
+            None,
         );
         assert_eq!(env.to, "research_agent");
         assert_eq!(env.body, "hello");
@@ -535,6 +604,7 @@ mod tests {
             "@robb:safehouse.local",
             "@typo-agent do the thing",
             &personas(),
+            None,
         );
         assert_eq!(env.to, "*");
         assert_eq!(env.kind, "chat");
@@ -551,6 +621,7 @@ mod tests {
             "@robb:safehouse.local",
             "hmm, the timeline looks off",
             &personas(),
+            None,
         );
         assert_eq!(env.to, "*");
         assert_eq!(env.from, "@robb:safehouse.local");
@@ -564,7 +635,8 @@ mod tests {
     /// address, so the daemon doesn't ack on stray `@` usage.
     #[test]
     fn bare_at_sign_is_not_an_unknown_address() {
-        let (env, unknown) = synthesize_for_human("@robb:safehouse.local", "@ hello", &personas());
+        let (env, unknown) =
+            synthesize_for_human("@robb:safehouse.local", "@ hello", &personas(), None);
         assert_eq!(env.to, "*");
         assert_eq!(env.body, "@ hello");
         assert!(unknown.is_none());
@@ -584,7 +656,7 @@ mod tests {
                 "body": "hi"
             }
         });
-        match from_event_json(&content, "@safehoused-hosta:server", &personas()) {
+        match from_event_json(&content, "@safehoused-hosta:server", &personas(), None) {
             Inbound::Envelope(env, unknown) => {
                 assert_eq!(env.from, "writer_agent");
                 assert_eq!(env.to, "does_not_exist");
@@ -619,10 +691,15 @@ mod tests {
     // ---- additional §5.1 token-parsing edge cases -------------------------
 
     fn human(body: &str) -> Envelope {
+        human_in_thread(body, None)
+    }
+
+    fn human_in_thread(body: &str, thread_agent: Option<&str>) -> Envelope {
         match from_event_json(
             &json!({ "body": body }),
             "@robb:safehouse.local",
             &personas(),
+            thread_agent,
         ) {
             Inbound::Envelope(env, _unknown) => env,
             other => panic!("expected Envelope, got {other:?}"),
@@ -648,5 +725,92 @@ mod tests {
         let env = human("@research_agent:");
         assert_eq!(env.to, "research_agent");
         assert_eq!(env.body, "");
+    }
+
+    // ---- §5.2 — thread-reply routing --------------------------------------
+
+    /// §5.2 — a human message with no `@token` but a resolved thread agent
+    /// routes there directly; no token required.
+    #[test]
+    fn thread_reply_routes_to_thread_agent_without_token() {
+        let env = human_in_thread("confirm the source list", Some("research_agent"));
+        assert_eq!(env.to, "research_agent");
+        assert_eq!(env.from, "@robb:safehouse.local");
+        assert_eq!(env.kind, "chat");
+        assert_eq!(env.body, "confirm the source list");
+    }
+
+    /// §5.1 still takes priority over §5.2: an explicit `@token` wins even
+    /// inside a tracked thread.
+    #[test]
+    fn explicit_address_overrides_thread_agent() {
+        let env = human_in_thread("@writer-agent status?", Some("research_agent"));
+        assert_eq!(env.to, "writer_agent");
+        assert_eq!(env.body, "status?");
+    }
+
+    /// No `@token` and no tracked thread agent: falls through to §5.3
+    /// broadcast, unchanged from prior behavior.
+    #[test]
+    fn no_token_and_no_thread_agent_still_broadcasts() {
+        let env = human_in_thread("hmm, the timeline looks off", None);
+        assert_eq!(env.to, "*");
+        assert_eq!(env.kind, "chat");
+    }
+
+    // ---- to_event_content / thread_relation — §2 native threading --------
+
+    #[test]
+    fn to_event_content_without_relation_omits_relates_to() {
+        let content = to_event_content(&env("writer_agent", "research_agent", "chat", "hi"), None);
+        assert!(content.get("m.relates_to").is_none());
+    }
+
+    #[test]
+    fn to_event_content_with_relation_embeds_it() {
+        let relation = thread_relation("$root", "$latest");
+        let content = to_event_content(
+            &env("writer_agent", "research_agent", "task", "go"),
+            Some(relation),
+        );
+        let relates_to = content
+            .get("m.relates_to")
+            .expect("m.relates_to must be present");
+        assert_eq!(relates_to["rel_type"], "m.thread");
+        assert_eq!(relates_to["event_id"], "$root");
+        assert_eq!(relates_to["is_falling_back"], true);
+        assert_eq!(relates_to["m.in_reply_to"]["event_id"], "$latest");
+    }
+
+    #[test]
+    fn thread_relation_shape_matches_spec() {
+        let relation = thread_relation("$abc", "$abc");
+        assert_eq!(relation["rel_type"], "m.thread");
+        assert_eq!(relation["event_id"], "$abc");
+        assert_eq!(relation["m.in_reply_to"]["event_id"], "$abc");
+    }
+
+    #[test]
+    fn thread_root_from_content_extracts_thread_relation() {
+        let content = json!({
+            "body": "confirm the source list",
+            "m.relates_to": thread_relation("$root", "$latest"),
+        });
+        assert_eq!(thread_root_from_content(&content).as_deref(), Some("$root"));
+    }
+
+    #[test]
+    fn thread_root_from_content_ignores_non_thread_relations() {
+        let content = json!({
+            "body": "a plain reply",
+            "m.relates_to": { "rel_type": "m.reference", "event_id": "$other" },
+        });
+        assert!(thread_root_from_content(&content).is_none());
+    }
+
+    #[test]
+    fn thread_root_from_content_none_when_absent() {
+        let content = json!({ "body": "no relation here" });
+        assert!(thread_root_from_content(&content).is_none());
     }
 }

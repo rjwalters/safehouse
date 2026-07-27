@@ -35,6 +35,79 @@ pub struct Registry {
     /// unsupported-version envelope (§7.2). Deduped so a remote daemon sending
     /// a stream of bad-version envelopes surfaces once, not once per event.
     surfaced_unsupported: Mutex<HashSet<(String, u64)>>,
+    /// §2/§5.2 thread-relation bookkeeping, populated from the synced event
+    /// stream (D6 — one code path) and consulted both when composing outbound
+    /// `m.relates_to` and when routing un-tokened human thread replies.
+    pub threads: ThreadState,
+}
+
+/// In-memory thread bookkeeping. All state here is derived from observed
+/// room events (`ThreadState::observe`, called once per dispatched envelope
+/// in `on_message`) — never persisted, since it's rebuildable from room
+/// history and the daemon is long-running (D6: the room, not local state, is
+/// the source of truth; this is a local index over it, not a second copy).
+#[derive(Default)]
+pub struct ThreadState {
+    /// `task_id` -> the event id of that task's thread root (§2). Recorded
+    /// the first time a `task_id` is seen; never overwritten, so every
+    /// message sharing a `task_id` threads under the same root.
+    task_roots: Mutex<HashMap<String, String>>,
+    /// thread root event id -> the most recent event id observed in that
+    /// thread, for the `m.in_reply_to` rich-reply fallback (§2).
+    latest_in_thread: Mutex<HashMap<String, String>>,
+    /// thread root event id -> the persona most recently addressed within
+    /// that thread, so a human's un-tokened in-thread reply (§5.2) still
+    /// routes correctly.
+    thread_target: Mutex<HashMap<String, String>>,
+}
+
+impl ThreadState {
+    /// The thread root already recorded for `task_id`, if any.
+    pub async fn root_for_task(&self, task_id: &str) -> Option<String> {
+        self.task_roots.lock().await.get(task_id).cloned()
+    }
+
+    /// The most recent event id observed in the thread rooted at
+    /// `root_event_id`, if any.
+    pub async fn latest_in_thread(&self, root_event_id: &str) -> Option<String> {
+        self.latest_in_thread
+            .lock()
+            .await
+            .get(root_event_id)
+            .cloned()
+    }
+
+    /// The persona currently addressed within the thread rooted at
+    /// `root_event_id` (§5.2), if any.
+    pub async fn target_for_thread(&self, root_event_id: &str) -> Option<String> {
+        self.thread_target.lock().await.get(root_event_id).cloned()
+    }
+
+    /// Record that `event_id` (belonging to the thread rooted at
+    /// `thread_root`) carried `env`. Called for every dispatched envelope —
+    /// own, remote, or human-synthesized — so thread state always reflects
+    /// what actually round-tripped through the room (D6).
+    pub async fn observe(&self, thread_root: &str, event_id: &str, env: &Envelope) {
+        self.latest_in_thread
+            .lock()
+            .await
+            .insert(thread_root.to_owned(), event_id.to_owned());
+        if let Some(task_id) = &env.task_id {
+            self.task_roots
+                .lock()
+                .await
+                .entry(task_id.clone())
+                .or_insert_with(|| thread_root.to_owned());
+        }
+        // Only a persona-shaped `to` (never "*", never a Matrix user id) is
+        // useful as a §5.2 routing target.
+        if envelope::valid_persona(&env.to) {
+            self.thread_target
+                .lock()
+                .await
+                .insert(thread_root.to_owned(), env.to.clone());
+        }
+    }
 }
 
 struct ConnHandle {
@@ -49,6 +122,7 @@ impl Registry {
             next_id: std::sync::atomic::AtomicU64::new(1),
             personas,
             surfaced_unsupported: Mutex::new(HashSet::new()),
+            threads: ThreadState::default(),
         })
     }
 
@@ -184,14 +258,44 @@ async fn handle_op(
         "send" => {
             let env = build_send_envelope(persona, req)?;
             let room = resolve_room(client, req.get("room").and_then(Value::as_str))?;
-            let content = envelope::to_event_content(&env);
+
+            // §2: task/handoff chains sharing a `task_id` thread under that
+            // task's root event. If we already know the root (from an
+            // earlier send, or from having observed one over sync — D6),
+            // attach native `m.thread` threading; otherwise this send
+            // *becomes* the root and carries no relation.
+            let known_root = match &env.task_id {
+                Some(task_id) => registry.threads.root_for_task(task_id).await,
+                None => None,
+            };
+            let relates_to = if let Some(root) = &known_root {
+                let latest = registry
+                    .threads
+                    .latest_in_thread(root)
+                    .await
+                    .unwrap_or_else(|| root.clone());
+                Some(envelope::thread_relation(root, &latest))
+            } else {
+                None
+            };
+
+            let content = envelope::to_event_content(&env, relates_to);
             let response = room
                 .send_raw("m.room.message", content)
                 .await
                 .context("sending to room")?;
-            Ok(
-                json!({"ok": true, "event_id": response.response.event_id, "room_id": room.room_id()}),
-            )
+            let event_id = response.response.event_id.to_string();
+
+            // Self-register the thread state immediately rather than only
+            // relying on this event round-tripping back through sync — that
+            // closes the race where two rapid sends for a brand-new
+            // `task_id` would each miss the other's root (§2).
+            if env.task_id.is_some() {
+                let root = known_root.unwrap_or_else(|| event_id.clone());
+                registry.threads.observe(&root, &event_id, &env).await;
+            }
+
+            Ok(json!({"ok": true, "event_id": event_id, "room_id": room.room_id()}))
         }
         "create_room" => {
             let name = req
@@ -257,9 +361,24 @@ async fn handle_op(
                     "ts": parsed.get("origin_server_ts"),
                 });
                 let obj = message.as_object_mut().expect("json object literal");
+                // §5.2: resolve the thread agent the same way the live
+                // dispatch path does, so a replayed thread reply synthesizes
+                // the same envelope it would have gotten in real time.
+                let event_id = parsed.get("event_id").and_then(Value::as_str);
+                let thread_root = envelope::thread_root_from_content(&content)
+                    .or_else(|| event_id.map(str::to_owned));
+                let thread_agent = match &thread_root {
+                    Some(root) => registry.threads.target_for_thread(root).await,
+                    None => None,
+                };
                 // §7.2: never hand an agent a guessed envelope for a version we
                 // don't support — mark it so the agent can surface, not act.
-                match envelope::from_event_json(&content, &sender, &registry.personas) {
+                match envelope::from_event_json(
+                    &content,
+                    &sender,
+                    &registry.personas,
+                    thread_agent.as_deref(),
+                ) {
                     envelope::Inbound::Envelope(env, _unknown_persona) => {
                         obj.insert("envelope".into(), serde_json::to_value(env)?);
                     }
@@ -613,5 +732,118 @@ mod tests {
         assert!(registry.mark_unsupported_surfaced("@evil:remote", 3).await);
         // A different sender at a seen version is also new.
         assert!(registry.mark_unsupported_surfaced("@other:remote", 2).await);
+    }
+
+    // ---- ThreadState — §2 task threading / §5.2 thread-reply routing -------
+
+    fn env_to(to: &str, task_id: Option<&str>) -> Envelope {
+        Envelope {
+            v: 1,
+            from: "writer_agent".to_owned(),
+            to: to.to_owned(),
+            kind: "task".to_owned(),
+            task_id: task_id.map(str::to_owned),
+            body: "go".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_state_records_root_the_first_time_a_task_id_is_seen() {
+        let threads = ThreadState::default();
+        assert!(threads.root_for_task("source_check").await.is_none());
+
+        threads
+            .observe(
+                "$root",
+                "$root",
+                &env_to("research_agent", Some("source_check")),
+            )
+            .await;
+        assert_eq!(
+            threads.root_for_task("source_check").await.as_deref(),
+            Some("$root")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_state_never_overwrites_an_established_root() {
+        // Every subsequent event for the same task_id must thread under the
+        // *original* root, even if it arrives with a different root (which
+        // shouldn't happen in practice, but the map must not drift).
+        let threads = ThreadState::default();
+        threads
+            .observe(
+                "$root",
+                "$root",
+                &env_to("research_agent", Some("source_check")),
+            )
+            .await;
+        threads
+            .observe(
+                "$root",
+                "$reply1",
+                &env_to("writer_agent", Some("source_check")),
+            )
+            .await;
+        assert_eq!(
+            threads.root_for_task("source_check").await.as_deref(),
+            Some("$root")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_state_tracks_latest_event_in_thread() {
+        let threads = ThreadState::default();
+        threads
+            .observe("$root", "$root", &env_to("research_agent", Some("t")))
+            .await;
+        assert_eq!(
+            threads.latest_in_thread("$root").await.as_deref(),
+            Some("$root")
+        );
+
+        threads
+            .observe("$root", "$reply1", &env_to("writer_agent", Some("t")))
+            .await;
+        assert_eq!(
+            threads.latest_in_thread("$root").await.as_deref(),
+            Some("$reply1")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_state_tracks_last_addressed_persona_for_thread_replies() {
+        // §5.2: whoever was last addressed within a thread is who an
+        // un-tokened human reply should route to.
+        let threads = ThreadState::default();
+        threads
+            .observe("$root", "$root", &env_to("research_agent", Some("t")))
+            .await;
+        assert_eq!(
+            threads.target_for_thread("$root").await.as_deref(),
+            Some("research_agent")
+        );
+
+        threads
+            .observe("$root", "$reply1", &env_to("writer_agent", Some("t")))
+            .await;
+        assert_eq!(
+            threads.target_for_thread("$root").await.as_deref(),
+            Some("writer_agent")
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_state_ignores_broadcast_and_matrix_user_targets() {
+        // "*" and a Matrix user id are not persona-shaped — never useful as
+        // a §5.2 routing target.
+        let threads = ThreadState::default();
+        threads.observe("$root", "$root", &env_to("*", None)).await;
+        assert!(threads.target_for_thread("$root").await.is_none());
+
+        threads
+            .observe("$root", "$root", &env_to("@robb:safehouse.local", None))
+            .await;
+        assert!(threads.target_for_thread("$root").await.is_none());
     }
 }

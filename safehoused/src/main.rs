@@ -270,27 +270,49 @@ async fn on_message(
         );
     }
 
+    // §5.2: resolve the thread this event belongs to (its own id, unless it
+    // explicitly relates to an earlier root via `m.thread`) and, from prior
+    // observations, which persona is currently addressed there — used only
+    // for human-message synthesis below, ignored for events that already
+    // carry an envelope.
+    let event_id = event.event_id.to_string();
+    let thread_root =
+        envelope::thread_root_from_content(&content).unwrap_or_else(|| event_id.clone());
+    let thread_agent = registry.threads.target_for_thread(&thread_root).await;
+
     // §7.2/§9: gate on envelope version. An unsupported `v` is never dispatched
     // or guess-parsed — it is logged and surfaced to the human once per sender.
-    let (env, unknown_persona) =
-        match envelope::from_event_json(&content, event.sender.as_str(), &registry.personas) {
-            envelope::Inbound::Envelope(env, unknown_persona) => (env, unknown_persona),
-            envelope::Inbound::UnsupportedVersion(v) => {
-                eprintln!(
+    let (env, unknown_persona) = match envelope::from_event_json(
+        &content,
+        event.sender.as_str(),
+        &registry.personas,
+        thread_agent.as_deref(),
+    ) {
+        envelope::Inbound::Envelope(env, unknown_persona) => (env, unknown_persona),
+        envelope::Inbound::UnsupportedVersion(v) => {
+            eprintln!(
                 "safehoused: ignoring unsupported envelope version {v} from {} in {} (event {})",
                 event.sender,
                 room.room_id(),
                 event.event_id
             );
-                if registry
-                    .mark_unsupported_surfaced(event.sender.as_str(), v)
-                    .await
-                {
-                    surface_unsupported_version(&room, &client, event.sender.as_str(), v).await;
-                }
-                return;
+            if registry
+                .mark_unsupported_surfaced(event.sender.as_str(), v)
+                .await
+            {
+                surface_unsupported_version(&room, &client, event.sender.as_str(), v).await;
             }
-        };
+            return;
+        }
+    };
+
+    // Record this event's contribution to thread state (§2 task_id -> root,
+    // §5.2 root -> current agent) before dispatching, so a same-tick reply
+    // (e.g. this daemon's own subsequent `send`) already sees it.
+    registry
+        .threads
+        .observe(&thread_root, &event_id, &env)
+        .await;
 
     let push = json!({
         "event": "message",
@@ -314,7 +336,7 @@ async fn on_message(
     // this path.
     if let Some(token) = unknown_persona {
         let ack = envelope::unknown_persona_ack(&env.from, &token, &registry.personas);
-        let content = envelope::to_event_content(&ack);
+        let content = envelope::to_event_content(&ack, None);
         if let Err(err) = room.send_raw("m.room.message", content).await {
             eprintln!(
                 "safehoused: failed to post unknown-persona ack for @{token} in {}: {err:#}",
@@ -346,7 +368,7 @@ async fn surface_unsupported_version(room: &Room, client: &Client, sender: &str,
             envelope::SUPPORTED_VERSION
         ),
     };
-    let content = envelope::to_event_content(&env);
+    let content = envelope::to_event_content(&env, None);
     if let Err(err) = room.send_raw("m.room.message", content).await {
         eprintln!("safehoused: failed to surface unsupported-version notice for {sender}: {err:#}");
     }
