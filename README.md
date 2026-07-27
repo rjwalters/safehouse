@@ -90,6 +90,44 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
 **Next:** wire the first real agent through the stack, and the loom fleet integration
 ([loom#3997–3999](https://github.com/rjwalters/loom/issues/3997)).
 
+## Running it
+
+1. **Create the bot's Matrix account** on your homeserver ahead of time — `safehoused` logs in with
+   a username/password, it never registers itself. On tuwunel (registration off by default):
+
+   ```bash
+   tuwunel --execute "users create_user safehouse-bot"   # prompts for a password
+   ```
+
+   See [`docs/research/2026-07-26-homeserver.md`](docs/research/2026-07-26-homeserver.md) for the
+   full homeserver setup this project targets (federation off, `allow_registration = false`).
+
+2. **Write a config file.** Copy [`safehoused/example-config.toml`](safehoused/example-config.toml)
+   — it documents every field, including the two easy to miss ones: `recovery_passphrase` is
+   mandatory (the only headless way back after a crypto-store loss, D10) and `personas` is an
+   allowlist that defaults empty, meaning no local agent can attach until you populate it.
+
+   ```bash
+   cp safehoused/example-config.toml config.toml
+   $EDITOR config.toml   # fill in homeserver, username/password, state_dir, passphrases
+   ```
+
+3. **Run the daemon:**
+
+   ```bash
+   cargo run -p safehoused -- config.toml
+   # or: SAFEHOUSED_CONFIG=config.toml cargo run -p safehoused
+   ```
+
+   First run is a cold start: password login, headless cross-signing bootstrap, and recovery
+   enabled with your configured passphrase. Subsequent runs warm-start from the session blob in
+   `state_dir`.
+
+4. **Invite the bot to a room.** From any other account on the same homeserver (e.g. your own,
+   in Element), create or open a room and invite `@safehouse-bot:<your-server>`. The daemon
+   auto-joins invites and starts mirroring room traffic to stdout; local agents allowlisted in
+   `personas` can now attach over the unix socket at `<state_dir>/safehoused.sock`.
+
 ## Chosen stack (verified live)
 
 | Layer | Choice | Why |
