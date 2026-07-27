@@ -63,8 +63,14 @@ fn main() -> Result<()> {
 }
 
 fn handle_tool_call(msg: &Value) -> Result<Value> {
-    let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
-    let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
+    let name = msg
+        .pointer("/params/name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let args = msg
+        .pointer("/params/arguments")
+        .cloned()
+        .unwrap_or(json!({}));
     let op = match name {
         "safehouse_send" => {
             let mut op = json!({"op": "send"});
@@ -102,8 +108,9 @@ fn handle_tool_call(msg: &Value) -> Result<Value> {
 fn daemon_call(mut op: Value) -> Result<Value> {
     let socket = env::var("SAFEHOUSED_SOCKET").context("SAFEHOUSED_SOCKET must be set")?;
     let persona = env::var("SAFEHOUSE_PERSONA").context("SAFEHOUSE_PERSONA must be set")?;
-    let stream = UnixStream::connect(&socket)
-        .with_context(|| format!("connecting to safehoused at {socket} — is the daemon running?"))?;
+    let stream = UnixStream::connect(&socket).with_context(|| {
+        format!("connecting to safehoused at {socket} — is the daemon running?")
+    })?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
 
@@ -111,11 +118,18 @@ fn daemon_call(mut op: Value) -> Result<Value> {
     writeln!(writer, "{hello}")?;
     let reply = read_reply(&mut reader)?;
     if !reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        bail!("daemon rejected persona {persona:?}: {}",
-            reply.get("error").and_then(Value::as_str).unwrap_or("unknown error"));
+        bail!(
+            "daemon rejected persona {persona:?}: {}",
+            reply
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        );
     }
 
-    op.as_object_mut().context("op must be an object")?.insert("id".into(), json!(1));
+    op.as_object_mut()
+        .context("op must be an object")?
+        .insert("id".into(), json!(1));
     writeln!(writer, "{op}")?;
     read_reply(&mut reader)
 }
@@ -137,7 +151,9 @@ fn copy_fields(from: &Value, to: &mut Value, fields: &[&str]) {
     for field in fields {
         if let Some(v) = from.get(field) {
             if !v.is_null() {
-                to.as_object_mut().unwrap().insert((*field).to_owned(), v.clone());
+                to.as_object_mut()
+                    .unwrap()
+                    .insert((*field).to_owned(), v.clone());
             }
         }
     }

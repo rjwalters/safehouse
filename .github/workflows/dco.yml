@@ -1,0 +1,61 @@
+name: DCO
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  dco:
+    name: sign-off check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify Signed-off-by on every commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Check every non-merge commit introduced by this PR. Merge commits
+          # are exempt (they carry no authored change), matching the DCO app.
+          commits="$(git rev-list --no-merges "${BASE_SHA}..${HEAD_SHA}")"
+
+          if [ -z "${commits}" ]; then
+            echo "No commits to check."
+            exit 0
+          fi
+
+          fail=0
+          while IFS= read -r sha; do
+            name="$(git show -s --format='%an' "${sha}")"
+            email="$(git show -s --format='%ae' "${sha}")"
+            if git show -s --format='%B' "${sha}" \
+                 | grep -qiE '^Signed-off-by: .+ <.+@.+>[[:space:]]*$'; then
+              echo "PASS ${sha} — ${name} <${email}>"
+            else
+              echo "FAIL ${sha} — ${name} <${email}> — missing Signed-off-by"
+              fail=1
+            fi
+          done <<< "${commits}"
+
+          if [ "${fail}" -ne 0 ]; then
+            cat <<'MSG'
+
+          One or more commits are missing a Developer Certificate of Origin
+          sign-off. safehouse requires every commit to carry a Signed-off-by
+          line (see CONTRIBUTING.md and docs/decisions.md D11).
+
+          Fix it by signing your commits:
+
+              git commit -s                       # for a new commit
+              git rebase --signoff <base>         # to sign existing commits
+              git push --force-with-lease         # update the PR branch
+
+          MSG
+            exit 1
+          fi
+
+          echo "All commits carry a Signed-off-by line."

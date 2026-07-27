@@ -14,18 +14,18 @@
 
 use std::{env, fs, path::PathBuf, time::Duration};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use matrix_sdk::{
+    Client, Room,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     deserialized_responses::TimelineEventKind,
-    encryption::{recovery::RecoveryState, BackupDownloadStrategy, EncryptionSettings},
+    encryption::{BackupDownloadStrategy, EncryptionSettings, recovery::RecoveryState},
     room::MessagesOptions,
     ruma::{
-        api::client::room::create_room::v3::Request as CreateRoomRequest,
-        events::room::message::RoomMessageEventContent, OwnedUserId,
+        OwnedUserId, api::client::room::create_room::v3::Request as CreateRoomRequest,
+        events::room::message::RoomMessageEventContent,
     },
-    Client, Room,
 };
 
 const ROOM_NAME: &str = "safehouse-test";
@@ -84,7 +84,10 @@ async fn main() -> Result<()> {
             .login_username(&user, &password)
             .initial_device_display_name("safehoused-qj")
             .await?;
-        let session = client.matrix_auth().session().context("no session after login")?;
+        let session = client
+            .matrix_auth()
+            .session()
+            .context("no session after login")?;
         fs::create_dir_all(&state_dir)?;
         // Session blob and store must land together — write-then-rename.
         let tmp = session_path.with_extension("json.tmp");
@@ -95,7 +98,10 @@ async fn main() -> Result<()> {
     let device_id = client.device_id().context("no device id")?.to_owned();
     println!("== {run_kind} start; device {device_id}");
 
-    client.encryption().wait_for_e2ee_initialization_tasks().await;
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
     client.sync_once(SyncSettings::default()).await?;
 
     let recovery = client.encryption().recovery();
@@ -115,8 +121,14 @@ async fn main() -> Result<()> {
     }
 
     let enc = client.encryption();
-    let cs = enc.cross_signing_status().await.context("no cross-signing status")?;
-    let device = enc.get_own_device().await?.context("own device not found")?;
+    let cs = enc
+        .cross_signing_status()
+        .await
+        .context("no cross-signing status")?;
+    let device = enc
+        .get_own_device()
+        .await?
+        .context("own device not found")?;
     println!(
         "cross-signing: master={} self_signing={} user_signing={}",
         cs.has_master, cs.has_self_signing, cs.has_user_signing
@@ -127,7 +139,11 @@ async fn main() -> Result<()> {
         device.is_cross_signed_by_owner(),
         device.is_verified()
     );
-    println!("backup: {:?} | recovery: {:?}", enc.backups().state(), recovery.state());
+    println!(
+        "backup: {:?} | recovery: {:?}",
+        enc.backups().state(),
+        recovery.state()
+    );
 
     let room = match client
         .joined_rooms()
