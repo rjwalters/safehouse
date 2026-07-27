@@ -272,24 +272,25 @@ async fn on_message(
 
     // §7.2/§9: gate on envelope version. An unsupported `v` is never dispatched
     // or guess-parsed — it is logged and surfaced to the human once per sender.
-    let env = match envelope::from_event_json(&content, event.sender.as_str(), &registry.personas) {
-        envelope::Inbound::Envelope(env) => env,
-        envelope::Inbound::UnsupportedVersion(v) => {
-            eprintln!(
+    let (env, unknown_persona) =
+        match envelope::from_event_json(&content, event.sender.as_str(), &registry.personas) {
+            envelope::Inbound::Envelope(env, unknown_persona) => (env, unknown_persona),
+            envelope::Inbound::UnsupportedVersion(v) => {
+                eprintln!(
                 "safehoused: ignoring unsupported envelope version {v} from {} in {} (event {})",
                 event.sender,
                 room.room_id(),
                 event.event_id
             );
-            if registry
-                .mark_unsupported_surfaced(event.sender.as_str(), v)
-                .await
-            {
-                surface_unsupported_version(&room, &client, event.sender.as_str(), v).await;
+                if registry
+                    .mark_unsupported_surfaced(event.sender.as_str(), v)
+                    .await
+                {
+                    surface_unsupported_version(&room, &client, event.sender.as_str(), v).await;
+                }
+                return;
             }
-            return;
-        }
-    };
+        };
 
     let push = json!({
         "event": "message",
@@ -305,6 +306,22 @@ async fn on_message(
     registry
         .dispatch(&push.to_string(), own_event, &env.from)
         .await;
+
+    // §5.1: a human addressed an unknown persona — post a visible ack rather
+    // than let the message silently fall back to a no-wake broadcast. The ack
+    // itself carries a real envelope, so the next sync round-trips through
+    // the early-return branch of `from_event_json` above and never re-enters
+    // this path.
+    if let Some(token) = unknown_persona {
+        let ack = envelope::unknown_persona_ack(&env.from, &token, &registry.personas);
+        let content = envelope::to_event_content(&ack);
+        if let Err(err) = room.send_raw("m.room.message", content).await {
+            eprintln!(
+                "safehoused: failed to post unknown-persona ack for @{token} in {}: {err:#}",
+                room.room_id()
+            );
+        }
+    }
 }
 
 /// Post a human-legible notice to the room that a message used an envelope
