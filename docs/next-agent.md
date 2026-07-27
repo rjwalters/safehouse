@@ -94,8 +94,8 @@ Start with the two-project handoff use case that motivated all this: one agent w
   research preview with a changeable protocol contract, so still off the critical path.
 
 ## Housekeeping
-- Repo is local only. Public repo `rjwalters/safehouse` to be created when Robb says go
-  (`gh repo create rjwalters/safehouse --public --source . --push`).
+- **Public since 2026-07-26:** https://github.com/rjwalters/safehouse (Apache-2.0, DCO
+  contributions per `CONTRIBUTING.md`).
 - Provenance for every decision lives in `research/` — eight passes, all 2026-07-26.
 - Reference source (baibot, rust-mxlink, matrix-rust-sdk, tuwunel, continuwuity) was cloned to a
   scratchpad during research; re-clone as needed. Remember: read, don't copy.
