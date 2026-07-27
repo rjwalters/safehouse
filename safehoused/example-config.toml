@@ -65,7 +65,16 @@ recovery_passphrase = "change-me-as-well"
 # personas = ["writer_agent", "research_agent"]
 
 # Unix-domain socket path the daemon listens on for local agent RPC
-# (hello/send/create_room/list_rooms/read — see safehoused/src/rpc.rs).
+# (hello/send/create_room/list_rooms/read/check — see safehoused/src/rpc.rs).
 # AF_UNIX only, by design — never a TCP listener (docs/decisions.md D8).
 # Defaults to "<state_dir>/safehoused.sock" when omitted.
 # socket_path = "/var/lib/safehoused/safehoused.sock"
+
+# Per-persona mailbox store (docs/decisions.md D16/D17): a sqlite database
+# holding, for each registered persona, its unread-mail cursor. This is a
+# derived view over the room timeline, not a second source of truth — the
+# room stays authoritative; this file just remembers what each persona has
+# already consumed, so a `safehouse_check` after a daemon restart still
+# returns exactly what was missed. Defaults to
+# "<state_dir>/mailbox.sqlite3" when omitted.
+# mailbox_path = "/var/lib/safehoused/mailbox.sqlite3"

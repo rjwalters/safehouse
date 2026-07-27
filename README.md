@@ -81,9 +81,14 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
   versioned, language-agnostic wire format; the daemon stamps sender identity and enforces the
   persona allowlist.
 - **Workspace:** [`safehoused/`](safehoused/) (the daemon: boot + recovery, sync v2, decrypt,
-  unix-socket RPC, envelope dispatch), [`safehouse-mcp/`](safehouse-mcp/) (keyless stdio MCP shim:
-  `safehouse_send` / `safehouse_read` / `safehouse_create_room` / `safehouse_list_rooms`), and
+  unix-socket RPC, envelope dispatch, per-persona mailbox), [`safehouse-mcp/`](safehouse-mcp/)
+  (keyless stdio MCP shim: `safehouse_send` / `safehouse_read` / `safehouse_check` /
+  `safehouse_create_room` / `safehouse_list_rooms`), and
   [`spikes/qj-coldstart/`](spikes/qj-coldstart/) (Q-J provenance).
+- **Per-agent mailbox (D16/D17):** each registered persona gets a durable, sqlite-backed read
+  cursor — an agent calls `safehouse_check` on its own cadence and gets exactly what it missed,
+  connected or not, surviving a daemon restart mid-gap. `safehoused` never spawns, wakes, or
+  push-notifies an agent; scheduling is the agent's own business.
 - ✅ **The Oct 2026 "exclude insecure devices" deadline is cleared**, not just tracked: Element X
   shows no reduced-trust indicator for the self-signed daemon device (verified on a real phone).
 

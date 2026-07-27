@@ -7,6 +7,7 @@
 //! stdout. No agents, no unix socket yet — that's the next step.
 
 mod envelope;
+mod mailbox;
 mod rpc;
 
 use std::{env, fs, path::PathBuf, process::ExitCode, sync::Arc};
@@ -26,7 +27,7 @@ use matrix_sdk::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::rpc::Registry;
+use crate::{mailbox::Mailbox, rpc::Registry};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +51,12 @@ struct Config {
     /// Unix socket path; defaults to `<state_dir>/safehoused.sock`.
     #[serde(default)]
     socket_path: Option<PathBuf>,
+    /// Per-persona mailbox store (D17); defaults to
+    /// `<state_dir>/mailbox.sqlite3`. Holds only delivery bookkeeping (which
+    /// envelopes each persona has consumed) — rebuildable from the room, not
+    /// a second source of truth (D6).
+    #[serde(default)]
+    mailbox_path: Option<PathBuf>,
 }
 
 fn load_config() -> Result<Config> {
@@ -82,7 +89,13 @@ async fn run() -> Result<()> {
             "invalid persona {persona:?} in config"
         );
     }
-    let registry = Registry::new(config.personas.clone());
+    let mailbox_path = config
+        .mailbox_path
+        .clone()
+        .unwrap_or_else(|| config.state_dir.join("mailbox.sqlite3"));
+    let mailbox = Mailbox::open(&mailbox_path)
+        .with_context(|| format!("opening mailbox store {}", mailbox_path.display()))?;
+    let registry = Registry::new(config.personas.clone(), mailbox);
     let socket_path = config
         .socket_path
         .clone()
@@ -329,6 +342,27 @@ async fn on_message(
         .dispatch(&push.to_string(), own_event, &env.from)
         .await;
 
+    // D16/D17: the durable mailbox write. Unlike the live push above, this
+    // always runs — receipt must not depend on any agent being connected.
+    // Resolution (direct address / broadcast / not-ours-to-keep) happens
+    // inside `mailbox_deliver`, per envelope-v1 §7.
+    if let Err(err) = registry
+        .mailbox_deliver(
+            own_event,
+            room.room_id().as_str(),
+            event.event_id.as_str(),
+            event.sender.as_str(),
+            &env,
+        )
+        .await
+    {
+        eprintln!(
+            "safehoused: mailbox delivery failed for event {} in {}: {err:#}",
+            event.event_id,
+            room.room_id()
+        );
+    }
+
     // §5.1: a human addressed an unknown persona — post a visible ack rather
     // than let the message silently fall back to a no-wake broadcast. The ack
     // itself carries a real envelope, so the next sync round-trips through
@@ -367,6 +401,7 @@ async fn surface_unsupported_version(room: &Room, client: &Client, sender: &str,
              (this daemon speaks v{}). It was not delivered to any agent.",
             envelope::SUPPORTED_VERSION
         ),
+        wake: None,
     };
     let content = envelope::to_event_content(&env, None);
     if let Err(err) = room.send_raw("m.room.message", content).await {

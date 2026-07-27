@@ -74,7 +74,11 @@ fn handle_tool_call(msg: &Value) -> Result<Value> {
     let op = match name {
         "safehouse_send" => {
             let mut op = json!({"op": "send"});
-            copy_fields(&args, &mut op, &["to", "body", "type", "task_id", "room"]);
+            copy_fields(
+                &args,
+                &mut op,
+                &["to", "body", "type", "task_id", "room", "wake"],
+            );
             op
         }
         "safehouse_create_room" => {
@@ -86,6 +90,11 @@ fn handle_tool_call(msg: &Value) -> Result<Value> {
         "safehouse_read" => {
             let mut op = json!({"op": "read"});
             copy_fields(&args, &mut op, &["room", "limit"]);
+            op
+        }
+        "safehouse_check" => {
+            let mut op = json!({"op": "check"});
+            copy_fields(&args, &mut op, &["peek", "limit"]);
             op
         }
         other => bail!("unknown tool: {other}"),
@@ -171,7 +180,8 @@ fn tool_definitions() -> Value {
                     "body": {"type": "string", "description": "Message content (plain text)"},
                     "type": {"type": "string", "enum": ["chat", "task", "handoff", "ack"], "description": "Message type (default chat)"},
                     "task_id": {"type": "string", "description": "Stable task identifier, [A-Za-z0-9_]"},
-                    "room": {"type": "string", "description": "Room id or name; optional when only one room is joined"}
+                    "room": {"type": "string", "description": "Room id or name; optional when only one room is joined"},
+                    "wake": {"type": "boolean", "description": "Advisory hint only — the daemon never acts on it. For optional external wakers deciding whether to nudge the recipient."}
                 },
                 "required": ["to", "body"]
             }
@@ -201,6 +211,17 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "room": {"type": "string", "description": "Room id or name; optional when only one room is joined"},
                     "limit": {"type": "integer", "description": "Max messages (default 20, cap 100)"}
+                }
+            }
+        },
+        {
+            "name": "safehouse_check",
+            "description": "Check your mailbox: unread envelopes addressed to you (`to: <your persona>` or broadcasts), oldest first, since you last checked. Call this on your own cadence, like checking your phone — no agent needs to stay connected to receive. By default this advances your read cursor so a repeat call returns nothing new; pass peek=true to look without consuming. Survives daemon restarts: anything you missed while the daemon (or you) were down is still here.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "peek": {"type": "boolean", "description": "If true, don't advance the read cursor — a repeated peek returns the same unread set (default false)"},
+                    "limit": {"type": "integer", "description": "Max envelopes to return (oldest unread first); unset returns everything unread"}
                 }
             }
         }
