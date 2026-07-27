@@ -2899,6 +2899,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "matrix-sdk",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

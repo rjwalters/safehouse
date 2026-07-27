@@ -25,7 +25,10 @@ use tokio::{
     sync::{mpsc, Mutex},
 };
 
-use crate::envelope::{self, Envelope};
+use crate::{
+    envelope::{self, Envelope},
+    mailbox::{Mailbox, MailboxEntry},
+};
 
 pub struct Registry {
     conns: Mutex<HashMap<u64, ConnHandle>>,
@@ -39,6 +42,11 @@ pub struct Registry {
     /// stream (D6 — one code path) and consulted both when composing outbound
     /// `m.relates_to` and when routing un-tokened human thread replies.
     pub threads: ThreadState,
+    /// The durable per-persona mailbox (D16/D17) — populated as the room
+    /// stream is dispatched (`mailbox_deliver`), consumed via the `check` op.
+    /// Delivery to a live connection above is a low-latency convenience; the
+    /// mailbox is what makes receipt independent of being connected at all.
+    mailbox: Mailbox,
 }
 
 /// In-memory thread bookkeeping. All state here is derived from observed
@@ -116,13 +124,14 @@ struct ConnHandle {
 }
 
 impl Registry {
-    pub fn new(personas: Vec<String>) -> Arc<Self> {
+    pub fn new(personas: Vec<String>, mailbox: Mailbox) -> Arc<Self> {
         Arc::new(Self {
             conns: Mutex::new(HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             personas,
             surfaced_unsupported: Mutex::new(HashSet::new()),
             threads: ThreadState::default(),
+            mailbox,
         })
     }
 
@@ -149,6 +158,66 @@ impl Registry {
             }
             let _ = handle.tx.send(line.to_owned());
         }
+    }
+
+    /// Route one inbound envelope into the durable mailbox of every
+    /// locally-hosted persona it's addressed to, per envelope-v1 §7's
+    /// resolution rules — a broadcast (`to: "*"`) fans out to every
+    /// registered persona; a direct `to:` lands only in that persona's
+    /// mailbox; anything else (a persona hosted elsewhere, or a Matrix user
+    /// id) is not ours to keep. This is what makes receipt independent of
+    /// whether any agent is connected right now (D16/D17) — unlike the live
+    /// `dispatch` above, this always runs, for every event.
+    pub async fn mailbox_deliver(
+        &self,
+        own_event: bool,
+        room_id: &str,
+        event_id: &str,
+        sender: &str,
+        env: &Envelope,
+    ) -> anyhow::Result<()> {
+        for persona in self.mailbox_recipients(own_event, env) {
+            self.mailbox
+                .deliver(persona, room_id, event_id, sender, env)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// The set of locally-registered personas that should receive `env` in
+    /// their mailbox (§7). Same-host loop-back rule: when the Matrix sender
+    /// is this daemon's own user, the authoring persona is skipped — same
+    /// nuance as `dispatch`'s `own_event`/`author` handling.
+    fn mailbox_recipients(&self, own_event: bool, env: &Envelope) -> Vec<&str> {
+        if env.to == "*" {
+            self.personas
+                .iter()
+                .map(String::as_str)
+                .filter(|p| !(own_event && *p == env.from))
+                .collect()
+        } else if own_event && env.to == env.from {
+            // Nonsensical (an agent addressing itself) but guard it anyway —
+            // never let an event deliver to its own author on same-host loop
+            // back.
+            Vec::new()
+        } else {
+            self.personas
+                .iter()
+                .map(String::as_str)
+                .filter(|p| *p == env.to)
+                .collect()
+        }
+    }
+
+    /// Unread mailbox envelopes for `persona` — the `check` op / MCP tool.
+    /// See [`Mailbox::check`] for the peek/limit/cursor semantics.
+    pub async fn check(
+        &self,
+        persona: &str,
+        advance: bool,
+        limit: Option<u32>,
+    ) -> anyhow::Result<Vec<MailboxEntry>> {
+        self.mailbox.check(persona, advance, limit).await
     }
 }
 
@@ -390,6 +459,28 @@ async fn handle_op(
             }
             Ok(json!({"ok": true, "room_id": room.room_id(), "messages": messages}))
         }
+        "check" => {
+            // Peek mode (no-advance) and `limit`, per the issue spec.
+            // Default is to advance the cursor past everything returned.
+            let peek = req.get("peek").and_then(Value::as_bool).unwrap_or(false);
+            let limit = req
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|l| l.min(1000) as u32);
+            let entries = registry.check(persona, !peek, limit).await?;
+            let messages: Vec<Value> = entries
+                .into_iter()
+                .map(|e| {
+                    json!({
+                        "room_id": e.room_id,
+                        "event_id": e.event_id,
+                        "sender": e.sender,
+                        "envelope": e.envelope,
+                    })
+                })
+                .collect();
+            Ok(json!({"ok": true, "advanced": !peek, "messages": messages}))
+        }
         other => anyhow::bail!("unknown op {other:?}"),
     }
 }
@@ -423,6 +514,9 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
             "task_id must be [A-Za-z0-9_]"
         );
     }
+    // Advisory only (D16) — the daemon never acts on this, it just carries it
+    // through so a receiver's `check` output preserves the sender's hint.
+    let wake = req.get("wake").and_then(Value::as_bool);
     Ok(Envelope {
         v: 1,
         from: persona.to_owned(), // stamped here; never taken from the request
@@ -430,6 +524,7 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
         kind: kind.to_owned(),
         task_id,
         body: body.to_owned(),
+        wake,
     })
 }
 
@@ -495,7 +590,8 @@ mod tests {
         Arc<Registry>,
     ) {
         let (server, client_side) = UnixStream::pair().expect("socketpair");
-        let registry = Registry::new(personas);
+        let mailbox = Mailbox::open_in_memory().expect("in-memory mailbox for tests");
+        let registry = Registry::new(personas, mailbox);
         let client = offline_client().await;
         let conn_registry = registry.clone();
         tokio::spawn(async move {
@@ -711,6 +807,25 @@ mod tests {
     }
 
     #[test]
+    fn build_send_envelope_carries_the_wake_hint_through() {
+        // Advisory only (D16) — the daemon never acts on it, it's just
+        // preserved for optional external wakers to read later via `check`.
+        let req = json!({"to": "research_agent", "body": "hi", "wake": true});
+        let env = build_send_envelope("writer_agent", &req).unwrap();
+        assert_eq!(env.wake, Some(true));
+    }
+
+    #[test]
+    fn build_send_envelope_defaults_wake_to_none_when_absent() {
+        let env = build_send_envelope(
+            "writer_agent",
+            &json!({"to": "research_agent", "body": "hi"}),
+        )
+        .unwrap();
+        assert_eq!(env.wake, None);
+    }
+
+    #[test]
     fn build_send_envelope_accepts_well_formed_task_id() {
         let req = json!({"to": "research_agent", "body": "hi", "task_id": "source_check_1"});
         let env = build_send_envelope("writer_agent", &req).unwrap();
@@ -721,7 +836,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_surface_dedups_per_sender_and_version() {
-        let registry = Registry::new(vec![]);
+        let registry = Registry::new(vec![], Mailbox::open_in_memory().unwrap());
         // First sighting of a (sender, version) pair surfaces.
         assert!(registry.mark_unsupported_surfaced("@evil:remote", 2).await);
         // Repeats from the same sender at the same version are suppressed —
@@ -736,7 +851,7 @@ mod tests {
 
     // ---- ThreadState — §2 task threading / §5.2 thread-reply routing -------
 
-    fn env_to(to: &str, task_id: Option<&str>) -> Envelope {
+    fn thread_env(to: &str, task_id: Option<&str>) -> Envelope {
         Envelope {
             v: 1,
             from: "writer_agent".to_owned(),
@@ -744,6 +859,21 @@ mod tests {
             kind: "task".to_owned(),
             task_id: task_id.map(str::to_owned),
             body: "go".to_owned(),
+            wake: None,
+        }
+    }
+
+    // ---- mailbox routing (D16/D17 §7 addressing) --------------------------
+
+    fn env_to(from: &str, to: &str) -> Envelope {
+        Envelope {
+            v: 1,
+            from: from.to_owned(),
+            to: to.to_owned(),
+            kind: "chat".to_owned(),
+            task_id: None,
+            body: "hi".to_owned(),
+            wake: None,
         }
     }
 
@@ -756,12 +886,71 @@ mod tests {
             .observe(
                 "$root",
                 "$root",
-                &env_to("research_agent", Some("source_check")),
+                &thread_env("research_agent", Some("source_check")),
             )
             .await;
         assert_eq!(
             threads.root_for_task("source_check").await.as_deref(),
             Some("$root")
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_deliver_routes_direct_address_to_only_that_persona() {
+        let registry = Registry::new(
+            vec!["writer_agent".to_owned(), "research_agent".to_owned()],
+            Mailbox::open_in_memory().unwrap(),
+        );
+        registry
+            .mailbox_deliver(
+                false,
+                "!room:x",
+                "$1",
+                "@robb:x",
+                &env_to("@robb:x", "research_agent"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .check("research_agent", true, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(registry
+            .check("writer_agent", true, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn mailbox_deliver_broadcast_reaches_every_local_persona() {
+        let registry = Registry::new(
+            vec!["writer_agent".to_owned(), "research_agent".to_owned()],
+            Mailbox::open_in_memory().unwrap(),
+        );
+        registry
+            .mailbox_deliver(false, "!room:x", "$1", "@robb:x", &env_to("@robb:x", "*"))
+            .await
+            .unwrap();
+        assert_eq!(
+            registry
+                .check("writer_agent", true, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .check("research_agent", true, None)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -775,14 +964,14 @@ mod tests {
             .observe(
                 "$root",
                 "$root",
-                &env_to("research_agent", Some("source_check")),
+                &thread_env("research_agent", Some("source_check")),
             )
             .await;
         threads
             .observe(
                 "$root",
                 "$reply1",
-                &env_to("writer_agent", Some("source_check")),
+                &thread_env("writer_agent", Some("source_check")),
             )
             .await;
         assert_eq!(
@@ -795,7 +984,7 @@ mod tests {
     async fn thread_state_tracks_latest_event_in_thread() {
         let threads = ThreadState::default();
         threads
-            .observe("$root", "$root", &env_to("research_agent", Some("t")))
+            .observe("$root", "$root", &thread_env("research_agent", Some("t")))
             .await;
         assert_eq!(
             threads.latest_in_thread("$root").await.as_deref(),
@@ -803,7 +992,7 @@ mod tests {
         );
 
         threads
-            .observe("$root", "$reply1", &env_to("writer_agent", Some("t")))
+            .observe("$root", "$reply1", &thread_env("writer_agent", Some("t")))
             .await;
         assert_eq!(
             threads.latest_in_thread("$root").await.as_deref(),
@@ -817,7 +1006,7 @@ mod tests {
         // un-tokened human reply should route to.
         let threads = ThreadState::default();
         threads
-            .observe("$root", "$root", &env_to("research_agent", Some("t")))
+            .observe("$root", "$root", &thread_env("research_agent", Some("t")))
             .await;
         assert_eq!(
             threads.target_for_thread("$root").await.as_deref(),
@@ -825,7 +1014,7 @@ mod tests {
         );
 
         threads
-            .observe("$root", "$reply1", &env_to("writer_agent", Some("t")))
+            .observe("$root", "$reply1", &thread_env("writer_agent", Some("t")))
             .await;
         assert_eq!(
             threads.target_for_thread("$root").await.as_deref(),
@@ -838,12 +1027,181 @@ mod tests {
         // "*" and a Matrix user id are not persona-shaped — never useful as
         // a §5.2 routing target.
         let threads = ThreadState::default();
-        threads.observe("$root", "$root", &env_to("*", None)).await;
+        threads
+            .observe("$root", "$root", &thread_env("*", None))
+            .await;
         assert!(threads.target_for_thread("$root").await.is_none());
 
         threads
-            .observe("$root", "$root", &env_to("@robb:safehouse.local", None))
+            .observe("$root", "$root", &thread_env("@robb:safehouse.local", None))
             .await;
         assert!(threads.target_for_thread("$root").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mailbox_deliver_broadcast_skips_only_the_authoring_persona_on_own_events() {
+        let registry = Registry::new(
+            vec!["writer_agent".to_owned(), "research_agent".to_owned()],
+            Mailbox::open_in_memory().unwrap(),
+        );
+        registry
+            .mailbox_deliver(
+                true,
+                "!room:x",
+                "$1",
+                "@safehoused:x",
+                &env_to("writer_agent", "*"),
+            )
+            .await
+            .unwrap();
+        assert!(registry
+            .check("writer_agent", true, None)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            registry
+                .check("research_agent", true, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn mailbox_deliver_ignores_a_persona_not_hosted_locally() {
+        let registry = Registry::new(
+            vec!["writer_agent".to_owned()],
+            Mailbox::open_in_memory().unwrap(),
+        );
+        registry
+            .mailbox_deliver(
+                false,
+                "!room:x",
+                "$1",
+                "@safehoused-hostb:x",
+                &env_to("remote_agent", "not_a_local_persona"),
+            )
+            .await
+            .unwrap();
+        assert!(registry
+            .check("writer_agent", true, None)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // ---- `check` op end-to-end over the socket (acceptance criteria) ------
+
+    #[tokio::test]
+    async fn check_delivers_exactly_what_was_missed_while_disconnected() {
+        // The persona was never connected while N messages arrived — they
+        // land straight in the mailbox via `mailbox_deliver`, exactly as
+        // `on_message` does on every inbound event.
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        for i in 0..3 {
+            registry
+                .mailbox_deliver(
+                    false,
+                    "!room:x",
+                    &format!("$event{i}"),
+                    "@robb:x",
+                    &env_to("@robb:x", "writer_agent"),
+                )
+                .await
+                .unwrap();
+        }
+
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "check"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["messages"].as_array().unwrap().len(), 3);
+
+        // A second immediate check returns nothing — the cursor advanced.
+        send(&mut write, json!({"op": "check"})).await;
+        let reply = recv(&mut read).await;
+        assert!(reply["messages"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn check_peek_mode_does_not_advance_the_cursor() {
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        registry
+            .mailbox_deliver(
+                false,
+                "!room:x",
+                "$1",
+                "@robb:x",
+                &env_to("@robb:x", "writer_agent"),
+            )
+            .await
+            .unwrap();
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "check", "peek": true})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(reply["advanced"], false);
+
+        send(&mut write, json!({"op": "check", "peek": true})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(
+            reply["messages"].as_array().unwrap().len(),
+            1,
+            "a repeated peek must be idempotent"
+        );
+
+        send(&mut write, json!({"op": "check"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(reply["advanced"], true);
+    }
+
+    #[tokio::test]
+    async fn check_respects_limit() {
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        for i in 0..3 {
+            registry
+                .mailbox_deliver(
+                    false,
+                    "!room:x",
+                    &format!("$event{i}"),
+                    "@robb:x",
+                    &env_to("@robb:x", "writer_agent"),
+                )
+                .await
+                .unwrap();
+        }
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "check", "limit": 2})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["messages"].as_array().unwrap().len(), 2);
+
+        send(&mut write, json!({"op": "check"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(
+            reply["messages"].as_array().unwrap().len(),
+            1,
+            "the remaining unread message must still be there"
+        );
     }
 }

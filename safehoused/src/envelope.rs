@@ -44,6 +44,11 @@ pub struct Envelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
     pub body: String,
+    /// Advisory only (protocol §3/§7): a hint for optional external wakers.
+    /// The daemon never acts on it (D16) — it's carried through unchanged so
+    /// it survives into `safehouse_check` output (D17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<bool>,
 }
 
 pub fn valid_persona(s: &str) -> bool {
@@ -216,6 +221,7 @@ fn synthesize_for_human(
                         kind: "chat".to_owned(),
                         task_id: None,
                         body: stripped,
+                        wake: None,
                     },
                     None,
                 );
@@ -240,6 +246,7 @@ fn synthesize_for_human(
                 kind: "chat".to_owned(),
                 task_id: None,
                 body: body.to_owned(),
+                wake: None,
             },
             None,
         );
@@ -256,6 +263,7 @@ fn broadcast(sender: &str, body: &str) -> Envelope {
         kind: "chat".to_owned(),
         task_id: None,
         body: body.to_owned(),
+        wake: None,
     }
 }
 
@@ -279,6 +287,7 @@ pub fn unknown_persona_ack(to: &str, token: &str, personas: &[String]) -> Envelo
         kind: "ack".to_owned(),
         task_id: None,
         body: format!("Unknown persona \"@{token}\" — known personas: {known}"),
+        wake: None,
     }
 }
 
@@ -430,6 +439,7 @@ mod tests {
             kind: kind.to_owned(),
             task_id: None,
             body: body.to_owned(),
+            wake: None,
         }
     }
 
@@ -521,6 +531,53 @@ mod tests {
                 assert_eq!(env.task_id.as_deref(), Some("source_check"));
                 assert_eq!(env.body, "Need the source list confirmed.");
                 assert!(unknown.is_none());
+            }
+            other => panic!("expected Envelope, got {other:?}"),
+        }
+    }
+
+    /// D16/D17: `wake` is advisory-only for optional external wakers, but it
+    /// must round-trip through the daemon unchanged so it reaches
+    /// `safehouse_check` output.
+    #[test]
+    fn from_event_json_preserves_the_wake_hint() {
+        let content = json!({
+            "msgtype": "m.text",
+            "body": "irrelevant",
+            ENVELOPE_KEY: {
+                "v": 1,
+                "from": "writer_agent",
+                "to": "research_agent",
+                "type": "task",
+                "body": "go",
+                "wake": true
+            }
+        });
+        match from_event_json(&content, "@robb:safehouse.local", &[], None) {
+            Inbound::Envelope(env, _unknown) => {
+                assert_eq!(env.wake, Some(true));
+                // And it survives round-tripping back out to event content.
+                let rendered = to_event_content(&env, None);
+                assert_eq!(
+                    rendered[ENVELOPE_KEY]["wake"],
+                    serde_json::Value::Bool(true)
+                );
+            }
+            other => panic!("expected Envelope, got {other:?}"),
+        }
+    }
+
+    /// A human message (no wake field at all) synthesizes with `wake: None`,
+    /// which must not serialize a `wake` key at all (keeps the wire format
+    /// clean for the common case).
+    #[test]
+    fn synthesized_human_envelope_omits_wake_when_absent() {
+        let content = json!({ "msgtype": "m.text", "body": "hmm" });
+        match from_event_json(&content, "@robb:safehouse.local", &[], None) {
+            Inbound::Envelope(env, _unknown) => {
+                assert_eq!(env.wake, None);
+                let rendered = to_event_content(&env, None);
+                assert!(rendered[ENVELOPE_KEY].get("wake").is_none());
             }
             other => panic!("expected Envelope, got {other:?}"),
         }

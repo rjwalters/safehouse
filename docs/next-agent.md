@@ -84,14 +84,26 @@ end-to-end: MCP tool call → socket → encrypted room → phone, allowlist rej
 Envelope §7's loop-back rule was refined during implementation (own events dispatch to non-author
 personas; see the note in `protocol/envelope-v1.md`).
 
-### 5. Wire one real agent and retire the copy-paste relay.
+### 5. ~~Per-agent mailbox + `safehouse_check` (D16/D17)~~ ✅ DONE 2026-07-26
+Per-persona durable mailbox in `safehoused` (`mailbox.rs`), populated from the same synced room
+timeline that drives live dispatch (`on_message`) — a broadcast (`to: "*"`) fans out to every
+registered persona, a direct `to:` lands only in that persona's mailbox, own-host loop-back still
+skips only the authoring persona. Read cursors persist in sqlite (`<state_dir>/mailbox.sqlite3`),
+so an agent that was away for N messages — including across a daemon restart mid-gap — gets exactly
+those N on its next `safehouse_check` and nothing on the immediate repeat. `safehouse_check` supports
+`peek` (no-advance) and `limit`. The envelope's advisory `wake` field is stamped when a sender
+supplies it (`safehouse_send`'s new `wake` argument) and round-trips through into `check` output
+unchanged, per D16 (the daemon never acts on it — only optional external wakers would).
+
+### 6. Wire one real agent and retire the copy-paste relay.
 Start with the two-project handoff use case that motivated all this: one agent writing a long-form document, another holding the facts it needs, today bridged by a human copy-pasting.
 
 ## Deferred, with a deadline
 - ~~**D11 — CLA vs. DCO.**~~ ✅ Decided 2026-07-26: **DCO** (`CONTRIBUTING.md`, D11).
 - **Claude Code Channels push-wake** remains a **v1** item. `safehouse-mcp` covers the tools story
-  today (polling via `safehouse_read`); Channels is the sanctioned *wake* mechanism — still a
-  research preview with a changeable protocol contract, so still off the critical path.
+  today (`safehouse_check` for durable pull-model delivery, D17); Channels is the sanctioned *wake*
+  mechanism — still a research preview with a changeable protocol contract, so still off the
+  critical path.
 
 ## Housekeeping
 - **Public since 2026-07-26:** https://github.com/rjwalters/safehouse (Apache-2.0, DCO
