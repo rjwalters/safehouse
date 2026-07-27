@@ -21,3 +21,6 @@ crypto-store/
 *.swp
 .idea/
 .vscode/
+
+# Repo Skills machine-local install metadata (absolute source path + timestamp)
+.claude/skills/repo/.install-local.json
