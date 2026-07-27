@@ -212,3 +212,24 @@ Sync v2 is spec-frozen. Choosing it sidesteps that bug *and* the MSC4186 churn e
 The blast radius is asymmetric and that's the point: on the phone, the worst case is a verification
 hang cleared by restarting the app; in the daemon, to-device loss means missing room keys.
 
+
+## D14 — Deployment: server_name is `safehouse.2amlogic.com`, TLS via Caddy + Cloudflare DNS-01
+**Decision (2026-07-26):** the production homeserver runs on the Mac Studio with the **permanent**
+`server_name = safehouse.2amlogic.com` (a domain we control, in the dedicated 2AM Logic Cloudflare
+account). TLS is terminated by **Caddy** (custom build with the `caddy-dns/cloudflare` module) using
+**DNS-01**, so certificate issuance never requires public reachability. tuwunel itself stays bound to
+loopback and serves `/.well-known/matrix/client`.
+
+**Why this shape:** `server_name` is immutable (D12 research, risk 7), so it must not encode a
+machine, a network tool, or an exposure decision. DNS-01 decouples *naming* from *reachability*:
+the `safehouse.2amlogic.com` A record can point at a LAN IP (today), a Tailscale IP, or a public
+port-forward (for family devices without Tailscale) — in any order, reversibly, with no server wipe.
+A `*.ts.net` server_name was rejected because it welds the Matrix identity to Tailscale forever and
+forces every client device onto the tailnet; public-from-day-one was rejected as unnecessary
+exposure while the user base is one phone.
+
+**Ops facts:** phased exposure lives in one Cloudflare A record (DNS-only/grey cloud — it may carry
+non-proxied Matrix traffic and can point at private IPs). Scoped API token per the operator's
+`~/.cloudflare` conventions. Element X works from day one (real Let's Encrypt cert + well-known).
+Known soft spot: Docker Desktop requires a logged-in session on the Studio; move to colima or a
+LaunchDaemon before the household depends on it.
