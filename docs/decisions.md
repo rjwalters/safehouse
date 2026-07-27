@@ -236,3 +236,41 @@ non-proxied Matrix traffic and can point at private IPs). Scoped API token per t
 `~/.cloudflare` conventions. Element X works from day one (real Let's Encrypt cert + well-known).
 Known soft spot: Docker Desktop requires a logged-in session on the Studio; move to colima or a
 LaunchDaemon before the household depends on it.
+
+## D15 — Homeserver moves to a dedicated always-on cloud host (Studio stays a fleet worker)
+**Decision (2026-07-26):** the tuwunel homeserver will move off the Mac Studio to a dedicated,
+always-on Linux cloud host (AWS EC2, ~4 GB / t4g.medium-class per the 2–4 GB footprint in
+`research/2026-07-26-homeserver.md`). The Studio reverts to a pure loom **worker** (compute), no
+longer double-duty as the coordination hub. **Not yet executed** — tracked as an issue; this records
+the direction and rationale.
+
+**Why:**
+- **Removes the GUI-session fragility.** On macOS the homeserver ran under Docker Desktop, which only
+  starts after a console login — every Studio reboot left the homeserver down until a human logged in
+  *and* launched Docker (observed live 2026-07-26). A Linux host runs tuwunel's static musl binary
+  under systemd (or headless Docker): comes back on boot, zero human. Same class of problem killed
+  Caddy/tailscaled (gui LaunchAgents) on that reboot.
+- **No threat-model cost.** The room is E2E; the homeserver sees only ciphertext (design §2, which
+  explicitly assumes a compromised server). The key-holding component (`safehoused`) stays on
+  owner-controlled hardware. So a cloud relay does **not** weaken the crypto posture — unlike moving
+  a plaintext service.
+- **Clean separation of concerns / fleet fit.** Always-on coordination hub (cloud) vs. fleet workers
+  (Studio, laptop, future cloud workers). Removes the CPU contention seen when loom sweep bursts and
+  the homeserver shared the Studio. Pre-positions the AWS presence loom#3998 (elastic cloud workers)
+  needs anyway.
+
+**Why the move is cheap — D14 set it up:** `server_name = safehouse.2amlogic.com` is on an owned
+domain with **DNS-01** certs, chosen precisely so reachability can change without touching the Matrix
+identity. Migration = copy tuwunel's RocksDB data dir (portable, same version → preserves accounts,
+the encrypted room, device identities, cross-signing, key backups), repoint the A record to the new
+host's tailnet IP, and `safehoused` reconnects seamlessly. `server_name` never changes (D12 risk 7).
+
+**Accepted costs:** ~$25–30/mo for an always-on instance; a cloud box to maintain instead of
+all-local. Justified for a hub the phone + family + fleet depend on being always-up.
+
+**Posture:** keep it **tailnet-only** initially (tailscaled runs headless on Linux); flip the A record
+to a public endpoint later only if family-without-Tailscale needs in — same one-record move as the
+LAN→tailnet cutover already done.
+
+**Interim if deferred:** `colima` on the Studio (headless Docker, no GUI login) fixes the
+Docker-Desktop fragility at zero cost, but leaves homeserver uptime tied to the Studio.
