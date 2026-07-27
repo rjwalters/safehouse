@@ -18,6 +18,7 @@ use matrix_sdk::{
     config::SyncSettings,
     encryption::{recovery::RecoveryState, BackupDownloadStrategy, EncryptionSettings},
     event_handler::{Ctx, RawEvent},
+    room::MessagesOptions,
     ruma::events::room::{
         encrypted::OriginalSyncRoomEncryptedEvent, member::StrippedRoomMemberEvent,
         message::OriginalSyncRoomMessageEvent,
@@ -106,6 +107,14 @@ async fn run() -> Result<()> {
     client.add_event_handler(on_undecryptable);
     client.add_event_handler_context(registry.clone());
 
+    // Rebuild §2/§5.2 thread bookkeeping from durable room history before any
+    // live event can be routed. `ThreadState` is in-memory (D6: rebuildable
+    // from the room, never persisted), so after a restart it starts empty;
+    // without this replay, an un-tokened human thread reply (§5.2) that
+    // predates the restart resolves no target and silently falls through to a
+    // no-wake §5.3 broadcast until some later event re-establishes the thread.
+    replay_thread_history(&client, &registry).await;
+
     let rpc = tokio::spawn(rpc::serve(client.clone(), registry, socket_path.clone()));
 
     println!("safehoused: entering sync loop (sync v2); ctrl-c to stop");
@@ -127,6 +136,103 @@ async fn run() -> Result<()> {
         .await?;
     println!("safehoused: room-key backup flushed; bye");
     Ok(())
+}
+
+/// How far back to walk each room's history on boot when rebuilding thread
+/// bookkeeping (§2/§5.2). Only currently-open threads matter, so this is a
+/// bound rather than full-history replay — a restart re-establishes routing
+/// for recently-active threads without paginating the entire room.
+const THREAD_REPLAY_MAX_EVENTS: usize = 500;
+
+/// Rebuild [`rpc::ThreadState`] from recent history for every joined room,
+/// before the live sync loop can route anything. Best-effort per room: a
+/// pagination failure is logged and skipped rather than aborting boot, since
+/// degraded thread routing (the pre-replay status quo) is strictly better than
+/// refusing to start. See [`replay_thread_events`] for the per-event logic.
+async fn replay_thread_history(client: &Client, registry: &Registry) {
+    for room in client.joined_rooms() {
+        match collect_recent_events(&room, THREAD_REPLAY_MAX_EVENTS).await {
+            Ok(events) => {
+                if !events.is_empty() {
+                    replay_thread_events(&registry.threads, &registry.personas, &events).await;
+                    println!(
+                        "safehoused: replayed {} event(s) of {} history to rebuild thread state",
+                        events.len(),
+                        room.room_id()
+                    );
+                }
+            }
+            Err(err) => eprintln!(
+                "safehoused: thread-state replay for {} failed \
+                 (in-thread routing may be degraded until the next live event): {err:#}",
+                room.room_id()
+            ),
+        }
+    }
+}
+
+/// Walk `room` backward from the live edge, collecting up to `max` decrypted
+/// events as parsed JSON in **chronological** (oldest-first) order — the same
+/// order the live sync path observes them, which [`rpc::ThreadState::observe`]
+/// depends on (it records the *first* root seen for a `task_id` and the
+/// *latest* agent addressed in a thread). Uses the same backward pagination as
+/// the `read` RPC op, continuing via the returned `end` token until `max` is
+/// reached or history is exhausted.
+async fn collect_recent_events(room: &Room, max: usize) -> Result<Vec<Value>> {
+    let mut newest_first: Vec<Value> = Vec::new();
+    let mut from: Option<String> = None;
+    while newest_first.len() < max {
+        let mut options = MessagesOptions::backward();
+        options.from = from.clone();
+        let remaining = max - newest_first.len();
+        options.limit = (remaining.min(100) as u32).into();
+        let batch = room.messages(options).await?;
+        if batch.chunk.is_empty() {
+            break;
+        }
+        for event in &batch.chunk {
+            if let Ok(parsed) = serde_json::from_str::<Value>(event.raw().json().get()) {
+                newest_first.push(parsed);
+            }
+        }
+        match batch.end {
+            Some(token) => from = Some(token),
+            None => break, // reached the start of accessible history
+        }
+    }
+    newest_first.reverse();
+    Ok(newest_first)
+}
+
+/// Replay a chronological slice of room-event JSON through
+/// [`rpc::ThreadState::observe`], reconstructing the §2/§5.2 index exactly as
+/// `on_message` does for live events: resolve the thread root, resolve the
+/// currently-addressed agent from the state rebuilt so far, interpret the
+/// envelope (skipping unsupported versions, as the live path drops them), then
+/// observe. Non-`m.room.message` events are ignored. Factored out of the boot
+/// path so it can be unit-tested without a live homeserver.
+async fn replay_thread_events(threads: &rpc::ThreadState, personas: &[String], events: &[Value]) {
+    for parsed in events {
+        if parsed.get("type").and_then(Value::as_str) != Some("m.room.message") {
+            continue;
+        }
+        let Some(event_id) = parsed.get("event_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let content = parsed.get("content").cloned().unwrap_or(Value::Null);
+        let sender = parsed.get("sender").and_then(Value::as_str).unwrap_or("");
+        let thread_root =
+            envelope::thread_root_from_content(&content).unwrap_or_else(|| event_id.to_owned());
+        let thread_agent = threads.target_for_thread(&thread_root).await;
+        let env =
+            match envelope::from_event_json(&content, sender, personas, thread_agent.as_deref()) {
+                envelope::Inbound::Envelope(env, _unknown) => env,
+                // §7.2: never let an unsupported-version envelope into the index —
+                // the live path drops it, so replay must too.
+                envelope::Inbound::UnsupportedVersion(_) => continue,
+            };
+        threads.observe(&thread_root, event_id, &env).await;
+    }
 }
 
 /// Cold/warm/recovery boot. The sequence Q-J verified live: build client on an
@@ -418,4 +524,161 @@ async fn on_undecryptable(event: OriginalSyncRoomEncryptedEvent, room: Room) {
         event.sender,
         room.room_id()
     );
+}
+
+/// Boot-time thread-state replay (§2/§5.2). These exercise
+/// [`replay_thread_events`] directly — the pure per-event replay logic — which
+/// is what makes the fix testable without a live homeserver (the paginating
+/// [`collect_recent_events`] wrapper does the network I/O and is covered in
+/// production, not here).
+#[cfg(test)]
+mod replay_tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn personas() -> Vec<String> {
+        vec!["writer_agent".to_owned(), "research_agent".to_owned()]
+    }
+
+    /// A room event carrying an explicit agent envelope of `type: task`.
+    /// `root: None` means the event *is* a thread root (no `m.relates_to`);
+    /// `Some(root)` threads it under an earlier root via `m.thread`.
+    fn agent_event(event_id: &str, root: Option<&str>, to: &str, task_id: Option<&str>) -> Value {
+        let mut content = json!({
+            "msgtype": "m.text",
+            "body": "rendered text agents never read",
+            envelope::ENVELOPE_KEY: {
+                "v": 1,
+                "from": "writer_agent",
+                "to": to,
+                "type": "task",
+                "task_id": task_id,
+                "body": "go",
+            },
+        });
+        if let Some(root) = root {
+            content["m.relates_to"] = envelope::thread_relation(root, root);
+        }
+        json!({
+            "type": "m.room.message",
+            "event_id": event_id,
+            "sender": "@safehoused:x",
+            "content": content,
+        })
+    }
+
+    /// A human message with no envelope, threaded under `root` — the §5.2
+    /// case: no `@token`, routing depends entirely on rebuilt thread state.
+    fn human_thread_reply(event_id: &str, root: &str, body: &str) -> Value {
+        json!({
+            "type": "m.room.message",
+            "event_id": event_id,
+            "sender": "@robb:x",
+            "content": {
+                "msgtype": "m.text",
+                "body": body,
+                "m.relates_to": envelope::thread_relation(root, root),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn replay_rebuilds_task_root_and_thread_target() {
+        // A single agent task event establishes the whole index for its
+        // thread: the task's root, the latest event, and who's addressed.
+        let threads = rpc::ThreadState::default();
+        let events = vec![agent_event("$root", None, "research_agent", Some("t"))];
+        replay_thread_events(&threads, &personas(), &events).await;
+
+        assert_eq!(threads.root_for_task("t").await.as_deref(), Some("$root"));
+        assert_eq!(
+            threads.target_for_thread("$root").await.as_deref(),
+            Some("research_agent")
+        );
+        assert_eq!(
+            threads.latest_in_thread("$root").await.as_deref(),
+            Some("$root")
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_after_restart_restores_untokened_reply_routing() {
+        // The issue's exact scenario: a task thread is established, then the
+        // daemon restarts. Replaying history must restore `thread_target` so
+        // an un-tokened §5.2 reply resolves an agent instead of falling
+        // through to a no-wake §5.3 broadcast. Also verifies chronological
+        // replay: the target follows the *latest* agent addressed, the task
+        // root is never overwritten, and a later human reply advances only
+        // `latest_in_thread`.
+        let threads = rpc::ThreadState::default();
+        let events = vec![
+            agent_event("$root", None, "research_agent", Some("t")),
+            agent_event("$reply1", Some("$root"), "writer_agent", Some("t")),
+            human_thread_reply("$reply2", "$root", "and one more thing"),
+        ];
+        replay_thread_events(&threads, &personas(), &events).await;
+
+        // Was empty before replay (the bug) — now resolves the last agent
+        // addressed, so the un-tokened reply above routed to it, not "*".
+        assert_eq!(
+            threads.target_for_thread("$root").await.as_deref(),
+            Some("writer_agent")
+        );
+        assert_eq!(
+            threads.latest_in_thread("$root").await.as_deref(),
+            Some("$reply2")
+        );
+        assert_eq!(
+            threads.root_for_task("t").await.as_deref(),
+            Some("$root"),
+            "the first root seen for a task_id must never be overwritten"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_skips_unsupported_versions_and_non_messages() {
+        let threads = rpc::ThreadState::default();
+        let unsupported = json!({
+            "type": "m.room.message",
+            "event_id": "$bad",
+            "sender": "@evil:remote",
+            "content": {
+                "body": "rendered",
+                envelope::ENVELOPE_KEY: {
+                    "v": 2,
+                    "from": "writer_agent",
+                    "to": "research_agent",
+                    "type": "task",
+                    "task_id": "t",
+                    "body": "go",
+                },
+            },
+        });
+        let reaction = json!({
+            "type": "m.reaction",
+            "event_id": "$react",
+            "sender": "@robb:x",
+            "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": "$x" } },
+        });
+        replay_thread_events(&threads, &personas(), &[unsupported, reaction]).await;
+
+        // Neither event contributed to the index.
+        assert!(threads.root_for_task("t").await.is_none());
+        assert!(threads.target_for_thread("$bad").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_ignores_events_missing_an_event_id() {
+        // Defensive: a malformed history entry with no `event_id` must be
+        // skipped, not panic or misindex.
+        let threads = rpc::ThreadState::default();
+        let malformed = json!({
+            "type": "m.room.message",
+            "sender": "@robb:x",
+            "content": { "body": "no event id here" },
+        });
+        replay_thread_events(&threads, &personas(), &[malformed]).await;
+        assert!(threads.target_for_thread("$anything").await.is_none());
+    }
 }
