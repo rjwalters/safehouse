@@ -303,3 +303,24 @@ long-lived process, or a human at a REPL), not to the message layer.
   making self-scheduled catch-up reliable — a `since`/cursor option on `read` so an agent that was
   away gets exactly what it missed — plus surfacing the advisory `wake` hint in `read` output for
   external wakers.
+
+## D17 — Per-agent mailbox is the agent-facing primitive (realizes D16)
+**Decision (2026-07-26):** for each registered persona, `safehoused` maintains an up-to-date
+**mailbox** — the envelopes destined for that persona (its `to:` messages plus broadcasts) with a
+per-persona **read cursor**. Agents consume their mailbox via MCP tools on their own cadence (D16);
+they never hold a socket open or get spawned. Registration = a persona present in the config
+allowlist; the daemon keeps a mailbox for each.
+
+**Consistency with D6 (room = source of truth):** the mailbox is a **derived view** over the
+daemon's synced room timeline plus per-persona local read-state — it is **rebuildable from the room**
+on restart, so it is a cache/index, not a second source of truth. The only genuinely new state is the
+read cursor (what persona X has already consumed): local delivery bookkeeping, not message content.
+
+**Requirements:**
+- **Durable across daemon restarts** — an agent that checks in after a reboot still gets exactly what
+  it missed (read cursors persist, e.g. sqlite in `state_dir`).
+- **MCP surface**: a `check`/inbox tool returns unread-for-me and advances the cursor;
+  `send` / `read` (room history) / `create_room` / `list_rooms` remain. Live delivery to a *connected*
+  socket stays as an optional low-latency path, but the mailbox is the durable primitive — **no agent
+  needs to be connected to receive**.
+- Per-machine (D4): each host's daemon maintains mailboxes for the personas registered on it.
