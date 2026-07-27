@@ -112,6 +112,11 @@ as assumed against our chosen homeserver.
 ---
 
 ## Churn watch
+
+**tuwunel#525 (ours, filed 2026-07-26):** feature request for MSC4108 QR-code login on top of
+tuwunel's native OIDC server (#342). If it lands, phones onboard by QR instead of typed passwords —
+but only adoptable if password `/login` keeps coexisting, since the daemon's headless path (D10)
+depends on it. Until then: manual sign-in on phones; Element X QR login is impossible on tuwunel.
 The lightweight-homeserver landscape moves fast (conduwuit died 2025; continuwuity/tuwunel are young,
 ~weekly releases; MSC3202 superseded by MSC4326). Because safehouse rides the **client-SDK** path, not
 encrypted appservices, we're insulated from the churniest part — and Q-G added two independent
