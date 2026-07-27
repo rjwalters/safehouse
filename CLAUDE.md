@@ -1,7 +1,7 @@
 # safehouse
 
 FOSS, E2E, bot-first messaging substrate on Matrix. **Start with `docs/next-agent.md`** — it is the
-canonical handoff and points everywhere else (design, decisions D1–D14, open questions, protocol).
+canonical handoff and points everywhere else (design, decisions D1–D17, open questions, protocol).
 
 - Rust workspace: `safehoused/` (the daemon — key custody, sync v2, unix-socket RPC),
   `safehouse-mcp/` (keyless stdio MCP shim), `spikes/` (throwaway provenance binaries).

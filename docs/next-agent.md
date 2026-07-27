@@ -11,7 +11,7 @@ inbound room events to **ephemeral local agents** that sit behind it over a **lo
 hold no keys. The **room is the single source of truth** so a human on Element gets full visibility +
 @-mention remote control. Threat model: compromised host/server, NOT agent-vs-agent.
 
-## Status: steps 1–4 done and verified live; next is the first real agent
+## Status: steps 1–5 done and verified live; next is the first real agent
 
 Two research rounds are done (8 passes, all 2026-07-26, archived in `research/`). **Every question
 is answered and live-verified**, including the phone check on the production stack: cold start, warm
@@ -23,7 +23,7 @@ via Caddy DNS-01 (D14).
 
 ## Decisions already made (don't relitigate without reason)
 
-See `decisions.md` for all fourteen with rationale. The load-bearing ones:
+See `decisions.md` for all seventeen with rationale. The load-bearing ones:
 
 - **Matrix, not a hand-rolled Signal clone.** Never hand-write crypto — vodozemac via
   matrix-rust-sdk. (D3)
