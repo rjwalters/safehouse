@@ -7,12 +7,15 @@
 //! daemon also pushes inbound room events to the connection as
 //! `{"event":"message", ...}` lines (no `id`).
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
-    room::MessagesOptions,
-    ruma::api::client::room::create_room::v3::Request as CreateRoomRequest,
+    room::MessagesOptions, ruma::api::client::room::create_room::v3::Request as CreateRoomRequest,
     Client, Room, RoomState,
 };
 use serde_json::{json, Value};
@@ -28,6 +31,10 @@ pub struct Registry {
     conns: Mutex<HashMap<u64, ConnHandle>>,
     next_id: std::sync::atomic::AtomicU64,
     pub personas: Vec<String>,
+    /// `(matrix_sender, version)` pairs already surfaced to the human for an
+    /// unsupported-version envelope (§7.2). Deduped so a remote daemon sending
+    /// a stream of bad-version envelopes surfaces once, not once per event.
+    surfaced_unsupported: Mutex<HashSet<(String, u64)>>,
 }
 
 struct ConnHandle {
@@ -41,7 +48,19 @@ impl Registry {
             conns: Mutex::new(HashMap::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             personas,
+            surfaced_unsupported: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Record that an unsupported-version envelope from `sender` at `version`
+    /// is about to be surfaced, returning `true` only the first time the pair
+    /// is seen. Callers surface to the human iff this returns `true`, so a
+    /// flood of bad-version events from one sender is logged but surfaced once.
+    pub async fn mark_unsupported_surfaced(&self, sender: &str, version: u64) -> bool {
+        self.surfaced_unsupported
+            .lock()
+            .await
+            .insert((sender.to_owned(), version))
     }
 
     /// Deliver an inbound envelope to connected agents. The author persona is
@@ -163,15 +182,24 @@ async fn handle_op(
 ) -> Result<Value> {
     match op {
         "send" => {
-            let to = req.get("to").and_then(Value::as_str).context("send requires `to`")?;
-            let body = req.get("body").and_then(Value::as_str).context("send requires `body`")?;
+            let to = req
+                .get("to")
+                .and_then(Value::as_str)
+                .context("send requires `to`")?;
+            let body = req
+                .get("body")
+                .and_then(Value::as_str)
+                .context("send requires `body`")?;
             let kind = req.get("type").and_then(Value::as_str).unwrap_or("chat");
             anyhow::ensure!(
                 envelope::KNOWN_TYPES.contains(&kind),
                 "unknown type {kind:?} (v1 types: {:?})",
                 envelope::KNOWN_TYPES
             );
-            let task_id = req.get("task_id").and_then(Value::as_str).map(str::to_owned);
+            let task_id = req
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             if let Some(t) = &task_id {
                 anyhow::ensure!(
                     t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
@@ -192,16 +220,25 @@ async fn handle_op(
                 .send_raw("m.room.message", content)
                 .await
                 .context("sending to room")?;
-            Ok(json!({"ok": true, "event_id": response.response.event_id, "room_id": room.room_id()}))
+            Ok(
+                json!({"ok": true, "event_id": response.response.event_id, "room_id": room.room_id()}),
+            )
         }
         "create_room" => {
-            let name = req.get("name").and_then(Value::as_str).context("create_room requires `name`")?;
+            let name = req
+                .get("name")
+                .and_then(Value::as_str)
+                .context("create_room requires `name`")?;
             let mut request = CreateRoomRequest::new();
             request.name = Some(name.to_owned());
             if let Some(invites) = req.get("invite").and_then(Value::as_array) {
                 for user in invites {
-                    let user = user.as_str().context("invite entries must be user id strings")?;
-                    request.invite.push(user.try_into().context("invalid user id in invite")?);
+                    let user = user
+                        .as_str()
+                        .context("invite entries must be user id strings")?;
+                    request
+                        .invite
+                        .push(user.try_into().context("invalid user id in invite")?);
                 }
             }
             let room = client.create_room(request).await?;
@@ -221,7 +258,11 @@ async fn handle_op(
         }
         "read" => {
             let room = resolve_room(client, req.get("room").and_then(Value::as_str))?;
-            let limit = req.get("limit").and_then(Value::as_u64).unwrap_or(20).min(100);
+            let limit = req
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(20)
+                .min(100);
             let mut options = MessagesOptions::backward();
             options.limit = (limit as u32).into();
             let batch = room.messages(options).await?;
@@ -234,16 +275,30 @@ async fn handle_op(
                 if parsed.get("type").and_then(Value::as_str) != Some("m.room.message") {
                     continue;
                 }
-                let sender = parsed.get("sender").and_then(Value::as_str).unwrap_or("").to_owned();
+                let sender = parsed
+                    .get("sender")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
                 let content = parsed.get("content").cloned().unwrap_or(Value::Null);
-                let env = envelope::from_event_json(&content, &sender, &registry.personas);
-                messages.push(json!({
+                let mut message = json!({
                     "event_id": parsed.get("event_id"),
                     "sender": sender,
                     "own": sender == own,
                     "ts": parsed.get("origin_server_ts"),
-                    "envelope": env,
-                }));
+                });
+                let obj = message.as_object_mut().expect("json object literal");
+                // §7.2: never hand an agent a guessed envelope for a version we
+                // don't support — mark it so the agent can surface, not act.
+                match envelope::from_event_json(&content, &sender, &registry.personas) {
+                    envelope::Inbound::Envelope(env) => {
+                        obj.insert("envelope".into(), serde_json::to_value(env)?);
+                    }
+                    envelope::Inbound::UnsupportedVersion(v) => {
+                        obj.insert("unsupported_version".into(), json!(v));
+                    }
+                }
+                messages.push(message);
             }
             Ok(json!({"ok": true, "room_id": room.room_id(), "messages": messages}))
         }
@@ -265,5 +320,25 @@ fn resolve_room(client: &Client, spec: Option<&str>) -> Result<Room> {
             .with_context(|| format!("no joined room matching {s:?}")),
         None if joined.len() == 1 => Ok(joined.into_iter().next().unwrap()),
         None => anyhow::bail!("`room` required: {} rooms joined", joined.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unsupported_surface_dedups_per_sender_and_version() {
+        let registry = Registry::new(vec![]);
+        // First sighting of a (sender, version) pair surfaces.
+        assert!(registry.mark_unsupported_surfaced("@evil:remote", 2).await);
+        // Repeats from the same sender at the same version are suppressed —
+        // a flood of bad-version events surfaces once, not once per event.
+        assert!(!registry.mark_unsupported_surfaced("@evil:remote", 2).await);
+        assert!(!registry.mark_unsupported_surfaced("@evil:remote", 2).await);
+        // A different version from the same sender is meaningfully new.
+        assert!(registry.mark_unsupported_surfaced("@evil:remote", 3).await);
+        // A different sender at a seen version is also new.
+        assert!(registry.mark_unsupported_surfaced("@other:remote", 2).await);
     }
 }
