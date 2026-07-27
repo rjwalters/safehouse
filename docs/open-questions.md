@@ -4,8 +4,8 @@ Things to resolve before (or early in) coding.
 
 **Round 2 complete (2026-07-26).** Q-G, Q-H and Q-I are answered; provenance in `research/`. The
 headline: the biggest technical risk (Q-G) is **retired**, and Q-I found a **factual error in our own
-docs** that inverted the licensing answer. What remains is one live integration test and one design
-decision (Q-F).
+docs** that inverted the licensing answer. Q-F (envelope schema) is now answered by
+`protocol/envelope-v1.md`. What remains is one live integration test (Q-J).
 
 ---
 
@@ -51,6 +51,14 @@ Decision: **Apache-2.0, no `mxlink` dependency**, write the ~400 lines ourselves
 boot and key-custody path, the most security-critical code in the project. Decision rule and the
 architectural invariants that flow from it (no TCP listener, no plugin ABI) are in **D8**.
 
+### Q-F. Envelope schema — ✅ **ANSWERED** (`protocol/envelope-v1.md`, accepted 2026-07-26)
+An ordinary `m.room.message` (`msgtype: m.text`) carrying a namespaced `org.safehouse.envelope` key —
+not a custom event type, so Element renders it legibly. Fields: `v`, `from` (daemon-stamped, never
+agent-supplied), `to`, `type` (`chat`|`task`|`handoff`|`ack`), `task_id`, `body`, plus native
+`m.thread` relations. Human messages get an envelope synthesized by the daemon (`@persona` token,
+thread reply, or no-wake broadcast). Both round-2 constraints honored: `[A-Za-z0-9_]` field names and
+sender-identity gating enforced in the daemon.
+
 ### Q-D. Daemon language / SDK — ✅ **ANSWERED**
 **Rust, directly on matrix-rust-sdk ≥ 0.18.0.** Settled by D8 (no wrapper crate) and confirmed by
 Q-G, which read the SDK source and verified the full headless path exists at that version. matrix-nio
@@ -77,22 +85,6 @@ recovery passphrase is mandatory config. Passing this converts Q-G from "solved 
 
 Also unverified: whether MSC4268 historic-key-bundles-on-invite works on our homeserver (matters only
 if agents need pre-join history).
-
-### Q-F. Envelope schema *(the main thing we get to invent)*
-Define: `from`, `to` (agent | @human | room-broadcast), `type` (chat | task | handoff | ack),
-`task_id`/threading, and how it renders for a *human* reading the room in Element — legible, not JSON
-soup. Consider borrowing A2A's Task-object lifecycle for the `task` type while keeping chat readable.
-
-Two constraints landed from round 2:
-- **Field names must be `[A-Za-z0-9_]`-safe.** Claude Code Channels silently drops `meta` keys
-  containing hyphens — so **`task_id`, not `task-id`** (this file previously said `task-id`). Free to
-  fix now; annoying after the v1 shim exists.
-- **Gate on sender identity, never room identity.** From the Channels docs, which independently
-  reached our design: *"gating on the room would let anyone in an allowlisted group inject messages
-  into the session."* The `from:` field is the right primitive, and it must be enforced **in the
-  daemon**, not in any shim.
-- Per D8, the envelope is also a **licensing-relevant boundary**: keep it a documented, versioned,
-  language-agnostic wire format, and never leak internal Rust types across it.
 
 ### Q-E. Wake-without-Synapse reliability *(only if the daemon ever sleeps)*
 Not needed while the daemon is always-on. If we ever want it to sleep: is Sygnal / UnifiedPush
