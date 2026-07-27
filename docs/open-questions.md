@@ -78,9 +78,12 @@ pulls every room key back. Q-G is now solved in practice, not just on paper.
 server-side backup — the first recovery attempt lost a message permanently. The daemon's shutdown
 path MUST call `Backups::wait_for_steady_state()` (verified as the fix).
 
-Remaining sliver, needs Robb's phone: Element as `@robb`, accept the safehouse-test invite, confirm
-bot messages decrypt + what shield the self-signed bot gets (also covers Q-C). MSC4268
-historic-key-bundles remains unverified (only matters for pre-join history).
+**Phone check done 2026-07-26, production stack** (Element X on Android → tailnet →
+`safehouse.2amlogic.com` on the Studio): the human's encrypted message was decrypted and printed by
+`safehoused` end-to-end, and the bot's post-join messages decrypt on the phone. Pre-join history
+shows as undecryptable on the phone as expected — MSC4268 historic-key-bundles remains the open
+item there (only matters if pre-join history should be readable). Still to note informally: which
+trust shield Element X renders on the self-signed bot.
 
 ## 🔴 OPEN — resolve before / early in coding
 
