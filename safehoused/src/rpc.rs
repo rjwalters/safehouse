@@ -626,6 +626,31 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
     // Advisory only (D16) — the daemon never acts on this, it just carries it
     // through so a receiver's `check` output preserves the sender's hint.
     let wake = req.get("wake").and_then(Value::as_bool);
+    // §4a: agent-originated `completion` meta (#30). Unlike ingest — which
+    // degrades an invalid completion to `chat` (D18) — an agent's *own* send is
+    // rejected outright on bad meta rather than silently downgraded, so the
+    // agent learns its completion won't be feed-eligible instead of discovering
+    // it vanished. `meta` is only meaningful for `completion`; supplying it on
+    // any other type is a request error, and a `completion` without valid
+    // `completion-v1` meta is refused here.
+    let meta = match req.get("meta") {
+        Some(m) if !m.is_null() => {
+            anyhow::ensure!(
+                kind == "completion",
+                "`meta` is only valid for type \"completion\", not {kind:?}"
+            );
+            envelope::validate_completion_meta(m)
+                .map_err(|e| anyhow::anyhow!("invalid completion-v1 meta: {e}"))?;
+            Some(m.clone())
+        }
+        _ => {
+            anyhow::ensure!(
+                kind != "completion",
+                "type \"completion\" requires a `meta` object (completion-v1)"
+            );
+            None
+        }
+    };
     Ok(Envelope {
         v: 1,
         from: persona.to_owned(), // stamped here; never taken from the request
@@ -634,9 +659,7 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
         task_id,
         body: body.to_owned(),
         wake,
-        // Agent-originated `completion` meta is not wired through this send
-        // path yet — that (with strict validation) is the egress work in #30.
-        meta: None,
+        meta,
     })
 }
 
@@ -1144,6 +1167,73 @@ mod tests {
         let req = json!({"to": "research_agent", "body": "hi", "task_id": "source_check_1"});
         let env = build_send_envelope("writer_agent", &req).unwrap();
         assert_eq!(env.task_id.as_deref(), Some("source_check_1"));
+    }
+
+    // ---- build_send_envelope — completion meta wiring (#30) ----------------
+
+    fn completion_meta() -> Value {
+        json!({
+            "schema": "completion-v1",
+            "agent": "writer_agent",
+            "repo": "rjwalters/safehouse",
+            "ref": "https://github.com/rjwalters/safehouse/pull/99",
+            "result": "success",
+            "started_at": "2026-07-29T10:00:00Z",
+            "completed_at": "2026-07-29T10:05:00Z",
+        })
+    }
+
+    #[test]
+    fn build_send_envelope_carries_valid_completion_meta_intact() {
+        let req = json!({
+            "to": "*",
+            "body": "shipped it",
+            "type": "completion",
+            "meta": completion_meta(),
+        });
+        let env = build_send_envelope("writer_agent", &req).unwrap();
+        assert_eq!(env.kind, "completion");
+        assert_eq!(env.meta.as_ref().unwrap()["schema"], "completion-v1");
+        assert_eq!(env.meta.as_ref().unwrap()["repo"], "rjwalters/safehouse");
+    }
+
+    #[test]
+    fn build_send_envelope_rejects_completion_without_meta() {
+        let req = json!({"to": "*", "body": "shipped it", "type": "completion"});
+        let err = build_send_envelope("writer_agent", &req).unwrap_err();
+        assert!(err.to_string().contains("requires a `meta`"));
+    }
+
+    #[test]
+    fn build_send_envelope_rejects_completion_with_invalid_meta() {
+        let mut meta = completion_meta();
+        meta["schema"] = json!("wrong-schema");
+        let req = json!({"to": "*", "body": "shipped it", "type": "completion", "meta": meta});
+        let err = build_send_envelope("writer_agent", &req).unwrap_err();
+        assert!(err.to_string().contains("invalid completion-v1 meta"));
+    }
+
+    #[test]
+    fn build_send_envelope_rejects_meta_on_non_completion_type() {
+        let req = json!({
+            "to": "research_agent",
+            "body": "hi",
+            "type": "chat",
+            "meta": completion_meta(),
+        });
+        let err = build_send_envelope("writer_agent", &req).unwrap_err();
+        assert!(err.to_string().contains("only valid for type"));
+    }
+
+    #[test]
+    fn build_send_envelope_non_completion_without_meta_is_unaffected() {
+        // Regression: the common chat/task path never sets meta and never errors.
+        let env = build_send_envelope(
+            "writer_agent",
+            &json!({"to": "research_agent", "body": "hi"}),
+        )
+        .unwrap();
+        assert!(env.meta.is_none());
     }
 
     // ---- room resolution: id/name/alias matching + ambiguity (AC #3) ------
