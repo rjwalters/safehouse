@@ -11,7 +11,13 @@ mod envelope;
 mod mailbox;
 mod rpc;
 
-use std::{env, fs, path::PathBuf, process::ExitCode, sync::Arc};
+use std::{
+    env, fs,
+    path::PathBuf,
+    process::ExitCode,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context, Result};
 use matrix_sdk::{
@@ -24,7 +30,7 @@ use matrix_sdk::{
         encrypted::OriginalSyncRoomEncryptedEvent, member::StrippedRoomMemberEvent,
         message::OriginalSyncRoomMessageEvent, redaction::OriginalSyncRoomRedactionEvent,
     },
-    Client, Room, RoomState,
+    Client, Error as MatrixError, Room, RoomState,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -166,7 +172,14 @@ async fn run() -> Result<()> {
     let rpc = tokio::spawn(rpc::serve(client.clone(), registry, socket_path.clone()));
 
     println!("safehoused: entering sync loop (sync v2); ctrl-c to stop");
-    let sync = client.sync(SyncSettings::default());
+    // #52: a transient network hiccup during /sync (timeout, DNS failure,
+    // connection refused, 5xx, 429) must not kill the daemon — a single
+    // `operation timed out` used to propagate straight to `main()`'s fatal path
+    // and left the daemon down for days. `resilient_sync` retries those with
+    // bounded exponential backoff, reserving a fatal return for genuinely
+    // unrecoverable errors (auth/config/unsupported endpoint). ctrl-c / SIGTERM
+    // still cancel it mid-backoff via the select! below.
+    let sync = resilient_sync(&client);
     // SIGTERM is the routine supervised-stop signal (systemd `stop`, launchctl
     // `bootout`, bare `kill`), so it MUST reach the same clean-shutdown path as
     // ctrl-c below — otherwise the default termination action skips both the
@@ -177,7 +190,7 @@ async fn run() -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install SIGTERM handler")?;
     tokio::select! {
-        result = sync => result.context("sync loop exited")?,
+        result = sync => result?,
         result = rpc => result.context("rpc task panicked")?.context("rpc server exited")?,
         _ = tokio::signal::ctrl_c() => println!("safehoused: shutdown requested"),
         _ = sigterm.recv() => println!("safehoused: shutdown requested (SIGTERM)"),
@@ -194,6 +207,144 @@ async fn run() -> Result<()> {
         .await?;
     println!("safehoused: room-key backup flushed; bye");
     Ok(())
+}
+
+/// Whether a sync-loop error should be transparently retried or is fatal (#52).
+/// Mirrors `egress.rs`'s `SinkError::{Retryable, Terminal}` split — the in-repo
+/// precedent for a recoverable/non-recoverable classification — applied here to
+/// `matrix_sdk::Error`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyncDisposition {
+    /// A transient condition — raw transport error (timeout/DNS/connection
+    /// refused), `5xx`, or `429`. The sync loop backs off and retries rather
+    /// than terminating the daemon.
+    Recoverable,
+    /// A non-recoverable condition — auth failure (401/403), a bad-request/config
+    /// error (other 4xx), an unsupported/unimplemented endpoint, or a non-HTTP
+    /// sync error. Propagated to `main()`'s fatal-exit path, preserving pre-#52
+    /// behavior for genuinely unrecoverable states.
+    Fatal,
+}
+
+/// A run of sync failures whose gap from the previous failure exceeds this is
+/// treated as a *new* outage: the consecutive-failure counter resets so backoff
+/// starts small again, rather than staying pinned at the cap for the rest of the
+/// daemon's life after one early blip.
+const SYNC_STREAK_RESET: Duration = Duration::from_secs(300);
+
+/// Exponential backoff (seconds) before the `attempt`-th consecutive sync retry,
+/// capped so a long outage doesn't push the delay absurdly far out. Deliberately
+/// the same shape (2s base, 60s cap) as `egress::retry_backoff_secs`.
+fn sync_retry_backoff_secs(attempt: u32) -> u64 {
+    const BASE_SECS: u64 = 2;
+    const CAP_SECS: u64 = 60;
+    BASE_SECS.saturating_pow(attempt.clamp(1, 6)).min(CAP_SECS)
+}
+
+/// Decide whether a sync error is a transient network condition to retry or a
+/// genuine failure to surface fatally. Delegates the actual policy to
+/// [`disposition_for_http_status`] so it is unit-testable without a live
+/// homeserver or a hand-constructed `matrix_sdk::Error`.
+fn classify_sync_error(err: &MatrixError) -> SyncDisposition {
+    match err {
+        MatrixError::Http(http) => {
+            // A server that doesn't implement /sync won't start doing so on a
+            // retry — surface it rather than spin forever.
+            if http.is_endpoint_not_implemented() {
+                return SyncDisposition::Fatal;
+            }
+            // `None` means there was no Matrix/HTTP *response* at all — a raw
+            // transport failure (DNS, connection refused, TLS, timeout: exactly
+            // the reported #52 crash) — which is always transient.
+            let status = err.as_client_api_error().map(|e| e.status_code.as_u16());
+            disposition_for_http_status(status)
+        }
+        // A non-HTTP sync error (crypto store, etc.) is not a transient network
+        // condition; preserve today's surface-and-exit behavior.
+        _ => SyncDisposition::Fatal,
+    }
+}
+
+/// The pure classification core: map the HTTP status of a sync failure to a
+/// retry disposition. `None` = a raw transport error with no HTTP response.
+fn disposition_for_http_status(status: Option<u16>) -> SyncDisposition {
+    match status {
+        // No response: DNS/timeout/connection-refused — the #52 crash. Transient.
+        None => SyncDisposition::Recoverable,
+        // Rate limited, or the homeserver (or a proxy in front of it) is briefly
+        // unwell — worth waiting out.
+        Some(429) => SyncDisposition::Recoverable,
+        Some(s) if (500..=599).contains(&s) => SyncDisposition::Recoverable,
+        // Auth: M_UNKNOWN_TOKEN / M_FORBIDDEN etc. surface as 401/403 — retrying
+        // with the same (bad) credentials can't help.
+        Some(401) | Some(403) => SyncDisposition::Fatal,
+        // Any other 4xx means the request itself was rejected on its merits — a
+        // config/version problem to surface, not a fault to retry away.
+        Some(_) => SyncDisposition::Fatal,
+    }
+}
+
+/// Drive a fallible async sync attempt with bounded exponential backoff, exiting
+/// only on a [`SyncDisposition::Fatal`] error. Generic over the attempt, its
+/// error, and the sleeper so the retry policy is unit-testable without a live
+/// `Client` (see `sync_retry_tests`); the live daemon instantiates it via
+/// [`resilient_sync`] with `client.sync(...)`, [`classify_sync_error`], and
+/// `tokio::time::sleep`.
+async fn retry_sync_attempts<A, Fut, E, S, SFut>(
+    mut attempt: A,
+    classify: impl Fn(&E) -> SyncDisposition,
+    describe: impl Fn(&E) -> String,
+    mut sleep: S,
+) -> std::result::Result<(), E>
+where
+    A: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), E>>,
+    S: FnMut(u64) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let mut consecutive: u32 = 0;
+    let mut last_failure: Option<Instant> = None;
+    loop {
+        match attempt().await {
+            // `client.sync` only returns `Ok` when its callback asks it to stop;
+            // with the daemon's default callback that never happens, but honor it.
+            Ok(()) => return Ok(()),
+            Err(err) => match classify(&err) {
+                SyncDisposition::Fatal => return Err(err),
+                SyncDisposition::Recoverable => {
+                    let now = Instant::now();
+                    if last_failure.is_some_and(|prev| now.duration_since(prev) > SYNC_STREAK_RESET)
+                    {
+                        consecutive = 0;
+                    }
+                    consecutive = consecutive.saturating_add(1);
+                    last_failure = Some(now);
+                    let backoff = sync_retry_backoff_secs(consecutive);
+                    eprintln!(
+                        "safehoused: sync error (attempt {consecutive}), retrying in {backoff}s: {}",
+                        describe(&err)
+                    );
+                    sleep(backoff).await;
+                }
+            },
+        }
+    }
+}
+
+/// The daemon's live sync loop (#52): retries transient failures with bounded
+/// backoff, returning `Err` only for genuinely unrecoverable errors so the
+/// existing fatal-exit path still fires for those. Resuming after backoff just
+/// re-enters `client.sync`, which reuses the persisted sync token internally, so
+/// no bespoke checkpointing is needed.
+async fn resilient_sync(client: &Client) -> Result<()> {
+    retry_sync_attempts(
+        || client.sync(SyncSettings::default()),
+        classify_sync_error,
+        |err| format!("{err:#}"),
+        |secs| tokio::time::sleep(Duration::from_secs(secs)),
+    )
+    .await
+    .map_err(|err| anyhow::Error::new(err).context("sync loop exited (unrecoverable)"))
 }
 
 /// How far back to walk each room's history on boot when rebuilding thread
@@ -925,5 +1076,151 @@ mod replay_tests {
         });
         replay_thread_events(&threads, &personas(), &[malformed]).await;
         assert!(threads.target_for_thread("$anything").await.is_none());
+    }
+}
+
+/// Sync-loop resilience (#52). The retry policy is factored out of the live
+/// `client.sync` call into [`retry_sync_attempts`] (generic over the attempt,
+/// its error, and the sleeper) precisely so it can be exercised here without a
+/// homeserver: a fake attempt closure feeds it synthetic recoverable/fatal
+/// errors and a recording sleeper captures the backoff schedule instead of
+/// actually waiting. The error *classification* is covered directly via the pure
+/// [`disposition_for_http_status`] core.
+#[cfg(test)]
+mod sync_retry_tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    #[test]
+    fn backoff_is_monotonic_and_capped() {
+        // Increasing, then pinned at the 60s cap — never unbounded.
+        let seq: Vec<u64> = (1..=8).map(sync_retry_backoff_secs).collect();
+        assert_eq!(seq, vec![2, 4, 8, 16, 32, 60, 60, 60]);
+        for w in seq.windows(2) {
+            assert!(w[1] >= w[0], "backoff must be non-decreasing");
+        }
+        assert!(
+            seq.iter().all(|&s| s <= 60),
+            "backoff must be capped so a long outage can't push it out unboundedly"
+        );
+    }
+
+    #[test]
+    fn transport_and_transient_statuses_are_recoverable() {
+        // No HTTP response (timeout/DNS/connection-refused: the #52 crash), plus
+        // 429 and any 5xx, are retried rather than treated as fatal.
+        for status in [None, Some(429), Some(500), Some(502), Some(503), Some(599)] {
+            assert_eq!(
+                disposition_for_http_status(status),
+                SyncDisposition::Recoverable,
+                "status {status:?} should be recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_and_client_errors_are_fatal() {
+        // Auth (401/403 — e.g. M_UNKNOWN_TOKEN) and other 4xx are surfaced, not
+        // retried: retrying with the same bad credentials/request can't help.
+        for status in [Some(400), Some(401), Some(403), Some(404), Some(422)] {
+            assert_eq!(
+                disposition_for_http_status(status),
+                SyncDisposition::Fatal,
+                "status {status:?} should be fatal"
+            );
+        }
+    }
+
+    /// A synthetic sync error for driving [`retry_sync_attempts`] without a
+    /// `Client` or a hand-built `matrix_sdk::Error`.
+    #[derive(Debug, PartialEq, Eq)]
+    struct FakeSyncError {
+        fatal: bool,
+        label: &'static str,
+    }
+
+    fn classify_fake(err: &FakeSyncError) -> SyncDisposition {
+        if err.fatal {
+            SyncDisposition::Fatal
+        } else {
+            SyncDisposition::Recoverable
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_transient_errors_then_succeeds() {
+        // The core #52 guarantee: three transient failures in a row, then a
+        // success — the loop must retry each with increasing backoff and return
+        // Ok, never propagating an error (which would exit the daemon).
+        let backoffs = RefCell::new(Vec::new());
+        let attempts = RefCell::new(0u32);
+        let result = retry_sync_attempts(
+            || {
+                let n = {
+                    let mut a = attempts.borrow_mut();
+                    *a += 1;
+                    *a
+                };
+                std::future::ready(if n <= 3 {
+                    Err(FakeSyncError {
+                        fatal: false,
+                        label: "operation timed out",
+                    })
+                } else {
+                    Ok(())
+                })
+            },
+            classify_fake,
+            |e| e.label.to_owned(),
+            |secs| {
+                backoffs.borrow_mut().push(secs);
+                std::future::ready(())
+            },
+        )
+        .await;
+
+        assert!(result.is_ok(), "transient errors must not exit the loop");
+        assert_eq!(*attempts.borrow(), 4, "3 failures then 1 success");
+        assert_eq!(
+            *backoffs.borrow(),
+            vec![2, 4, 8],
+            "each retry backs off longer than the last"
+        );
+    }
+
+    #[tokio::test]
+    async fn fatal_error_stops_the_loop_without_backoff() {
+        // Regression guard for the other half of the acceptance criteria: a
+        // non-recoverable (auth) error must propagate out so the daemon still
+        // exits fatally for genuine failures — and must not waste a backoff.
+        let backoffs = RefCell::new(Vec::new());
+        let result = retry_sync_attempts(
+            || {
+                std::future::ready(Err(FakeSyncError {
+                    fatal: true,
+                    label: "M_UNKNOWN_TOKEN",
+                }))
+            },
+            classify_fake,
+            |e| e.label.to_owned(),
+            |secs| {
+                backoffs.borrow_mut().push(secs);
+                std::future::ready(())
+            },
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            FakeSyncError {
+                fatal: true,
+                label: "M_UNKNOWN_TOKEN"
+            }
+        );
+        assert!(
+            backoffs.borrow().is_empty(),
+            "a fatal error must exit immediately, never backing off"
+        );
     }
 }
