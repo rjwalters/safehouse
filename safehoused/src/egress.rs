@@ -727,15 +727,33 @@ mod tests {
 
     /// A unique scratch directory under the OS temp dir. Mirrors `mailbox.rs`'s
     /// test helper to avoid pulling in a `tempfile` dependency.
+    ///
+    /// pid + wall-clock nanos alone are not sufficient uniqueness under
+    /// parallel test execution: macOS/APFS's `SystemTime::now()` granularity
+    /// is coarser than 1ns, so two tests starting in the same burst can
+    /// observe identical nanos and collide on the same directory name.
+    /// `create_dir_all` succeeds silently on an existing dir, so the tests
+    /// then share one `egress.sqlite3` — and whichever test finishes (and
+    /// runs its trailing `remove_dir_all`) first deletes the file out from
+    /// under the other test's still-open connection, which SQLite reports as
+    /// `SQLITE_READONLY_DBMOVED` (#55). A process-wide atomic counter makes
+    /// each call unique regardless of clock resolution.
     fn tempdir() -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "safehoused-egress-test-{}-{}",
+            "safehoused-egress-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
+        assert!(
+            !dir.exists(),
+            "tempdir collision: {dir:?} already exists (uniqueness invariant violated)"
+        );
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

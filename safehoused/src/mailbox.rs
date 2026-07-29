@@ -356,15 +356,27 @@ mod tests {
 
     /// A unique scratch directory under the OS temp dir, cleaned up by the
     /// caller. Avoids pulling in a `tempfile` dependency for one test.
+    ///
+    /// pid + wall-clock nanos alone are not sufficient uniqueness under
+    /// parallel test execution — see the sibling helper in `egress.rs` for
+    /// the full collision analysis (#55). A process-wide atomic counter
+    /// makes each call unique regardless of clock resolution.
     fn tempdir() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "safehoused-mailbox-test-{}-{}",
+            "safehoused-mailbox-test-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
+        assert!(
+            !dir.exists(),
+            "tempdir collision: {dir:?} already exists (uniqueness invariant violated)"
+        );
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
