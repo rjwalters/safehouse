@@ -6,6 +6,7 @@
 //! sync v2 loop (D13), decrypt inbound room messages and print them to
 //! stdout. No agents, no unix socket yet — that's the next step.
 
+mod egress;
 mod envelope;
 mod mailbox;
 mod rpc;
@@ -21,14 +22,23 @@ use matrix_sdk::{
     room::MessagesOptions,
     ruma::events::room::{
         encrypted::OriginalSyncRoomEncryptedEvent, member::StrippedRoomMemberEvent,
-        message::OriginalSyncRoomMessageEvent,
+        message::OriginalSyncRoomMessageEvent, redaction::OriginalSyncRoomRedactionEvent,
     },
     Client, Room, RoomState,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{mailbox::Mailbox, rpc::Registry};
+use crate::{
+    egress::{Egress, EgressConfig},
+    mailbox::Mailbox,
+    rpc::Registry,
+};
+
+/// The egress subsystem is optional; when absent from config the daemon runs
+/// exactly as before. This is the event-handler context type carrying that
+/// optionality through to `on_message`/`on_redaction`.
+type EgressHandle = Option<Arc<Egress>>;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +75,12 @@ struct Config {
     /// other invite is declined (logged, not joined).
     #[serde(default)]
     invite_allowlist: Option<Vec<String>>,
+    /// Optional public-feed egress (#30). Absent = the egress subsystem is
+    /// entirely disabled and the daemon behaves identically to before. When
+    /// present with a non-empty `rooms` allowlist, `deny_patterns` MUST also be
+    /// non-empty or the daemon refuses to boot (fail-safe, per #28).
+    #[serde(default)]
+    egress: Option<EgressConfig>,
 }
 
 fn load_config() -> Result<Config> {
@@ -109,11 +125,35 @@ async fn run() -> Result<()> {
         .clone()
         .unwrap_or_else(|| config.state_dir.join("safehoused.sock"));
 
+    // Optional public-feed egress (#30). Built (and its boot guard enforced)
+    // only when configured; otherwise `None` threads through every handler as a
+    // no-op, so the daemon runs exactly as it did before this feature existed.
+    let egress: EgressHandle = match config.egress.clone() {
+        Some(cfg) => {
+            let db_path = config.state_dir.join("egress.sqlite3");
+            let egress = Egress::open(cfg, &db_path).context("initializing egress")?;
+            println!(
+                "safehoused: egress enabled (delay buffer at {})",
+                db_path.display()
+            );
+            Some(egress)
+        }
+        None => None,
+    };
+
     client.add_event_handler(on_invite);
     client.add_event_handler(on_message);
+    client.add_event_handler(on_redaction);
     client.add_event_handler(on_undecryptable);
     client.add_event_handler_context(registry.clone());
     client.add_event_handler_context(Arc::new(config.invite_allowlist.clone()));
+    client.add_event_handler_context(egress.clone());
+
+    // The background flush task: it polls the durable delay buffer and writes
+    // due, un-retracted rows to the sink. Only spawned when egress is on.
+    if let Some(egress) = egress.clone() {
+        tokio::spawn(egress.run());
+    }
 
     // Rebuild §2/§5.2 thread bookkeeping from durable room history before any
     // live event can be routed. `ThreadState` is in-memory (D6: rebuildable
@@ -409,6 +449,7 @@ async fn on_message(
     client: Client,
     raw: RawEvent,
     Ctx(registry): Ctx<Arc<Registry>>,
+    Ctx(egress): Ctx<EgressHandle>,
 ) {
     let own_event = Some(event.sender.as_ref()) == client.user_id();
     let content: Value = serde_json::from_str(raw.get())
@@ -505,6 +546,27 @@ async fn on_message(
         );
     }
 
+    // #30: public-feed egress. Only runs when configured; the allowlist +
+    // is_allowlisted gate lives inside `consider`. A native edit (`m.replace`)
+    // of a source event inside its delay window suppresses the pending
+    // completion — the same "undo" a human has in Element — so an edit is
+    // routed to `retract` rather than treated as a fresh completion to queue.
+    if let Some(egress) = egress.as_ref() {
+        let room_id = room.room_id().as_str().to_owned();
+        if let Some(target) = egress::edit_target(&content) {
+            if let Err(err) = egress.retract(&room_id, &target).await {
+                eprintln!(
+                    "safehoused: egress retract (edit of {target}) in {room_id} failed: {err:#}"
+                );
+            }
+        } else if let Err(err) = egress.consider(&room_id, &event_id, &env).await {
+            eprintln!(
+                "safehoused: egress consider for event {} in {room_id} failed: {err:#}",
+                event.event_id
+            );
+        }
+    }
+
     // §5.1: a human addressed an unknown persona — post a visible ack rather
     // than let the message silently fall back to a no-wake broadcast. The ack
     // itself carries a real envelope, so the next sync round-trips through
@@ -517,6 +579,47 @@ async fn on_message(
             eprintln!(
                 "safehoused: failed to post unknown-persona ack for @{token} in {}: {err:#}",
                 room.room_id()
+            );
+        }
+    }
+}
+
+/// #30: a native Matrix redaction of a source event suppresses any completion
+/// still sitting in the egress delay buffer for that event — reusing the human's
+/// existing "delete message" as the retract signal rather than a bespoke
+/// envelope type. No-op when egress is off, or when the redaction targets an
+/// event with no pending row (an unrelated redaction, or one arriving after the
+/// completion already published). The `redacts` target is read from the raw
+/// event JSON so this stays correct across room versions (v11 moved `redacts`
+/// into `content`).
+async fn on_redaction(
+    _event: OriginalSyncRoomRedactionEvent,
+    room: Room,
+    raw: RawEvent,
+    Ctx(egress): Ctx<EgressHandle>,
+) {
+    let Some(egress) = egress.as_ref() else {
+        return;
+    };
+    let room_id = room.room_id().as_str().to_owned();
+    if !egress.is_egress_room(&room_id) {
+        return;
+    }
+    let parsed: Value = match serde_json::from_str(raw.get()) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    // `redacts` is top-level pre-v11 and under `content` in v11+ — accept either.
+    let target = parsed.get("redacts").and_then(Value::as_str).or_else(|| {
+        parsed
+            .get("content")
+            .and_then(|c| c.get("redacts"))
+            .and_then(Value::as_str)
+    });
+    if let Some(target) = target {
+        if let Err(err) = egress.retract(&room_id, target).await {
+            eprintln!(
+                "safehoused: egress retract (redaction of {target}) in {room_id} failed: {err:#}"
             );
         }
     }
@@ -561,6 +664,75 @@ async fn on_undecryptable(event: OriginalSyncRoomEncryptedEvent, room: Room) {
         event.sender,
         room.room_id()
     );
+}
+
+/// Config parsing — in particular the #30 `egress` block. These lock in the
+/// fail-safe defaults without a live homeserver: egress is opt-in (absent =
+/// `None`, zero behavior change) and its boot guard rejects an allowlisted room
+/// with no deny patterns.
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    /// A minimal otherwise-valid config, with `extra` appended for the egress
+    /// block (or empty for the no-egress regression case).
+    fn config_toml(extra: &str) -> String {
+        format!(
+            "homeserver = \"https://hs.example\"\n\
+             username = \"safehoused\"\n\
+             password = \"pw\"\n\
+             state_dir = \"/tmp/safehoused\"\n\
+             store_passphrase = \"sp\"\n\
+             recovery_passphrase = \"rp\"\n\
+             {extra}"
+        )
+    }
+
+    #[test]
+    fn config_without_egress_leaves_it_disabled() {
+        // Regression: a config with no `egress` block parses and the subsystem
+        // is off — the daemon must behave identically to before #30.
+        let config: Config = toml::from_str(&config_toml("")).unwrap();
+        assert!(config.egress.is_none());
+    }
+
+    #[test]
+    fn config_parses_a_full_egress_block() {
+        let config: Config = toml::from_str(&config_toml(
+            "[egress]\n\
+             rooms = [\"!feed:example\"]\n\
+             deny_patterns = [\"secret\"]\n\
+             delay_seconds = 30\n\
+             sink_path = \"/tmp/feed.jsonl\"\n",
+        ))
+        .unwrap();
+        let egress = config.egress.expect("egress block present");
+        assert_eq!(egress.rooms, vec!["!feed:example".to_owned()]);
+        assert_eq!(egress.deny_patterns, vec!["secret".to_owned()]);
+        assert_eq!(egress.delay_seconds, 30);
+        // The boot guard accepts a room paired with a deny pattern.
+        assert!(egress::validate_egress_config(&egress).is_ok());
+    }
+
+    #[test]
+    fn egress_rooms_without_deny_patterns_is_a_boot_error() {
+        // The daemon must refuse to boot (via `Egress::open` -> the guard) when
+        // a room is opted in but no deny patterns are configured.
+        let config: Config = toml::from_str(&config_toml(
+            "[egress]\n\
+             rooms = [\"!feed:example\"]\n\
+             sink_path = \"/tmp/feed.jsonl\"\n",
+        ))
+        .unwrap();
+        let egress = config.egress.expect("egress block present");
+        assert!(egress::validate_egress_config(&egress).is_err());
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        // `deny_unknown_fields` still holds with the new optional field present.
+        assert!(toml::from_str::<Config>(&config_toml("bogus_key = true\n")).is_err());
+    }
 }
 
 /// Boot-time thread-state replay (§2/§5.2). These exercise
