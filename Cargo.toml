@@ -3,7 +3,13 @@ resolver = "2"
 members = ["safehoused", "safehouse-mcp", "spikes/qj-coldstart"]
 
 [workspace.dependencies]
-matrix-sdk = { version = "0.18", features = ["e2e-encryption", "sqlite"] }
+# "bundled-sqlite" (not "sqlite") vendors sqlite via libsqlite3-sys/bundled instead of
+# linking the system library. Cargo feature unification means the direct `rusqlite`
+# dep below (mailbox store, D17) shares the same libsqlite3-sys and gets the bundled
+# build too — one flag covers both consumers. Without it, a bare Linux toolchain
+# fails to link with "unable to find library -lsqlite3" unless libsqlite3-dev is
+# installed (see README "Running it" > Prerequisites).
+matrix-sdk = { version = "0.18", features = ["e2e-encryption", "bundled-sqlite"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
