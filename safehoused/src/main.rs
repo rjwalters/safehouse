@@ -729,6 +729,42 @@ mod config_tests {
     }
 
     #[test]
+    fn egress_block_parses_sink_url_in_place_of_sink_path() {
+        // #31: an existing `sink_path`-only config keeps parsing unchanged
+        // (tested above); a new config can instead configure `sink_url` for
+        // the outbound HTTP sink, with no `sink_path` at all.
+        let config: Config = toml::from_str(&config_toml(
+            "[egress]\n\
+             rooms = [\"!feed:example\"]\n\
+             deny_patterns = [\"secret\"]\n\
+             delay_seconds = 30\n\
+             sink_url = \"https://feed.example.com/ingest\"\n",
+        ))
+        .unwrap();
+        let egress = config.egress.expect("egress block present");
+        assert_eq!(
+            egress.sink_url.as_deref(),
+            Some("https://feed.example.com/ingest")
+        );
+        assert!(egress.sink_path.is_none());
+        assert!(egress::validate_egress_config(&egress).is_ok());
+    }
+
+    #[test]
+    fn egress_block_without_any_sink_is_a_boot_error() {
+        // #31: an egress block that configures neither sink_path nor sink_url
+        // has no publish target — refuse to boot rather than silently no-op.
+        let config: Config = toml::from_str(&config_toml(
+            "[egress]\n\
+             rooms = [\"!feed:example\"]\n\
+             deny_patterns = [\"secret\"]\n",
+        ))
+        .unwrap();
+        let egress = config.egress.expect("egress block present");
+        assert!(egress::validate_egress_config(&egress).is_err());
+    }
+
+    #[test]
     fn unknown_config_key_is_rejected() {
         // `deny_unknown_fields` still holds with the new optional field present.
         assert!(toml::from_str::<Config>(&config_toml("bogus_key = true\n")).is_err());

@@ -21,10 +21,36 @@
 //!   a native Matrix edit (`m.replace`) or redaction (`m.room.redaction`) of the
 //!   source event suppresses it entirely ([`Egress::retract`]).
 //!
-//! This phase writes to a local JSON-lines file sink; real network transport is
-//! #31. Isolating the filtering logic behind a local sink lets the hardest part
-//! to get right — *what* leaves the boundary and *when* — be reviewed and tested
-//! without also reviewing an HTTP client.
+//! ## Transport (#31)
+//!
+//! The sink is one of two mutually-exclusive targets, chosen at boot from
+//! [`EgressConfig`] (`sink_url` wins if both are set): a local JSON-lines file
+//! (`sink_path`, the #30 default, kept for backward compatibility) or an
+//! outbound HTTP `POST` (`sink_url`) — e.g. a Workers/Pages endpoint or an
+//! R2-backed feed. **The HTTP sink only ever originates outbound connections;
+//! it never binds a listening socket** (D8 — see `docs/design.md` §4.1.2).
+//!
+//! The network POST never runs while holding the delay-buffer's sqlite
+//! [`Mutex`]: [`Egress::publish_due`] selects due rows under the lock, releases
+//! it, then publishes each row (the only part that may block on the network),
+//! and re-acquires the lock just to record the outcome. This keeps a slow or
+//! unreachable sink from stalling `consider`/`retract`, which run on the live
+//! sync-event path.
+//!
+//! Retry fits the existing 1s poll loop rather than an in-line sleep: a
+//! transient failure (network error or `5xx`) bumps `publish_after` into the
+//! future by an exponential backoff and increments `attempts`; after
+//! [`MAX_PUBLISH_ATTEMPTS`] the row is marked `failed` for operator inspection
+//! (`failed` rows are never auto-retried again). A `4xx` is treated as a
+//! config/schema problem, not a transient fault, and is marked `failed`
+//! immediately without consuming retry attempts — the operator needs to look
+//! at it, not have the daemon hammer a broken endpoint.
+//!
+//! **At-least-once delivery.** A crash between a successful sink write and the
+//! `published = 1` update re-emits that row on restart. The wrapper object
+//! POSTed (`{"room_id", "event_id", "payload"}`) carries the natural dedup key
+//! `(room_id, event_id)` — receivers MUST tolerate the same pair arriving more
+//! than once.
 
 use std::{
     collections::HashSet,
@@ -48,6 +74,28 @@ use crate::envelope::{validate_completion_meta, Envelope};
 /// the polling granularity, kept short so the buffer feels near-real-time.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long the HTTP sink waits for a response before treating the attempt as
+/// a (retryable) network failure. Bounded so an unreachable sink can never
+/// hang the flush loop indefinitely.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many total attempts a row gets against a transiently-failing sink
+/// before it is given up on and marked `failed`. Chosen to bound backoff to a
+/// few minutes rather than retry forever against a sink that is down for an
+/// extended outage — an operator can requeue a `failed` row manually once the
+/// sink is back (out of scope here; see the design-doc note on `failed`).
+const MAX_PUBLISH_ATTEMPTS: i64 = 5;
+
+/// Exponential backoff (seconds) after `attempts` failed tries, capped so a
+/// long outage doesn't push `publish_after` absurdly far out.
+fn retry_backoff_secs(attempts: i64) -> i64 {
+    const BASE_SECS: i64 = 2;
+    const CAP_SECS: i64 = 60;
+    BASE_SECS
+        .saturating_pow(attempts.clamp(1, 6) as u32)
+        .min(CAP_SECS)
+}
+
 /// The optional egress block on the daemon [`Config`](crate::Config). Absent =
 /// the whole egress subsystem is disabled (zero behavior change). Matches the
 /// repo's flat, explicit-config style (`#[serde(deny_unknown_fields)]`).
@@ -69,20 +117,41 @@ pub struct EgressConfig {
     /// during which an edit/redaction of the source event suppresses it.
     #[serde(default)]
     pub delay_seconds: u64,
-    /// The local JSON-lines sink file for this phase. #31 replaces this with a
-    /// real HTTP POST target.
-    pub sink_path: PathBuf,
+    /// The #30 local JSON-lines sink file. Optional as of #31 — kept only for
+    /// backward compatibility with existing configs; a config written from
+    /// scratch should prefer `sink_url`. Ignored when `sink_url` is set.
+    #[serde(default)]
+    pub sink_path: Option<PathBuf>,
+    /// The #31 outbound HTTP sink: every published record is `POST`ed here as
+    /// `{"room_id", "event_id", "payload"}` JSON. Takes priority over
+    /// `sink_path` when both are configured. Strictly outbound — the daemon
+    /// never listens on this or any address (D8).
+    #[serde(default)]
+    pub sink_url: Option<String>,
 }
 
-/// Boot-time fail-safe guard (from #28's acceptance sketch): if the operator
-/// opted any room into egress, they MUST also supply a non-empty deny-pattern
-/// list. A configured-but-unfiltered egress room is the exact
-/// leak-everything-by-omission footgun this refuses.
+/// Boot-time fail-safe guards.
+///
+/// - (from #28's acceptance sketch) if the operator opted any room into
+///   egress, they MUST also supply a non-empty deny-pattern list. A
+///   configured-but-unfiltered egress room is the exact
+///   leak-everything-by-omission footgun this refuses.
+/// - (#31) an egress block MUST configure at least one sink target
+///   (`sink_path` and/or `sink_url`) — an egress block with no publish target
+///   is either a config mistake or a copy-paste leftover, and the daemon
+///   refuses to boot silently-inert rather than guess.
 pub fn validate_egress_config(cfg: &EgressConfig) -> std::result::Result<(), String> {
     if !cfg.rooms.is_empty() && cfg.deny_patterns.is_empty() {
         return Err(
             "egress.rooms is non-empty but egress.deny_patterns is empty — refusing to \
              publish unredacted content (add at least one deny pattern)"
+                .to_owned(),
+        );
+    }
+    if cfg.sink_path.is_none() && cfg.sink_url.is_none() {
+        return Err(
+            "egress is configured but neither sink_path nor sink_url is set — configure at \
+             least one publish target"
                 .to_owned(),
         );
     }
@@ -162,7 +231,7 @@ pub fn edit_target(content: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// One row that cleared the delay buffer and was written to the sink.
+/// One row that cleared the delay buffer and was published to the sink.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublishedRecord {
     pub room_id: String,
@@ -171,18 +240,55 @@ pub struct PublishedRecord {
     pub payload: Value,
 }
 
-/// The egress runtime: allowlist config + a durable delay buffer + the local
-/// sink. Constructed only when `egress` is present in config; cloned into both
-/// the event-dispatch path (`consider`/`retract`) and the background flush task
+/// Where a published record actually goes. Chosen once at construction from
+/// [`EgressConfig`]; `sink_url` wins if both are configured.
+enum Sink {
+    /// The #30 local JSON-lines file.
+    File(PathBuf),
+    /// The #31 outbound HTTP POST target. `client` is a single shared
+    /// `reqwest::Client` (connection pooling, one place to bound the
+    /// request timeout) — never used to accept a connection, only to
+    /// originate one.
+    Http {
+        url: String,
+        client: reqwest::Client,
+    },
+}
+
+/// Why a publish attempt to the sink failed, distinguishing whether a retry is
+/// warranted.
+enum SinkError {
+    /// Network error or `5xx` — may well succeed on a later attempt.
+    Retryable(String),
+    /// `4xx`, or a local file-sink error (bad path/permissions) — retrying
+    /// without operator intervention won't help; surface it instead.
+    Terminal(String),
+}
+
+impl std::fmt::Display for SinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SinkError::Retryable(msg) | SinkError::Terminal(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// The egress runtime: allowlist config + a durable delay buffer + the sink.
+/// Constructed only when `egress` is present in config; cloned into both the
+/// event-dispatch path (`consider`/`retract`) and the background flush task
 /// (`run`).
 pub struct Egress {
     rooms: HashSet<String>,
     deny_patterns: Vec<String>,
     delay_seconds: u64,
-    sink_path: PathBuf,
+    sink: Sink,
     /// Durable delay buffer, mirroring `mailbox.rs`'s rusqlite-behind-a-Mutex
     /// shape. Keyed by `(room_id, event_id)` so an edit/redaction of the source
     /// event can find and suppress the pending row before it publishes.
+    ///
+    /// **Never held across a sink publish.** The network POST (the only part
+    /// of this subsystem that can block on something outside our control) runs
+    /// with this lock released — see [`Egress::publish_due`].
     conn: Mutex<Connection>,
 }
 
@@ -224,11 +330,43 @@ impl Egress {
             ",
         )
         .context("creating egress schema")?;
+        // #31: guarded migration for `egress.sqlite3` files written by #30,
+        // which predates the `attempts`/`failed` columns. `CREATE TABLE IF NOT
+        // EXISTS` above is a no-op against an existing file, so these columns
+        // must be added out-of-band rather than folded into the CREATE.
+        add_column_if_missing(
+            &conn,
+            "pending_publish",
+            "attempts",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &conn,
+            "pending_publish",
+            "failed",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        let sink = match config.sink_url {
+            Some(url) => Sink::Http {
+                url,
+                client: reqwest::Client::builder()
+                    .timeout(HTTP_TIMEOUT)
+                    .build()
+                    .context("building egress HTTP client")?,
+            },
+            None => Sink::File(
+                config
+                    .sink_path
+                    .context("egress config has neither sink_url nor sink_path (validate_egress_config should have caught this)")?,
+            ),
+        };
+
         Ok(Arc::new(Self {
             rooms: config.rooms.into_iter().collect(),
             deny_patterns: config.deny_patterns,
             delay_seconds: config.delay_seconds,
-            sink_path: config.sink_path,
+            sink,
             conn: Mutex::new(conn),
         }))
     }
@@ -301,54 +439,165 @@ impl Egress {
         Ok(())
     }
 
-    /// Flush every row whose delay has elapsed (`publish_after <= now`) and that
-    /// was neither retracted nor already published: append each to the sink and
-    /// mark it published. Returns what was written. Idempotent across calls — a
-    /// published row is never re-emitted.
+    /// Flush every row whose delay has elapsed (`publish_after <= now`), was
+    /// neither retracted, already published, nor given up on (`failed`):
+    /// publish each to the sink and mark the outcome. Returns what was
+    /// actually published. Idempotent across calls — a published row is never
+    /// re-emitted.
+    ///
+    /// Shape: **select due rows under the lock, release it, publish (the only
+    /// part that may hit the network), then re-acquire the lock per row just
+    /// to record the outcome.** The lock is never held across a sink publish,
+    /// so a slow/unreachable HTTP sink cannot stall `consider`/`retract`, which
+    /// run on the live sync-event path and share this same connection.
     pub async fn publish_due(&self, now: i64) -> Result<Vec<PublishedRecord>> {
-        let conn = self.conn.lock().await;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, room_id, event_id, payload_json FROM pending_publish \
-                 WHERE publish_after <= ?1 AND retracted = 0 AND published = 0 ORDER BY id ASC",
-            )
-            .context("preparing pending_publish query")?;
-        let rows = stmt
-            .query_map(params![now], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })
-            .context("querying pending_publish rows")?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .context("reading pending_publish rows")?;
+        let rows = {
+            let conn = self.conn.lock().await;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, room_id, event_id, payload_json, attempts FROM pending_publish \
+                     WHERE publish_after <= ?1 AND retracted = 0 AND published = 0 \
+                     AND failed = 0 ORDER BY id ASC",
+                )
+                .context("preparing pending_publish query")?;
+            let rows = stmt
+                .query_map(params![now], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .context("querying pending_publish rows")?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("reading pending_publish rows")?;
+            rows
+            // `conn`/`stmt` (and the lock guard) drop here, at the end of the
+            // block — deliberately, before any row is published.
+        };
 
         let mut published = Vec::with_capacity(rows.len());
-        for (id, room_id, event_id, payload_json) in rows {
+        for (id, room_id, event_id, payload_json, attempts) in rows {
             let payload: Value =
                 serde_json::from_str(&payload_json).context("decoding buffered egress payload")?;
-            self.write_to_sink(&room_id, &event_id, &payload)?;
-            conn.execute(
-                "UPDATE pending_publish SET published = 1 WHERE id = ?1",
-                params![id],
-            )
-            .context("marking pending_publish row published")?;
-            published.push(PublishedRecord {
-                room_id,
-                event_id,
-                payload,
-            });
+            match self.publish_to_sink(&room_id, &event_id, &payload).await {
+                Ok(()) => {
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE pending_publish SET published = 1 WHERE id = ?1",
+                        params![id],
+                    )
+                    .context("marking pending_publish row published")?;
+                    published.push(PublishedRecord {
+                        room_id,
+                        event_id,
+                        payload,
+                    });
+                }
+                Err(SinkError::Terminal(msg)) => {
+                    eprintln!(
+                        "safehoused: egress publish for {event_id} in {room_id} failed \
+                         permanently (non-retryable): {msg}"
+                    );
+                    let conn = self.conn.lock().await;
+                    conn.execute(
+                        "UPDATE pending_publish SET failed = 1 WHERE id = ?1",
+                        params![id],
+                    )
+                    .context("marking pending_publish row failed")?;
+                }
+                Err(SinkError::Retryable(msg)) => {
+                    let next_attempts = attempts + 1;
+                    let conn = self.conn.lock().await;
+                    if next_attempts >= MAX_PUBLISH_ATTEMPTS {
+                        eprintln!(
+                            "safehoused: egress publish for {event_id} in {room_id} failed \
+                             permanently after {next_attempts} attempts: {msg}"
+                        );
+                        conn.execute(
+                            "UPDATE pending_publish SET failed = 1, attempts = ?2 WHERE id = ?1",
+                            params![id, next_attempts],
+                        )
+                        .context("marking pending_publish row failed after max attempts")?;
+                    } else {
+                        let backoff = retry_backoff_secs(next_attempts);
+                        eprintln!(
+                            "safehoused: egress publish for {event_id} in {room_id} failed \
+                             (attempt {next_attempts}/{MAX_PUBLISH_ATTEMPTS}), retrying in \
+                             {backoff}s: {msg}"
+                        );
+                        conn.execute(
+                            "UPDATE pending_publish SET attempts = ?2, publish_after = ?3 \
+                             WHERE id = ?1",
+                            params![id, next_attempts, now + backoff],
+                        )
+                        .context("scheduling pending_publish retry")?;
+                    }
+                }
+            }
         }
         Ok(published)
     }
 
-    /// Append one published record to the local JSON-lines sink. #31 swaps this
-    /// for a real network POST.
-    fn write_to_sink(&self, room_id: &str, event_id: &str, payload: &Value) -> Result<()> {
-        if let Some(parent) = self.sink_path.parent() {
+    /// Publish one record to the configured sink. Never holds `self.conn`'s
+    /// lock — callers (`publish_due`) must have already released it before
+    /// calling this.
+    async fn publish_to_sink(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        payload: &Value,
+    ) -> std::result::Result<(), SinkError> {
+        match &self.sink {
+            Sink::File(path) => Self::write_to_file_sink(path, room_id, event_id, payload)
+                .map_err(|e| SinkError::Terminal(e.to_string())),
+            Sink::Http { url, client } => {
+                let body = json!({
+                    "room_id": room_id,
+                    "event_id": event_id,
+                    "payload": payload,
+                });
+                let response = client.post(url).json(&body).send().await;
+                match response {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            Ok(())
+                        } else if status.is_server_error() {
+                            // 5xx: the sink is having a bad time, not a bad
+                            // request — worth retrying.
+                            Err(SinkError::Retryable(format!(
+                                "sink returned {status} (transient)"
+                            )))
+                        } else {
+                            // 4xx and anything else unexpected: our request
+                            // was rejected on its merits — a config/schema
+                            // problem to surface, not a fault to retry away.
+                            Err(SinkError::Terminal(format!(
+                                "sink returned {status} (not retrying)"
+                            )))
+                        }
+                    }
+                    // A transport-level failure (DNS, connection refused,
+                    // timeout, TLS handshake failure, ...) is always treated
+                    // as transient — the operator's network/sink may recover.
+                    Err(err) => Err(SinkError::Retryable(err.to_string())),
+                }
+            }
+        }
+    }
+
+    /// Append one published record to the local JSON-lines sink (the #30
+    /// default, kept for `sink_path`-only configs).
+    fn write_to_file_sink(
+        sink_path: &Path,
+        room_id: &str,
+        event_id: &str,
+        payload: &Value,
+    ) -> Result<()> {
+        if let Some(parent) = sink_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating sink dir {}", parent.display()))?;
@@ -362,10 +611,10 @@ impl Egress {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.sink_path)
-            .with_context(|| format!("opening sink {}", self.sink_path.display()))?;
+            .open(sink_path)
+            .with_context(|| format!("opening sink {}", sink_path.display()))?;
         writeln!(file, "{line}")
-            .with_context(|| format!("writing to sink {}", self.sink_path.display()))?;
+            .with_context(|| format!("writing to sink {}", sink_path.display()))?;
         Ok(())
     }
 
@@ -392,6 +641,28 @@ impl Egress {
     }
 }
 
+/// Add `column` to `table` if it isn't already present. `ALTER TABLE ... ADD
+/// COLUMN` has no `IF NOT EXISTS` form, so this checks `pragma_table_info`
+/// first — needed to safely open an `egress.sqlite3` file written by #30
+/// (before `attempts`/`failed` existed) without erroring on every later boot.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let exists: bool = conn
+        .prepare(&format!(
+            "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+        ))
+        .context("preparing pragma_table_info query")?
+        .exists(params![column])
+        .context("checking for existing column")?;
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )
+        .with_context(|| format!("adding {table}.{column}"))?;
+    }
+    Ok(())
+}
+
 /// Current wall-clock time in whole seconds since the Unix epoch.
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -403,6 +674,11 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+        net::TcpListener,
+        sync::Mutex as TokioMutex,
+    };
 
     fn completion_meta() -> Value {
         json!({
@@ -434,7 +710,18 @@ mod tests {
             rooms: rooms.iter().map(|s| (*s).to_owned()).collect(),
             deny_patterns: deny.iter().map(|s| (*s).to_owned()).collect(),
             delay_seconds,
-            sink_path: sink,
+            sink_path: Some(sink),
+            sink_url: None,
+        }
+    }
+
+    fn http_config(rooms: &[&str], deny: &[&str], delay_seconds: u64, url: String) -> EgressConfig {
+        EgressConfig {
+            rooms: rooms.iter().map(|s| (*s).to_owned()).collect(),
+            deny_patterns: deny.iter().map(|s| (*s).to_owned()).collect(),
+            delay_seconds,
+            sink_path: None,
+            sink_url: Some(url),
         }
     }
 
@@ -451,6 +738,89 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A minimal single-purpose HTTP/1.1 server for tests — deliberately not a
+    /// crate dependency (`wiremock`/`httpmock`): a bare `TcpListener` plus a
+    /// hand-rolled request line/header/body reader is enough to assert what
+    /// this feature needs (received JSON bodies, controllable status codes)
+    /// without adding a new dev-dependency for it. Purely test-scope; this
+    /// process still never listens as part of the shipped daemon (D8).
+    ///
+    /// Returns the sink URL and a handle to the JSON bodies POSTed to it, in
+    /// arrival order. `statuses` is consumed one response per accepted
+    /// connection; once exhausted, the last status repeats.
+    async fn spawn_mock_sink(statuses: Vec<u16>) -> (String, Arc<TokioMutex<Vec<Value>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received: Arc<TokioMutex<Vec<Value>>> = Arc::new(TokioMutex::new(Vec::new()));
+        let received_task = received.clone();
+        tokio::spawn(async move {
+            let mut idx = 0usize;
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let status = statuses
+                    .get(idx)
+                    .or_else(|| statuses.last())
+                    .copied()
+                    .unwrap_or(200);
+                idx += 1;
+                handle_mock_conn(&mut stream, status, &received_task).await;
+            }
+        });
+        (format!("http://{addr}"), received)
+    }
+
+    async fn handle_mock_conn(
+        stream: &mut tokio::net::TcpStream,
+        status: u16,
+        received: &Arc<TokioMutex<Vec<Value>>>,
+    ) {
+        let (read_half, mut write_half) = stream.split();
+        let mut reader = BufReader::new(read_half);
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = trimmed.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = value.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        if let Ok(json) = serde_json::from_slice::<Value>(&body) {
+            received.lock().await.push(json);
+        }
+        let reason = match status {
+            200 => "OK",
+            400 => "Bad Request",
+            500 => "Internal Server Error",
+            _ => "Status",
+        };
+        let response =
+            format!("HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+        let _ = write_half.write_all(response.as_bytes()).await;
+        let _ = write_half.flush().await;
+    }
+
+    /// A local address nothing is listening on — connecting to it fails fast
+    /// (connection refused) rather than hanging, so the "unreachable sink"
+    /// test doesn't have to wait out a full timeout.
+    fn unreachable_addr() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
     }
 
     // ---- is_allowlisted — the security-critical gate (heaviest coverage) ---
@@ -552,6 +922,24 @@ mod tests {
     fn config_guard_accepts_empty_rooms_even_without_deny_patterns() {
         // An empty allowlist can never publish, so an empty deny list is moot.
         let cfg = config(&[], &[], 0, PathBuf::from("/tmp/sink.jsonl"));
+        assert!(validate_egress_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn config_guard_rejects_no_sink_configured() {
+        let cfg = EgressConfig {
+            rooms: vec![],
+            deny_patterns: vec![],
+            delay_seconds: 0,
+            sink_path: None,
+            sink_url: None,
+        };
+        assert!(validate_egress_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn config_guard_accepts_sink_url_alone() {
+        let cfg = http_config(&[], &[], 0, "https://example.com/feed".to_owned());
         assert!(validate_egress_config(&cfg).is_ok());
     }
 
@@ -746,5 +1134,182 @@ mod tests {
             "the same source event must queue at most once"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---- pre-existing `egress.sqlite3` migration (attempts/failed) ---------
+
+    #[tokio::test]
+    async fn opening_a_pre_31_store_adds_attempts_and_failed_columns() {
+        let dir = tempdir();
+        let db = dir.join("egress.sqlite3");
+        {
+            // Simulate a #30-vintage store: the base table, no attempts/failed.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE pending_publish (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    publish_after INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    retracted INTEGER NOT NULL DEFAULT 0,
+                    published INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        }
+        // Opening through Egress::open must migrate in the new columns rather
+        // than erroring on the pre-existing table, and the migrated schema
+        // must work end to end (enqueue + publish).
+        let egress = Egress::open(
+            config(&["!r:x"], &["nothing"], 0, dir.join("sink.jsonl")),
+            &db,
+        )
+        .unwrap();
+        egress
+            .enqueue("!r:x", "$1", 0, &json!({"schema": "completion-v1"}))
+            .await
+            .unwrap();
+        let due = egress.publish_due(0).await.unwrap();
+        assert_eq!(due.len(), 1, "a migrated store must still publish");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---- HTTP sink (#31) ----------------------------------------------------
+
+    #[tokio::test]
+    async fn http_sink_posts_expected_payload_only_after_delay() {
+        let (url, received) = spawn_mock_sink(vec![200]).await;
+        let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
+        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
+
+        // Before the delay elapses: no request at all.
+        let early = egress.publish_due(999).await.unwrap();
+        assert!(early.is_empty());
+        assert!(received.lock().await.is_empty(), "must not POST early");
+
+        // At/after publish_after: exactly one POST, with the redacted payload
+        // wrapped in the (room_id, event_id, payload) dedup envelope.
+        let due = egress.publish_due(1_000).await.unwrap();
+        assert_eq!(due.len(), 1);
+        let bodies = received.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["room_id"], "!r:x");
+        assert_eq!(bodies[0]["event_id"], "$1");
+        assert_eq!(bodies[0]["payload"]["schema"], "completion-v1");
+    }
+
+    #[tokio::test]
+    async fn http_sink_5xx_triggers_bounded_retry_then_succeeds() {
+        let (url, received) = spawn_mock_sink(vec![500, 500, 200]).await;
+        let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
+        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
+
+        // Attempt 1: 500 -> retryable, row rescheduled (not published, not failed).
+        let due = egress.publish_due(1_000).await.unwrap();
+        assert!(due.is_empty());
+        // A big future `now` clears whatever backoff was applied, so the next
+        // poll retries immediately without the test needing to know the exact
+        // backoff duration.
+        let due = egress.publish_due(1_000_000).await.unwrap();
+        assert!(due.is_empty(), "attempt 2 (still 500) must not publish");
+        let due = egress.publish_due(2_000_000).await.unwrap();
+        assert_eq!(due.len(), 1, "attempt 3 (200) must publish");
+        assert_eq!(received.lock().await.len(), 3, "exactly 3 POSTs total");
+    }
+
+    #[tokio::test]
+    async fn http_sink_4xx_does_not_retry() {
+        let (url, received) = spawn_mock_sink(vec![400]).await;
+        let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
+        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
+
+        let due = egress.publish_due(1_000).await.unwrap();
+        assert!(due.is_empty(), "a 4xx must not count as published");
+        assert_eq!(received.lock().await.len(), 1, "exactly one attempt made");
+
+        // A much later poll must not retry a 4xx-failed row at all.
+        let due = egress.publish_due(1_000_000).await.unwrap();
+        assert!(due.is_empty());
+        assert_eq!(
+            received.lock().await.len(),
+            1,
+            "a 4xx row must never be retried, even much later"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_sink_gives_up_after_max_attempts_on_repeated_5xx() {
+        let (url, received) = spawn_mock_sink(vec![500]).await;
+        let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
+        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
+
+        let mut now = 1_000i64;
+        for _ in 0..MAX_PUBLISH_ATTEMPTS {
+            let due = egress.publish_due(now).await.unwrap();
+            assert!(due.is_empty());
+            now += 1_000_000; // clear backoff unconditionally between polls
+        }
+        let attempts_made = received.lock().await.len();
+        assert_eq!(
+            attempts_made as i64, MAX_PUBLISH_ATTEMPTS,
+            "must stop at the attempt cap"
+        );
+
+        // One more poll: the row is `failed` now, so no further request fires.
+        let due = egress.publish_due(now).await.unwrap();
+        assert!(due.is_empty());
+        assert_eq!(
+            received.lock().await.len(),
+            attempts_made,
+            "a failed row must never be retried again"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_sink_unreachable_does_not_hang_or_crash() {
+        let egress =
+            Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, unreachable_addr()))
+                .unwrap();
+        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
+
+        // Bounded by the test harness itself: if this hangs, the test times
+        // out rather than the process. A connection-refused failure returns
+        // near-instantly, well inside HTTP_TIMEOUT.
+        let due = tokio::time::timeout(Duration::from_secs(5), egress.publish_due(1_000))
+            .await
+            .expect("publish_due must not hang against an unreachable sink")
+            .unwrap();
+        assert!(
+            due.is_empty(),
+            "an unreachable sink must not count as published"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_sink_failure_does_not_block_consider_on_other_rooms() {
+        // The core "must not stall the sync loop" property: even mid-retry
+        // against a bad sink, `consider`/`retract` (the live event-dispatch
+        // path, sharing the same connection) keep working.
+        let (url, _received) = spawn_mock_sink(vec![500]).await;
+        let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
+        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        egress
+            .enqueue("!r:x", "$stuck", 1_000, &payload)
+            .await
+            .unwrap();
+        let _ = egress.publish_due(1_000).await.unwrap();
+
+        // consider() must still work immediately after a publish attempt.
+        let queued = egress
+            .consider("!r:x", "$new", &env("completion", Some(completion_meta())))
+            .await
+            .unwrap();
+        assert!(queued);
     }
 }

@@ -95,6 +95,49 @@ replacement device is permanently unsigned and invisible.
 already in backup), and `matrix-sdk ≥ 0.18.0` (CVE-2026-45056 is a to-device sender-binding gap fixed
 in 0.16.1 — directly our threat model).
 
+#### 4.1.2 Public completion feed egress (#28–#31)
+
+**Off by default.** With no `egress` block in the daemon config, this subsystem does not exist at
+runtime — zero behavior change from a daemon that predates it.
+
+When explicitly configured, it is a narrow, fail-safe mirror of one envelope type (`completion`,
+`completion-v1` `meta` — `protocol/envelope-v1.md` §4a) out of specific, opted-in rooms to a public
+sink, so e.g. a status page can show "agent X finished task Y" without exposing the room's actual
+content:
+
+- **Explicit per-room opt-in + type allowlist.** Only rooms listed in `egress.rooms`, and only
+  well-formed `completion` envelopes, are ever eligible (`safehoused/src/egress.rs::is_allowlisted`).
+  Everything else — every other envelope type, every other room — is never even considered.
+- **Mandatory redaction.** A non-empty `egress.deny_patterns` list is required whenever `egress.rooms`
+  is non-empty; every deny pattern is a literal substring stripped from every string in the payload
+  before it is queued. The daemon refuses to boot on a room opted in with no deny patterns
+  (`validate_egress_config`) — leak-everything-by-omission is not a state this feature can reach.
+- **Delay buffer with retraction.** A completion sits in a durable sqlite-backed buffer for
+  `egress.delay_seconds` before publishing. A native Matrix edit (`m.replace`) or redaction of the
+  source event inside that window suppresses the pending row entirely — the same "undo" a human
+  already has in Element, reused rather than inventing a bespoke retract envelope.
+- **Sink (#31): strictly outbound HTTP, or a local file.** The published sink is configured via
+  `egress.sink_url` (an outbound `POST` — e.g. a Workers/Pages endpoint or an R2-backed feed) and/or
+  `egress.sink_path` (a local JSON-lines file, the original #30 mechanism, kept for backward
+  compatibility); `sink_url` wins if both are set. **The sink only ever originates outbound
+  connections — it never binds a listening socket, on any address, ever** (D8). This is the same
+  invariant as the agent socket (§4.1): safehoused has exactly one place it accepts connections
+  (the AF_UNIX agent socket) and the public feed is not it.
+- **Bounded, poll-driven retry — never an unbounded queue.** The existing 1s delay-buffer poll loop
+  also drives retry: a transient failure (network error or `5xx`) reschedules the row with
+  exponential backoff and an `attempts` counter; after a small fixed number of attempts the row is
+  marked `failed` (inspectable, not silently dropped) rather than retried forever. A `4xx` is treated
+  as a config/schema problem to surface to the operator, not a transient fault — it is marked
+  `failed` immediately, without consuming retry attempts, on the reasoning that hammering a
+  provably-broken request will never succeed.
+- **At-least-once delivery.** A crash between a successful sink write and marking the row published
+  re-emits that row on the next flush after restart. The published body
+  (`{"room_id", "event_id", "payload"}`) carries `(room_id, event_id)` as a natural dedup key — a
+  receiver on the other end of `sink_url` **must** tolerate the same pair arriving more than once.
+- A sink failure (of any kind) never blocks or crashes the sync loop — the room remains the single
+  source of truth (§3); the public feed is a lossy, best-effort mirror of it, not something the
+  daemon's core loop depends on.
+
 ### 4.2 Agents — ephemeral, behind the daemon
 
 - Spawn and die freely (per-task). **Never touch keys, never verify, never hit "unable to decrypt."**

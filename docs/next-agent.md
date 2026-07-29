@@ -129,11 +129,15 @@ unchanged, per D16 (the daemon never acts on it — only optional external waker
 ### 6. Wire one real agent and retire the copy-paste relay.
 Start with the two-project handoff use case that motivated all this: one agent writing a long-form document, another holding the facts it needs, today bridged by a human copy-pasting.
 
-### 7. Public completion feed (#28 chain).
-Schema groundwork is in: envelope v1 now has a `completion` `type` + `completion-v1` `meta`
-(`protocol/envelope-v1.md` §4a, D18) that round-trips through `safehoused` and degrades to `chat`
-when `meta` doesn't validate (#29 ✅). Next: the allowlist/redaction/publisher (#30) and transport
-(#31) that actually emit the feed.
+### 7. ~~Public completion feed (#28 chain)~~ ✅ DONE 2026-07-29
+Envelope v1 has a `completion` `type` + `completion-v1` `meta` (`protocol/envelope-v1.md` §4a, D18)
+that round-trips through `safehoused` and degrades to `chat` when `meta` doesn't validate (#29). The
+allowlist/redaction/delay-buffer publisher (#30, `safehoused/src/egress.rs`) and the outbound HTTP
+transport (#31) both shipped: off by default, per-room opt-in, mandatory redaction, a delay buffer
+with edit/redaction-triggered retraction, and a strictly-outbound sink (`sink_url` — a `POST`, with
+bounded exponential-backoff retry on `5xx`/network errors and no retry on `4xx` — or the original
+`sink_path` local JSON-lines file for backward compatibility). See `design.md` §4.1.2 for the full
+shape and the D8 compliance note (never a listening socket).
 
 ## Deferred, with a deadline
 - ~~**D11 — CLA vs. DCO.**~~ ✅ Decided 2026-07-26: **DCO** (`CONTRIBUTING.md`, D11).
