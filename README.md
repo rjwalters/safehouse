@@ -104,6 +104,12 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
    tuwunel --execute "users create_user safehouse-bot"   # prompts for a password
    ```
 
+   This standalone form assumes a **not-yet-running** homeserver — a bare `--execute` opens the
+   RocksDB store directly and can't attach while a live daemon holds the DB lock. To add a bot
+   account to a homeserver that's already in production (the common case since D15), see
+   [Creating a user on an already-running server](docs/research/2026-07-26-homeserver.md#creating-a-user-on-an-already-running-server)
+   for the `TUWUNEL_CONFIG` requirement and the stop/execute/start sequence.
+
    See [`docs/research/2026-07-26-homeserver.md`](docs/research/2026-07-26-homeserver.md) for the
    full homeserver setup this project targets (federation off, `allow_registration = false`).
 

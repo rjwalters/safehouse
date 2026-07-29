@@ -156,7 +156,9 @@ handlers — both sound. `federate_created_rooms = false` is **tuwunel-only** an
 rooms non-federating. `allow_registration` defaults **true on continuwuity, false on tuwunel**.
 Continuwuity phones home by default (`allow_announcements_check = true`); no tuwunel equivalent.
 
-**First two users** (tuwunel has no auto-generated first-run token):
+**First two users** (tuwunel has no auto-generated first-run token). These forms assume the
+homeserver is **not yet running** — a bare `--execute` invocation opens the RocksDB store directly,
+so it must be the only process touching it:
 
 ```bash
 tuwunel --execute "users create_user alice"          # the human
@@ -166,6 +168,56 @@ tuwunel --execute "users create_user safehouse-bot"  # the daemon
 
 Then log the bot in once via `/login` with `m.login.password` to mint a long-lived token.
 `allow_registration` stays `false` throughout — the box is sealed at two users from the start.
+
+### Creating a user on an already-running server
+
+Since D15 the production homeserver runs
+`tuwunel` under systemd on a dedicated EC2 host, so adding a bot account (e.g. a second host's
+`safehoused-studio`) means creating a user against a *live* server — now the normal case. The
+standalone `--execute` form above does not work as-is; the sequence below is **verified live
+2026-07-28** provisioning `safehoused-studio` against the production homeserver:
+
+1. **A bare `--execute` needs the config** the systemd unit otherwise supplies. Without it:
+
+   ```text
+   Error: … missing field `server_name`
+   ```
+
+   `server_name` (and friends) come from the config file; point `--execute` at it explicitly:
+
+   ```bash
+   export TUWUNEL_CONFIG=/etc/tuwunel/tuwunel.toml   # same config the systemd unit uses
+   ```
+
+2. **`--execute` cannot attach while the service holds the DB lock.** With the config set but the
+   service still running, opening the store fails because the running daemon owns
+   `/var/lib/tuwunel/LOCK`:
+
+   ```text
+   I/O error: While lock file: /var/lib/tuwunel/LOCK: Resource temporarily unavailable
+   ```
+
+   RocksDB is single-writer; `--execute` cannot share the store with the live server.
+
+3. **Verified working sequence** (stop → execute → shutdown → start, ~15s downtime; clients
+   reconnect automatically):
+
+   ```bash
+   sudo systemctl stop tuwunel
+   sudo TUWUNEL_CONFIG=/etc/tuwunel/tuwunel.toml tuwunel \
+     --execute 'users create_user safehoused-studio <password>' \
+     --execute 'server shutdown'
+   sudo systemctl start tuwunel
+   ```
+
+   The trailing `--execute 'server shutdown'` lets the transient process exit cleanly and release
+   the lock before `systemctl start` brings the service back up.
+
+**Zero-downtime alternative (admin room).** If the Matrix admin room has been provisioned on that
+homeserver, run the same `users create_user <name> <password>` command *in the admin room* instead
+— the live server executes it in-process, no stop/start and no downtime. This is conditional on the
+admin room existing; the stop/execute/start sequence above is the fallback when it hasn't been set
+up.
 
 ## Known risks for an E2E bot daemon
 
