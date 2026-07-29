@@ -155,6 +155,12 @@ shape and the D8 compliance note (never a listening socket).
   `systemd --user` on Linux), and prints the loom-daemon handoff block. Pure host orchestration — zero
   Matrix logic; the login/cross-sign/recovery it "does" is just the daemon's `boot`. Bot-account
   creation on the homeserver stays an admin action (non-goal; the script points at the #25 docs).
+- **EC2 homeserver backups (#23, done 2026-07-29):** DLM policy `policy-08f914ca7a876a175`
+  (us-west-2) snapshots the homeserver root volume daily at 09:00 UTC, 7-day retention, targeted
+  by the volume tag `Backup=safehouse-homeserver`. Restore path live-tested once: volume from
+  snapshot → attach to the instance → copy of `/var/lib/tuwunel` boots a second tuwunel on
+  port 8009 → password login succeeds. Full runbook in the closing comment on #23. Note: a volume
+  freshly created from a snapshot lazy-loads blocks from S3 — first reads are slow; that's normal.
 - **Public since 2026-07-26:** https://github.com/rjwalters/safehouse (Apache-2.0, DCO
   contributions per `CONTRIBUTING.md`).
 - Provenance for every decision lives in `research/` — eight passes, all 2026-07-26.
