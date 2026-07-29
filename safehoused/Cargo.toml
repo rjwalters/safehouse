@@ -14,3 +14,6 @@ serde_json = { workspace = true }
 rusqlite = { workspace = true }
 futures-util = { workspace = true }
 toml = "0.8"
+# Outbound-only HTTP POST client for the egress sink (#31). Never used to
+# accept inbound connections — see egress.rs's `Sink::Http`.
+reqwest = { workspace = true }
