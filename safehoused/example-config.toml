@@ -108,3 +108,40 @@ recovery_passphrase = "change-me-as-well"
 # returns exactly what was missed. Defaults to
 # "<state_dir>/mailbox.sqlite3" when omitted.
 # mailbox_path = "/var/lib/safehoused/mailbox.sqlite3"
+
+# --- Public completion feed (egress) ------------------------------------
+
+# Opt-in publisher for `completion` envelopes (docs/decisions.md D18,
+# docs/design.md §4.1.2, safehoused/src/egress.rs). Leaving the [egress]
+# table out entirely disables the feed. Boot-time fail-safe guards
+# (safehoused/src/egress.rs::validate_egress_config): if `rooms` is
+# non-empty, `deny_patterns` must also be non-empty (the daemon refuses to
+# publish unredacted content), and at least one of `sink_url` / `sink_path`
+# must be set — otherwise the daemon refuses to start.
+#
+# [egress]
+#
+# Room-id allowlist: only completions observed in one of these rooms are
+# ever feed-eligible. Empty (the default) means nothing is ever published
+# and the whole block is inert.
+# rooms = ["!abc123:example.com"]
+#
+# Mandatory deny-pattern list (literal substrings), applied to every
+# string in a completion payload before it is queued.
+# deny_patterns = ["secret", ":example.com"]
+#
+# How long a completion sits in the delay buffer before it is published;
+# an edit or redaction of the source event during this window suppresses
+# it. Defaults to 0 (publish immediately).
+# delay_seconds = 300
+#
+# Outbound HTTP sink (#31): every published record is POSTed here as
+# {"room_id", "event_id", "payload"} JSON, with bounded retry. Strictly
+# outbound — the daemon never listens on this or any address (D8). Takes
+# priority over sink_path when both are set.
+# sink_url = "https://feed.example.com/completions"
+#
+# Local JSON-lines sink file (#30) — kept for backward compatibility with
+# existing configs; a config written from scratch should prefer sink_url.
+# Ignored when sink_url is set.
+# sink_path = "/var/lib/safehoused/completions.jsonl"

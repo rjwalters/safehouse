@@ -83,13 +83,20 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
 - **Workspace:** [`safehoused/`](safehoused/) (the daemon: boot + recovery, sync v2, decrypt,
   unix-socket RPC, envelope dispatch, per-persona mailbox), [`safehouse-mcp/`](safehouse-mcp/)
   (keyless stdio MCP shim: `safehouse_send` / `safehouse_read` / `safehouse_check` /
-  `safehouse_create_room` / `safehouse_list_rooms` — also runnable as a one-shot operator CLI,
+  `safehouse_create_room` / `safehouse_add_to_space` / `safehouse_list_rooms` — also runnable as a
+  one-shot operator CLI,
   see "Scripting the socket"), and [`spikes/qj-coldstart/`](spikes/qj-coldstart/) (Q-J
   provenance).
 - **Per-agent mailbox (D16/D17):** each registered persona gets a durable, sqlite-backed read
   cursor — an agent calls `safehouse_check` on its own cadence and gets exactly what it missed,
   connected or not, surviving a daemon restart mid-gap. `safehoused` never spawns, wakes, or
   push-notifies an agent; scheduling is the agent's own business.
+- **Public completion feed (egress, D18):** a `completion` envelope type with a strict
+  `completion-v1` meta schema can be published outward through an opt-in per-room allowlist,
+  mandatory deny-pattern redaction, and a delay buffer with edit/redaction-triggered retraction —
+  to a strictly-outbound sink (`sink_url` HTTP POST with bounded retry, or a local JSON-lines
+  `sink_path`). Disabled unless configured; see `[egress]` in
+  [`safehoused/example-config.toml`](safehoused/example-config.toml).
 - ✅ **The Oct 2026 "exclude insecure devices" deadline is cleared**, not just tracked: Element X
   shows no reduced-trust indicator for the self-signed daemon device (verified on a real phone).
 
@@ -222,13 +229,13 @@ agent's identity and mailbox.
 The key insight: because we already committed to an always-on **per-host daemon**, the usual
 "client-SDK bot must stay online" cost is one we happily pay — which lets us skip encrypted
 appservices entirely and run the lightweight Rust server instead. See
-[`docs/decisions.md`](docs/decisions.md#d5). (Encrypted appservices were Synapse-only when we chose;
+[`docs/decisions.md`](docs/decisions.md#d5--lightweight-rust-homeserver--persistent-client-sdk-daemon-not-encrypted-appservice--synapse). (Encrypted appservices were Synapse-only when we chose;
 tuwunel shipped them in July 2026. The decision stands on its original reasoning — and there is still
 no Rust appservice SDK at all.)
 
 ## License
 
-**Apache-2.0** — see [`LICENSE`](LICENSE), and [`docs/decisions.md`](docs/decisions.md#d8) D8 for why.
+**Apache-2.0** — see [`LICENSE`](LICENSE), and [`docs/decisions.md`](docs/decisions.md#d8--license-apache-20-and-no-mxlink-dependency) D8 for why.
 
 Short version: it matches our dependency tree (matrix-rust-sdk and vodozemac are Apache-2.0), carries
 an express irrevocable patent grant, and preserves every downstream option — anyone wanting a

@@ -82,9 +82,10 @@ user and decrypted a cross-user encrypted message. Refuses to run if the device 
 ### 4. ~~Add the unix-socket RPC + envelope~~ ✅ DONE 2026-07-26
 JSON-lines over `<state_dir>/safehoused.sock`: `hello` (persona gated by the config `personas`
 allowlist, enforced in the daemon), `send` (daemon stamps `from`, renders envelope v1),
-`create_room`, `add_to_space`, `list_rooms`, `read`, `invite` (#39), plus inbound push lines. **`safehouse-mcp`**
+`create_room`, `add_to_space`, `list_rooms`, `read`, `check`, `invite` (#39), plus inbound push lines. **`safehouse-mcp`**
 (workspace member) is the keyless stdio MCP shim over it — tools `safehouse_send` /
-`safehouse_create_room` / `safehouse_add_to_space` / `safehouse_list_rooms` / `safehouse_read` —
+`safehouse_create_room` / `safehouse_add_to_space` / `safehouse_list_rooms` / `safehouse_read` /
+`safehouse_check` —
 pulled forward from the v1 plan. Verified live end-to-end: MCP tool call → socket → encrypted room
 → phone, allowlist rejection included. Envelope §7's loop-back rule was refined during
 implementation (own events dispatch to non-author personas; see the note in
