@@ -11,7 +11,7 @@
 
 use std::{
     env,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, IsTerminal, Write},
     os::unix::net::UnixStream,
 };
 
@@ -19,7 +19,34 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 fn main() -> Result<()> {
+    // Answer --help/--version before anything else so they work regardless of
+    // whether stdin is a TTY, a pipe, or /dev/null (e.g. in CI).
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--help" | "-h" => {
+                print_usage(&mut std::io::stdout());
+                return Ok(());
+            }
+            "--version" | "-V" => {
+                println!("safehouse-mcp {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     let stdin = std::io::stdin();
+    // A stdio MCP server expects JSON-RPC frames from a client on stdin. Run
+    // directly from an interactive shell with no redirection, stdin is the
+    // controlling TTY and the read loop would block forever waiting for a frame
+    // a human will never type — silently wedging any `cmd && next` pipeline.
+    // Print a usage hint and exit non-zero instead of hanging.
+    if stdin.is_terminal() {
+        let mut stderr = std::io::stderr();
+        print_usage(&mut stderr);
+        std::process::exit(1);
+    }
+
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
         let line = line?;
@@ -60,6 +87,20 @@ fn main() -> Result<()> {
         stdout.flush()?;
     }
     Ok(())
+}
+
+/// One-line usage note for humans who ran the binary directly instead of via an
+/// MCP client. Written to stderr on the TTY-hang guard, stdout for `--help`.
+fn print_usage(out: &mut impl Write) {
+    let _ = writeln!(
+        out,
+        "safehouse-mcp {} — stdio MCP server, meant to be launched by an MCP client.",
+        env!("CARGO_PKG_VERSION")
+    );
+    let _ = writeln!(
+        out,
+        "Set SAFEHOUSED_SOCKET / SAFEHOUSE_PERSONA and connect via JSON-RPC MCP framing on stdin."
+    );
 }
 
 fn handle_tool_call(msg: &Value) -> Result<Value> {
