@@ -78,12 +78,27 @@ user and decrypted a cross-user encrypted message. Refuses to run if the device 
 ### 4. ~~Add the unix-socket RPC + envelope~~ ✅ DONE 2026-07-26
 JSON-lines over `<state_dir>/safehoused.sock`: `hello` (persona gated by the config `personas`
 allowlist, enforced in the daemon), `send` (daemon stamps `from`, renders envelope v1),
-`create_room`, `list_rooms`, `read`, plus inbound push lines. **`safehouse-mcp`** (workspace
-member) is the keyless stdio MCP shim over it — tools `safehouse_send` / `safehouse_create_room` /
-`safehouse_list_rooms` / `safehouse_read` — pulled forward from the v1 plan. Verified live
-end-to-end: MCP tool call → socket → encrypted room → phone, allowlist rejection included.
-Envelope §7's loop-back rule was refined during implementation (own events dispatch to non-author
-personas; see the note in `protocol/envelope-v1.md`).
+`create_room`, `add_to_space`, `list_rooms`, `read`, plus inbound push lines. **`safehouse-mcp`**
+(workspace member) is the keyless stdio MCP shim over it — tools `safehouse_send` /
+`safehouse_create_room` / `safehouse_add_to_space` / `safehouse_list_rooms` / `safehouse_read` —
+pulled forward from the v1 plan. Verified live end-to-end: MCP tool call → socket → encrypted room
+→ phone, allowlist rejection included. Envelope §7's loop-back rule was refined during
+implementation (own events dispatch to non-author personas; see the note in
+`protocol/envelope-v1.md`).
+
+**Space (`m.space`) support + name/alias addressing (#27).** `create_room` takes `space: true` to
+make an `m.space` container (left unencrypted — a Space carries only `m.space.child`/`m.space.parent`
+state, not messages, so D5's "encrypt every meaningful message" rationale doesn't apply; message
+rooms are still encrypted), and `parent: "<space id/name/alias>"` to create a room already linked
+under a Space in one call. `add_to_space` links an already-joined room into a Space and is idempotent
+(re-linking is a no-op success — state events are keyed by (type, state_key), never duplicated).
+`list_rooms` now reports `type` (`"space"`/`"room"`) and `parent_space` (the room id of the first
+reciprocal parent from `Room::parent_spaces()`, else null) so a client can render/verify the
+hierarchy. Room addressing on `send`/`read`/`create_room parent`/`add_to_space` accepts a joined
+room's id, name, canonical alias, or alt alias; an **ambiguous** name/alias (matching more than one
+joined room) is now an error rather than a silent first-match. Live Element X phone verification of
+the rendered Space hierarchy (issue #27 AC #5) remains a deferred operator step — cannot be
+automated in CI.
 
 ### 5. ~~Per-agent mailbox + `safehouse_check` (D16/D17)~~ ✅ DONE 2026-07-26
 Per-persona durable mailbox in `safehoused` (`mailbox.rs`), populated from the same synced room
