@@ -98,6 +98,11 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
 
 ## Running it
 
+**Prerequisites (Linux).** sqlite is vendored (`matrix-sdk`'s `bundled-sqlite` feature, which also
+covers the direct `rusqlite` dependency used by the mailbox store, D17), so the only Linux build
+requirement is a C toolchain: `sudo apt install build-essential`. (macOS ships one via Xcode Command
+Line Tools.) No `libsqlite3-dev` or other system sqlite package is needed.
+
 **Fastest path (recommended): the one-command installer.** On a host that has `git`, `cargo`, and a
 reachable homeserver, from a checkout of this repo:
 

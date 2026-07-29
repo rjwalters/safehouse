@@ -61,6 +61,10 @@ See `decisions.md` for all seventeen with rationale. The load-bearing ones:
    live in Q-J: a key minted just before exit hadn't reached the server-side backup, and one message
    was permanently lost to the store wipe. Backup upload is a background task; treat an unflushed
    backup as not-yet-durable.
+9. **sqlite is vendored, not system-linked.** Workspace `Cargo.toml` enables matrix-sdk's
+   `bundled-sqlite` feature (covers the direct `rusqlite` dep too, via cargo feature unification on
+   `libsqlite3-sys`) so a bare Linux toolchain builds standalone — no `libsqlite3-dev` package
+   needed. Don't drop back to plain `sqlite` without re-adding that prerequisite to the README.
 
 ## Recommended first moves (in order)
 
