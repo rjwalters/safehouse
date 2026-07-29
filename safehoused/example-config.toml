@@ -62,7 +62,20 @@ recovery_passphrase = "change-me-as-well"
 # start if any entry fails that check. Defaults to an empty list, which
 # means NO agent can connect over the socket; the daemon still joins
 # rooms and mirrors traffic to stdout even with zero personas configured.
-# personas = ["writer_agent", "research_agent"]
+#
+# Convention (not enforced by the daemon): reserve a persona named
+# "operator" for humans/scripts running `safehouse-mcp read|send|check|
+# list-rooms` one-shot (see README "Scripting the socket") rather than
+# borrowing a real fleet agent's identity for ad hoc socket access — keeps
+# operator traffic out of any real agent's mailbox and out of its identity
+# in the room. One trade-off: a broadcast (`to: "*"`) is delivered to every
+# allowlisted persona's mailbox, including "operator" — an operator persona
+# that's allowlisted but rarely/never calls `check` accumulates unread
+# mailbox rows indefinitely. Harmless for correctness (the mailbox is a
+# rebuildable view over the room timeline, D16/D17), but worth knowing;
+# prefer the stateless `read` op for casual/scripted access, which never
+# touches any mailbox cursor.
+# personas = ["writer_agent", "research_agent", "operator"]
 
 # Unix-domain socket path the daemon listens on for local agent RPC
 # (hello/send/create_room/list_rooms/read/check — see safehoused/src/rpc.rs).
