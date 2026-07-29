@@ -119,10 +119,20 @@ async fn run() -> Result<()> {
 
     println!("safehoused: entering sync loop (sync v2); ctrl-c to stop");
     let sync = client.sync(SyncSettings::default());
+    // SIGTERM is the routine supervised-stop signal (systemd `stop`, launchctl
+    // `bootout`, bare `kill`), so it MUST reach the same clean-shutdown path as
+    // ctrl-c below — otherwise the default termination action skips both the
+    // socket cleanup and the load-bearing backup flush, leaving any just-minted
+    // room key unrecoverable after a store loss (found live in Q-J). The daemon
+    // is unix-only by invariant D8, so no cfg(unix) guard is needed. Register
+    // before the select! because installation can fail.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("install SIGTERM handler")?;
     tokio::select! {
         result = sync => result.context("sync loop exited")?,
         result = rpc => result.context("rpc task panicked")?.context("rpc server exited")?,
         _ = tokio::signal::ctrl_c() => println!("safehoused: shutdown requested"),
+        _ = sigterm.recv() => println!("safehoused: shutdown requested (SIGTERM)"),
     }
     let _ = fs::remove_file(&socket_path);
 
