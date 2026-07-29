@@ -26,9 +26,12 @@ use matrix_sdk::{
     encryption::{recovery::RecoveryState, BackupDownloadStrategy, EncryptionSettings},
     event_handler::{Ctx, RawEvent},
     room::MessagesOptions,
-    ruma::events::room::{
-        encrypted::OriginalSyncRoomEncryptedEvent, member::StrippedRoomMemberEvent,
-        message::OriginalSyncRoomMessageEvent, redaction::OriginalSyncRoomRedactionEvent,
+    ruma::{
+        api::client::membership::joined_rooms,
+        events::room::{
+            encrypted::OriginalSyncRoomEncryptedEvent, member::StrippedRoomMemberEvent,
+            message::OriginalSyncRoomMessageEvent, redaction::OriginalSyncRoomRedactionEvent,
+        },
     },
     Client, Error as MatrixError, Room, RoomState,
 };
@@ -160,6 +163,11 @@ async fn run() -> Result<()> {
     if let Some(egress) = egress.clone() {
         tokio::spawn(egress.run());
     }
+
+    // Evict rooms the server no longer considers joined before anything walks
+    // the store's room list — otherwise the stale entries below would also be
+    // thread-replayed (403 noise) and stay addressable over RPC (#57).
+    reconcile_left_rooms(&client).await;
 
     // Rebuild §2/§5.2 thread bookkeeping from durable room history before any
     // live event can be routed. `ThreadState` is in-memory (D6: rebuildable
@@ -345,6 +353,44 @@ async fn resilient_sync(client: &Client) -> Result<()> {
     )
     .await
     .map_err(|err| anyhow::Error::new(err).context("sync loop exited (unrecoverable)"))
+}
+
+/// Drop store rooms the server says we are not in (#57). A `/leave` performed
+/// out-of-band (another client on this account, or a CS-API call while the
+/// daemon was down) normally surfaces in the next `/sync` — but if the room
+/// was *forgotten* before that sync ran, the server omits it from the response
+/// entirely and the store's `Joined` membership survives forever. `/sync` can
+/// never repair this, so boot reconciles against the server's own
+/// `GET /joined_rooms`. Best-effort: a failed query or eviction is logged and
+/// skipped — a stale entry (the status quo) must never block boot.
+async fn reconcile_left_rooms(client: &Client) {
+    let server: std::collections::HashSet<_> =
+        match client.send(joined_rooms::v3::Request::new()).await {
+            Ok(response) => response.joined_rooms.into_iter().collect(),
+            Err(err) => {
+                eprintln!(
+                "safehoused: joined-rooms reconciliation skipped (server query failed): {err:#}"
+            );
+                return;
+            }
+        };
+    for room in client.joined_rooms() {
+        if server.contains(room.room_id()) {
+            continue;
+        }
+        // `leave()` is the SDK's public path to a `Left` store transition; on
+        // a room the server already considers left it is a no-op re-leave.
+        match room.leave().await {
+            Ok(()) => println!(
+                "safehoused: evicted {} — left/forgotten out-of-band, server no longer lists it",
+                room.room_id()
+            ),
+            Err(err) => eprintln!(
+                "safehoused: stale room {} could not be evicted (still listed locally): {err:#}",
+                room.room_id()
+            ),
+        }
+    }
 }
 
 /// How far back to walk each room's history on boot when rebuilding thread
