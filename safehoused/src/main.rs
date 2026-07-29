@@ -58,6 +58,13 @@ struct Config {
     /// a second source of truth (D6).
     #[serde(default)]
     mailbox_path: Option<PathBuf>,
+    /// Invite-acceptance policy (issue #39). `None` (the default) preserves
+    /// the daemon's existing accept-any behavior — see `on_invite`'s doc
+    /// comment for the rationale. When set, only invites whose sender is a
+    /// full Matrix user id (`@user:server`) in this list are joined; every
+    /// other invite is declined (logged, not joined).
+    #[serde(default)]
+    invite_allowlist: Option<Vec<String>>,
 }
 
 fn load_config() -> Result<Config> {
@@ -106,6 +113,7 @@ async fn run() -> Result<()> {
     client.add_event_handler(on_message);
     client.add_event_handler(on_undecryptable);
     client.add_event_handler_context(registry.clone());
+    client.add_event_handler_context(Arc::new(config.invite_allowlist.clone()));
 
     // Rebuild §2/§5.2 thread bookkeeping from durable room history before any
     // live event can be routed. `ThreadState` is in-memory (D6: rebuildable
@@ -349,13 +357,31 @@ async fn boot(config: &Config) -> Result<Client> {
 }
 
 /// The room is invite-only from our side: the sealed homeserver has no open
-/// registration, so any invite comes from a user the operator controls.
-async fn on_invite(event: StrippedRoomMemberEvent, room: Room, client: Client) {
+/// registration, so by default any invite comes from a user the operator
+/// controls and is accepted. When `invite_allowlist` (issue #39) is
+/// configured, only invites from a sender in that list are joined — an
+/// explicit opt-in tightening of this default, not a change to it.
+async fn on_invite(
+    event: StrippedRoomMemberEvent,
+    room: Room,
+    client: Client,
+    Ctx(invite_allowlist): Ctx<Arc<Option<Vec<String>>>>,
+) {
     let Some(own_user) = client.user_id() else {
         return;
     };
     if event.state_key != own_user || room.state() != RoomState::Invited {
         return;
+    }
+    if let Some(allowlist) = invite_allowlist.as_ref() {
+        if !allowlist.iter().any(|u| u == event.sender.as_str()) {
+            println!(
+                "safehoused: declining invite to {} from {} (not in invite_allowlist)",
+                room.room_id(),
+                event.sender
+            );
+            return;
+        }
     }
     println!(
         "safehoused: invited to {} by {}, joining",

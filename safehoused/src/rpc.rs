@@ -26,7 +26,7 @@ use matrix_sdk::{
         },
         room::RoomType,
         serde::Raw,
-        OwnedServerName,
+        OwnedServerName, OwnedUserId,
     },
     Client, Room, RoomState,
 };
@@ -440,6 +440,30 @@ async fn handle_op(
                 "name": name,
                 "type": if is_space { "space" } else { "room" },
                 "parent_space": parent.as_ref().map(|p| p.room_id().to_string()),
+            }))
+        }
+        "invite" => {
+            // New-host onboarding (issue #39): validate `user` before
+            // resolving the room, so a malformed/missing user id is reported
+            // on its own terms rather than being masked by room-resolution
+            // failure. The daemon on the *receiving* end auto-joins via
+            // `on_invite` (main.rs) — this op is only the sending half.
+            let user = req
+                .get("user")
+                .and_then(Value::as_str)
+                .context("invite requires `user`")?;
+            let user_id: OwnedUserId = user
+                .try_into()
+                .with_context(|| format!("invalid user id {user:?}"))?;
+            let room = resolve_room(client, req.get("room").and_then(Value::as_str))
+                .context("resolving `room`")?;
+            room.invite_user_by_id(&user_id)
+                .await
+                .with_context(|| format!("inviting {user} to {}", room.room_id()))?;
+            Ok(json!({
+                "ok": true,
+                "room_id": room.room_id(),
+                "user": user,
             }))
         }
         "add_to_space" => {
@@ -931,6 +955,76 @@ mod tests {
         let reply = recv(&mut read).await;
         assert_eq!(reply["ok"], false);
         assert!(reply["error"].as_str().unwrap().contains("unknown op"));
+    }
+
+    // ---- `invite` op request-parsing (issue #39) --------------------------
+    //
+    // `resolve_room` needs a live homeserver's joined rooms, which the
+    // offline test client never has (see `offline_client` above) — so these
+    // exercise the parts of the op that fail *before* room resolution
+    // (missing/malformed `user`) plus the room-resolution failure itself
+    // (unknown room), matching the issue's test plan.
+
+    #[tokio::test]
+    async fn invite_requires_user_field() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "invite", "room": "!x:y"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("requires `user`"));
+    }
+
+    #[tokio::test]
+    async fn invite_rejects_malformed_user_id() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(
+            &mut write,
+            json!({"op": "invite", "room": "!x:y", "user": "not-a-user-id"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("invalid user id"));
+    }
+
+    #[tokio::test]
+    async fn invite_reports_unknown_room() {
+        // A well-formed `user` clears the parsing check above, so this
+        // exercises `resolve_room`'s failure path: the offline test client
+        // has no joined rooms at all.
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(
+            &mut write,
+            json!({"op": "invite", "room": "!nope:x", "user": "@new-bot:example.org"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("no joined room matching"));
     }
 
     #[tokio::test]
