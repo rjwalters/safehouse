@@ -102,8 +102,11 @@ reciprocal parent from `Room::parent_spaces()`, else null) so a client can rende
 hierarchy. Room addressing on `send`/`read`/`create_room parent`/`add_to_space` accepts a joined
 room's id, name, canonical alias, or alt alias; an **ambiguous** name/alias (matching more than one
 joined room) is now an error rather than a silent first-match. Live Element X phone verification of
-the rendered Space hierarchy (issue #27 AC #5) remains a deferred operator step — cannot be
-automated in CI.
+the rendered Space hierarchy (issue #27 AC #5) was completed 2026-07-29 (#36): the "2AM Fleet"
+Space + "fleet-lounge" child render correctly on the phone with E2E intact, and both are left in
+place as real fleet infrastructure. Two minor RPC quirks found during verification are tracked as
+#57 (stale left room in `list_rooms`) and #58 (`resolve_room` can't see a just-created room until
+the next sync).
 
 **New-host onboarding via `invite` (#39).** The daemon already auto-accepted every invite
 addressed to its own account (`on_invite`) — that half was never the gap. What was missing was a
