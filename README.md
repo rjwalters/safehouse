@@ -97,6 +97,21 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
 
 ## Running it
 
+**Fastest path (recommended): the one-command installer.** On a host that has `git`, `cargo`, and a
+reachable homeserver, from a checkout of this repo:
+
+```bash
+scripts/install.sh
+```
+
+It builds `safehoused` into `~/.local/bin`, prompts for the homeserver + bot credentials + recovery
+passphrase (generating the store passphrase for you), writes a `0600` config, verifies the first boot
+(headless login, cross-signing, recovery), registers a supervised service (launchd LaunchAgent on
+macOS / `systemd --user` unit on Linux), and prints the loom-daemon handoff block. Re-running is safe:
+existing config/state is left untouched, the daemon warm-starts, and the service definition is
+refreshed. The installer does **not** create the bot's Matrix account — that is the one admin step
+below (step 1). The manual walkthrough that follows is the reference for what the installer automates.
+
 1. **Create the bot's Matrix account** on your homeserver ahead of time — `safehoused` logs in with
    a username/password, it never registers itself. On tuwunel (registration off by default):
 
