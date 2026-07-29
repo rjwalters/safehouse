@@ -11,3 +11,6 @@ serde_json = "1"
 # Already vendored transitively via matrix-sdk-sqlite; used directly here for
 # the mailbox read-cursor store (D17), not for any Matrix state.
 rusqlite = "0.37"
+# Already vendored transitively via matrix-sdk; used directly here only to
+# consume `Room::parent_spaces()`'s `Stream` (Space hierarchy in `list_rooms`).
+futures-util = { version = "0.3", default-features = false }

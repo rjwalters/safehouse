@@ -124,7 +124,12 @@ fn handle_tool_call(msg: &Value) -> Result<Value> {
         }
         "safehouse_create_room" => {
             let mut op = json!({"op": "create_room"});
-            copy_fields(&args, &mut op, &["name", "invite"]);
+            copy_fields(&args, &mut op, &["name", "invite", "space", "parent"]);
+            op
+        }
+        "safehouse_add_to_space" => {
+            let mut op = json!({"op": "add_to_space"});
+            copy_fields(&args, &mut op, &["space", "room"]);
             op
         }
         "safehouse_list_rooms" => json!({"op": "list_rooms"}),
@@ -221,7 +226,7 @@ fn tool_definitions() -> Value {
                     "body": {"type": "string", "description": "Message content (plain text)"},
                     "type": {"type": "string", "enum": ["chat", "task", "handoff", "ack"], "description": "Message type (default chat)"},
                     "task_id": {"type": "string", "description": "Stable task identifier, [A-Za-z0-9_]"},
-                    "room": {"type": "string", "description": "Room id or name; optional when only one room is joined"},
+                    "room": {"type": "string", "description": "Room id, name, or alias; optional when only one room is joined. An ambiguous name/alias (matching more than one joined room) is an error, never a guess"},
                     "wake": {"type": "boolean", "description": "Advisory hint only — the daemon never acts on it. For optional external wakers deciding whether to nudge the recipient."}
                 },
                 "required": ["to", "body"]
@@ -229,19 +234,33 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "safehouse_create_room",
-            "description": "Create a new encrypted safehouse room, optionally inviting Matrix users (e.g. the human's account).",
+            "description": "Create a new safehouse room, optionally inviting Matrix users (e.g. the human's account). Message rooms are encrypted; pass space=true to create a Matrix Space (m.space) container instead — Spaces hold rooms, not messages, and are left unencrypted. Pass parent (a Space's id/name/alias) to create the new room already linked under that Space.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Room name"},
-                    "invite": {"type": "array", "items": {"type": "string"}, "description": "Matrix user ids to invite"}
+                    "invite": {"type": "array", "items": {"type": "string"}, "description": "Matrix user ids to invite"},
+                    "space": {"type": "boolean", "description": "Create a Matrix Space (m.space) container instead of a message room (default false)"},
+                    "parent": {"type": "string", "description": "Existing Space (id, name, or alias) to create this room under — sets the m.space.child/m.space.parent relationship"}
                 },
                 "required": ["name"]
             }
         },
         {
+            "name": "safehouse_add_to_space",
+            "description": "Link an already-joined room into a Space (m.space), setting the reciprocal m.space.child/m.space.parent state. Idempotent: linking an already-linked room is a no-op success, never an error or a duplicate.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "space": {"type": "string", "description": "The Space (id, name, or alias) to add the room to"},
+                    "room": {"type": "string", "description": "The room (id, name, or alias) to link under the Space"}
+                },
+                "required": ["space", "room"]
+            }
+        },
+        {
             "name": "safehouse_list_rooms",
-            "description": "List joined safehouse rooms with their ids, names, and encryption state.",
+            "description": "List joined safehouse rooms with their ids, names, and encryption state. Each entry also carries `type` (\"space\" for an m.space container, else \"room\") and `parent_space` (the room id of its confirmed parent Space, or null) so clients can render/verify the Space hierarchy.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
@@ -250,7 +269,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "room": {"type": "string", "description": "Room id or name; optional when only one room is joined"},
+                    "room": {"type": "string", "description": "Room id, name, or alias; optional when only one room is joined. An ambiguous name/alias (matching more than one joined room) is an error, never a guess"},
                     "limit": {"type": "integer", "description": "Max messages (default 20, cap 100)"}
                 }
             }

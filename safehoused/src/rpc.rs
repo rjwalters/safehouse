@@ -14,8 +14,20 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use matrix_sdk::{
-    room::MessagesOptions, ruma::api::client::room::create_room::v3::Request as CreateRoomRequest,
+    deserialized_responses::SyncOrStrippedState,
+    room::{MessagesOptions, ParentSpace},
+    ruma::{
+        api::client::room::create_room::v3::{CreationContent, Request as CreateRoomRequest},
+        events::{
+            space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
+            SyncStateEvent,
+        },
+        room::RoomType,
+        serde::Raw,
+        OwnedServerName,
+    },
     Client, Room, RoomState,
 };
 use serde_json::{json, Value};
@@ -371,8 +383,35 @@ async fn handle_op(
                 .get("name")
                 .and_then(Value::as_str)
                 .context("create_room requires `name`")?;
+            // A Space (`m.space`) is a container of rooms, not a message room.
+            let is_space = req.get("space").and_then(Value::as_bool).unwrap_or(false);
+            // Optionally create the room already linked under an existing space,
+            // resolved through the same id/name/alias path as everything else.
+            let parent = match req.get("parent").and_then(Value::as_str) {
+                Some(p) => {
+                    let parent = resolve_room(client, Some(p))?;
+                    // Symmetry with `add_to_space`: refuse to write an
+                    // `m.space.child` into a plain message room.
+                    anyhow::ensure!(
+                        parent.is_space(),
+                        "parent room {:?} is not a Space (m.space)",
+                        parent.room_id().as_str()
+                    );
+                    Some(parent)
+                }
+                None => None,
+            };
             let mut request = CreateRoomRequest::new();
             request.name = Some(name.to_owned());
+            if is_space {
+                // `m.space` is set via the `m.room.create` content's `type`,
+                // carried through `creation_content` (there is no top-level
+                // `room_type` on the createRoom request in this ruma version).
+                let mut creation = CreationContent::new();
+                creation.room_type = Some(RoomType::Space);
+                request.creation_content =
+                    Some(Raw::new(&creation).context("serializing creation_content")?);
+            }
             if let Some(invites) = req.get("invite").and_then(Value::as_array) {
                 for user in invites {
                     let user = user
@@ -384,8 +423,49 @@ async fn handle_op(
                 }
             }
             let room = client.create_room(request).await?;
-            room.enable_encryption().await?;
-            Ok(json!({"ok": true, "room_id": room.room_id(), "name": name}))
+            // Encryption decision (see issue #27 / D5): a Space carries no
+            // messages — only `m.space.child`/`m.space.parent` state — so D5's
+            // "every meaningful message goes through the encrypted room"
+            // rationale does not apply, and Element's own convention leaves
+            // Spaces unencrypted. Only message rooms get encryption enabled.
+            if !is_space {
+                room.enable_encryption().await?;
+            }
+            if let Some(parent) = &parent {
+                link_room_to_space(client, parent, &room).await?;
+            }
+            Ok(json!({
+                "ok": true,
+                "room_id": room.room_id(),
+                "name": name,
+                "type": if is_space { "space" } else { "room" },
+                "parent_space": parent.as_ref().map(|p| p.room_id().to_string()),
+            }))
+        }
+        "add_to_space" => {
+            let space = resolve_room(client, req.get("space").and_then(Value::as_str))
+                .context("resolving `space`")?;
+            anyhow::ensure!(
+                space.is_space(),
+                "room {:?} is not a Space (m.space)",
+                space.room_id().as_str()
+            );
+            let room = resolve_room(client, req.get("room").and_then(Value::as_str))
+                .context("resolving `room`")?;
+            // Idempotent: only skip the write when *both* halves are already
+            // present. A half-link (one side written, the other lost to a
+            // mid-write crash) reports `false` and is repaired by re-running the
+            // overwrite-idempotent link — retrying must never error or duplicate.
+            let already = space_child_fully_linked(&space, &room).await?;
+            if !already {
+                link_room_to_space(client, &space, &room).await?;
+            }
+            Ok(json!({
+                "ok": true,
+                "space": space.room_id(),
+                "room": room.room_id(),
+                "already_linked": already,
+            }))
         }
         "list_rooms" => {
             let mut rooms = Vec::new();
@@ -394,6 +474,11 @@ async fn handle_op(
                     "room_id": room.room_id(),
                     "name": room.name(),
                     "encrypted": room.latest_encryption_state().await.map(|s| s.is_encrypted()).unwrap_or(false),
+                    // A client can render/verify the fleet hierarchy from these
+                    // two fields: whether this entry is a Space container, and
+                    // (for a message room) the id of its confirmed parent Space.
+                    "type": if room.is_space() { "space" } else { "room" },
+                    "parent_space": reciprocal_parent_space(&room).await,
                 }));
             }
             Ok(json!({"ok": true, "rooms": rooms}))
@@ -528,21 +613,153 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
     })
 }
 
-/// Room by id, by name, or the sole joined room when unambiguous.
+/// A joined room's addressable identifiers, projected out of a `Room` so the
+/// resolution logic (`pick_room_index`) is pure and unit-testable without a
+/// live homeserver — a `matrix_sdk::Room` can't be constructed offline.
+struct RoomAddr {
+    id: String,
+    name: Option<String>,
+    canonical_alias: Option<String>,
+    alt_aliases: Vec<String>,
+}
+
+impl RoomAddr {
+    fn of(room: &Room) -> Self {
+        RoomAddr {
+            id: room.room_id().to_string(),
+            name: room.name(),
+            canonical_alias: room.canonical_alias().map(|a| a.as_str().to_owned()),
+            alt_aliases: room
+                .alt_aliases()
+                .iter()
+                .map(|a| a.as_str().to_owned())
+                .collect(),
+        }
+    }
+
+    /// Whether `s` names this room — by id, display name, canonical alias, or
+    /// any alt alias (the issue's accepted address forms).
+    fn matches(&self, s: &str) -> bool {
+        self.id == s
+            || self.name.as_deref() == Some(s)
+            || self.canonical_alias.as_deref() == Some(s)
+            || self.alt_aliases.iter().any(|a| a == s)
+    }
+}
+
+/// Decide which room a spec resolves to. Returns the index into `rooms`.
+///
+/// Ambiguity is an **error**, never a silent first-match: once the fleet has
+/// several similarly-named rooms, guessing would misroute. A `None` spec is
+/// only valid when exactly one room is joined.
+fn pick_room_index(rooms: &[RoomAddr], spec: Option<&str>) -> Result<usize> {
+    match spec {
+        Some(s) => {
+            let matches: Vec<usize> = rooms
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.matches(s))
+                .map(|(i, _)| i)
+                .collect();
+            match matches.as_slice() {
+                [only] => Ok(*only),
+                [] => anyhow::bail!("no joined room matching {s:?}"),
+                many => anyhow::bail!(
+                    "ambiguous room spec {s:?}: {} joined rooms match",
+                    many.len()
+                ),
+            }
+        }
+        None if rooms.len() == 1 => Ok(0),
+        None => anyhow::bail!("`room` required: {} rooms joined", rooms.len()),
+    }
+}
+
+/// Room by id, name, or alias, or the sole joined room when unambiguous.
+/// Ambiguous specs (more than one match) error rather than guessing.
 fn resolve_room(client: &Client, spec: Option<&str>) -> Result<Room> {
     let joined: Vec<Room> = client
         .joined_rooms()
         .into_iter()
         .filter(|r| r.state() == RoomState::Joined)
         .collect();
-    match spec {
-        Some(s) => joined
-            .into_iter()
-            .find(|r| r.room_id() == s || r.name().as_deref() == Some(s))
-            .with_context(|| format!("no joined room matching {s:?}")),
-        None if joined.len() == 1 => Ok(joined.into_iter().next().unwrap()),
-        None => anyhow::bail!("`room` required: {} rooms joined", joined.len()),
+    let addrs: Vec<RoomAddr> = joined.iter().map(RoomAddr::of).collect();
+    let idx = pick_room_index(&addrs, spec)?;
+    Ok(joined.into_iter().nth(idx).expect("index within bounds"))
+}
+
+/// The server name to advertise in `m.space.child`/`m.space.parent` `via`
+/// lists — this daemon's own homeserver, the one guaranteed to be in the room.
+fn own_server_name(client: &Client) -> Result<OwnedServerName> {
+    Ok(client
+        .user_id()
+        .context("client has no user id (not logged in?)")?
+        .server_name()
+        .to_owned())
+}
+
+/// Link `child` under `space` by writing both halves of the reciprocal
+/// `m.space` relationship (spec §m.space.child / §m.space.parent): the
+/// `m.space.child` in the space keyed by the child's id, and the
+/// `m.space.parent` in the child keyed by the space's id. State events are
+/// keyed by (type, state_key), so re-writing is inherently idempotent — no
+/// duplicate rows, just an overwrite with identical content.
+async fn link_room_to_space(client: &Client, space: &Room, child: &Room) -> Result<()> {
+    let via = vec![own_server_name(client)?];
+    space
+        .send_state_event_for_key(child.room_id(), SpaceChildEventContent::new(via.clone()))
+        .await
+        .context("writing m.space.child in the space")?;
+    let mut parent = SpaceParentEventContent::new(via);
+    parent.canonical = true; // the only parent we set, so it's canonical
+    child
+        .send_state_event_for_key(space.room_id(), parent)
+        .await
+        .context("writing m.space.parent in the child room")?;
+    Ok(())
+}
+
+/// Whether `space` and `child` already advertise *both* halves of the
+/// reciprocal `m.space` link — the child-side `m.space.child` in the space and
+/// the parent-side `m.space.parent` in the child, each with a non-empty `via`.
+/// This is the idempotency guard for `add_to_space`: only a *full* link short-
+/// circuits the write. A half-link (one side written, the other missing because
+/// a crash landed between the two `send_state_event_for_key` calls) reports
+/// `false`, so the caller re-runs the overwrite-idempotent link and repairs the
+/// missing half rather than skipping it.
+async fn space_child_fully_linked(space: &Room, child: &Room) -> Result<bool> {
+    let child_side = space
+        .get_state_event_static_for_key::<SpaceChildEventContent, _>(child.room_id())
+        .await?;
+    let has_child_side = matches!(
+        child_side.map(|raw| raw.deserialize()),
+        Some(Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e)))) if !e.content.via.is_empty()
+    );
+    if !has_child_side {
+        return Ok(false);
     }
+    let parent_side = child
+        .get_state_event_static_for_key::<SpaceParentEventContent, _>(space.room_id())
+        .await?;
+    Ok(matches!(
+        parent_side.map(|raw| raw.deserialize()),
+        Some(Ok(SyncOrStrippedState::Sync(SyncStateEvent::Original(e)))) if !e.content.via.is_empty()
+    ))
+}
+
+/// The room id of `room`'s confirmed parent Space, if any: the first
+/// `ParentSpace::Reciprocal` from `room.parent_spaces()`. Only a reciprocal
+/// relationship (parent and child both advertise each other) is a *confirmed*
+/// parent — `WithPowerlevel`/`Illegitimate`/`Unverifiable` are not presented.
+async fn reciprocal_parent_space(room: &Room) -> Option<String> {
+    let stream = room.parent_spaces().await.ok()?;
+    futures_util::pin_mut!(stream);
+    while let Some(parent) = stream.next().await {
+        if let Ok(ParentSpace::Reciprocal(space)) = parent {
+            return Some(space.room_id().to_string());
+        }
+    }
+    None
 }
 
 /// Integration tests for the unix-socket RPC protocol.
@@ -830,6 +1047,91 @@ mod tests {
         let req = json!({"to": "research_agent", "body": "hi", "task_id": "source_check_1"});
         let env = build_send_envelope("writer_agent", &req).unwrap();
         assert_eq!(env.task_id.as_deref(), Some("source_check_1"));
+    }
+
+    // ---- room resolution: id/name/alias matching + ambiguity (AC #3) ------
+    //
+    // `resolve_room` needs a live `Client`'s joined rooms, but its decision
+    // logic is factored into the pure `pick_room_index`/`RoomAddr::matches`,
+    // which are exercised here with no homeserver — the same match predicate
+    // and ambiguity rule `resolve_room` runs against real `Room`s.
+
+    fn addr(id: &str, name: Option<&str>, canonical: Option<&str>, alt: &[&str]) -> RoomAddr {
+        RoomAddr {
+            id: id.to_owned(),
+            name: name.map(str::to_owned),
+            canonical_alias: canonical.map(str::to_owned),
+            alt_aliases: alt.iter().map(|a| (*a).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn pick_room_ambiguous_name_errors_instead_of_first_match() {
+        // The latent bug this fixes: two joined rooms sharing a display name
+        // must error, not silently route to whichever one happens to be first.
+        let rooms = [
+            addr("!a:x", Some("fleet"), None, &[]),
+            addr("!b:x", Some("fleet"), None, &[]),
+        ];
+        let err = pick_room_index(&rooms, Some("fleet")).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "expected an ambiguity error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn pick_room_resolves_by_canonical_alias() {
+        let rooms = [
+            addr("!a:x", Some("General"), Some("#fleet-vibesql:x"), &[]),
+            addr("!b:x", Some("Other"), Some("#other:x"), &[]),
+        ];
+        assert_eq!(
+            pick_room_index(&rooms, Some("#fleet-vibesql:x")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn pick_room_resolves_by_alt_alias() {
+        let rooms = [
+            addr("!a:x", Some("General"), Some("#canon:x"), &["#alt-fleet:x"]),
+            addr("!b:x", Some("Other"), None, &[]),
+        ];
+        assert_eq!(pick_room_index(&rooms, Some("#alt-fleet:x")).unwrap(), 0);
+    }
+
+    #[test]
+    fn pick_room_resolves_by_id_and_name_unchanged() {
+        // Regression: the existing id/name paths still resolve as before.
+        let rooms = [
+            addr("!a:x", Some("writer"), None, &[]),
+            addr("!b:x", Some("research"), None, &[]),
+        ];
+        assert_eq!(pick_room_index(&rooms, Some("!b:x")).unwrap(), 1);
+        assert_eq!(pick_room_index(&rooms, Some("research")).unwrap(), 1);
+    }
+
+    #[test]
+    fn pick_room_unknown_spec_errors() {
+        let rooms = [addr("!a:x", Some("writer"), None, &[])];
+        let err = pick_room_index(&rooms, Some("nope")).unwrap_err();
+        assert!(err.to_string().contains("no joined room matching"));
+    }
+
+    #[test]
+    fn pick_room_none_spec_defaults_only_when_single_room() {
+        let one = [addr("!a:x", Some("writer"), None, &[])];
+        assert_eq!(pick_room_index(&one, None).unwrap(), 0);
+
+        let two = [
+            addr("!a:x", Some("writer"), None, &[]),
+            addr("!b:x", Some("research"), None, &[]),
+        ];
+        assert!(pick_room_index(&two, None).is_err());
+
+        let none: [RoomAddr; 0] = [];
+        assert!(pick_room_index(&none, None).is_err());
     }
 
     // ---- unsupported-version surfacing dedup (§7.2, §9) --------------------
