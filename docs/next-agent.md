@@ -78,7 +78,7 @@ user and decrypted a cross-user encrypted message. Refuses to run if the device 
 ### 4. ~~Add the unix-socket RPC + envelope~~ ✅ DONE 2026-07-26
 JSON-lines over `<state_dir>/safehoused.sock`: `hello` (persona gated by the config `personas`
 allowlist, enforced in the daemon), `send` (daemon stamps `from`, renders envelope v1),
-`create_room`, `add_to_space`, `list_rooms`, `read`, plus inbound push lines. **`safehouse-mcp`**
+`create_room`, `add_to_space`, `list_rooms`, `read`, `invite` (#39), plus inbound push lines. **`safehouse-mcp`**
 (workspace member) is the keyless stdio MCP shim over it — tools `safehouse_send` /
 `safehouse_create_room` / `safehouse_add_to_space` / `safehouse_list_rooms` / `safehouse_read` —
 pulled forward from the v1 plan. Verified live end-to-end: MCP tool call → socket → encrypted room
@@ -99,6 +99,17 @@ room's id, name, canonical alias, or alt alias; an **ambiguous** name/alias (mat
 joined room) is now an error rather than a silent first-match. Live Element X phone verification of
 the rendered Space hierarchy (issue #27 AC #5) remains a deferred operator step — cannot be
 automated in CI.
+
+**New-host onboarding via `invite` (#39).** The daemon already auto-accepted every invite
+addressed to its own account (`on_invite`) — that half was never the gap. What was missing was a
+way to *send* one without raw CS-API calls and a temporary device against an E2E account (the
+foot-gun hit provisioning the fleet's second host, loom#3998). The `invite` op closes it:
+`{"op": "invite", "room": "<id|name|alias>", "user": "@new-bot:server"}`, resolved through the same
+`resolve_room` id/name/alias path as `send`/`read`, then `Room::invite_user_by_id`. Onboarding a new
+host into an existing room is now one call from an already-onboarded host's socket — the new host's
+daemon auto-joins on its next sync, cold-start included. The acceptance policy is now also
+explicit and, optionally, restrictable: `invite_allowlist` in config (default `None`/unset —
+accept-any, unchanged) limits which senders' invites `on_invite` will join.
 
 ### 5. ~~Per-agent mailbox + `safehouse_check` (D16/D17)~~ ✅ DONE 2026-07-26
 Per-persona durable mailbox in `safehoused` (`mailbox.rs`), populated from the same synced room

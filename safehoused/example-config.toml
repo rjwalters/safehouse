@@ -78,10 +78,27 @@ recovery_passphrase = "change-me-as-well"
 # personas = ["writer_agent", "research_agent", "operator"]
 
 # Unix-domain socket path the daemon listens on for local agent RPC
-# (hello/send/create_room/list_rooms/read/check — see safehoused/src/rpc.rs).
-# AF_UNIX only, by design — never a TCP listener (docs/decisions.md D8).
-# Defaults to "<state_dir>/safehoused.sock" when omitted.
+# (hello/send/create_room/add_to_space/list_rooms/read/check/invite — see
+# safehoused/src/rpc.rs). AF_UNIX only, by design — never a TCP listener
+# (docs/decisions.md D8). Defaults to "<state_dir>/safehoused.sock" when
+# omitted.
 # socket_path = "/var/lib/safehoused/safehoused.sock"
+
+# Invite-acceptance policy (issue #39). By default the daemon accepts EVERY
+# invite addressed to its own account (see on_invite in
+# safehoused/src/main.rs) — this is safe on a sealed homeserver with
+# registration off, since any invite necessarily comes from a user the
+# operator already controls. Setting this field makes that policy explicit
+# and, if you want it, stricter: only invites whose sender is a full Matrix
+# user id (`@user:server`) in this list are joined; every other invite is
+# declined (logged, not joined). Leaving this commented out / unset
+# preserves today's accept-any behavior — this is NOT a default change.
+#
+# Onboarding a new host into an existing room (the loom#3998 fleet pilot):
+# from an already-onboarded host's socket, send `{"op": "invite", "room":
+# "<id|name|alias>", "user": "@new-host-bot:example.com"}` — the new host's
+# daemon then auto-joins on its next sync, even if it's still cold-starting.
+# invite_allowlist = ["@ops-console:example.com"]
 
 # Per-persona mailbox store (docs/decisions.md D16/D17): a sqlite database
 # holding, for each registered persona, its unread-mail cursor. This is a

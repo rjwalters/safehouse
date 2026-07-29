@@ -155,6 +155,20 @@ below (step 1). The manual walkthrough that follows is the reference for what th
    auto-joins invites and starts mirroring room traffic to stdout; local agents allowlisted in
    `personas` can now attach over the unix socket at `<state_dir>/safehoused.sock`.
 
+   **Invite-acceptance policy is accept-any by default** — the daemon joins every invite
+   addressed to its account, on the premise that a sealed homeserver with registration off means
+   any invite already comes from a user the operator controls. Set `invite_allowlist` in the
+   config to restrict which senders' invites are accepted (see
+   [`safehoused/example-config.toml`](safehoused/example-config.toml)); leaving it unset keeps
+   today's accept-any behavior.
+
+   **Onboarding a new fleet host into an existing room** (e.g. adding a second daemon to a
+   room the first one already occupies) no longer needs raw CS-API calls or temporary devices:
+   from the already-onboarded host's socket, send an `invite` op —
+   `{"op": "invite", "room": "<id|name|alias>", "user": "@new-host-bot:<your-server>"}` — and the
+   new host's daemon auto-joins on its next sync (even if it's still cold-starting when the
+   invite is sent).
+
 ## Scripting the socket
 
 For a human or a script that just needs to read or send into a room — not run an MCP client —
