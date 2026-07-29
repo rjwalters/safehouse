@@ -62,7 +62,9 @@ die() {
 }
 
 usage() {
-	sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+	# Print the header comment block (lines after the shebang, up to the first
+	# non-comment line), stripping the leading "# " from each line.
+	awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
 	exit 0
 }
 
