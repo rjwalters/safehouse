@@ -328,3 +328,47 @@ read cursor (what persona X has already consumed): local delivery bookkeeping, n
   socket stays as an optional low-latency path, but the mailbox is the durable primitive — **no agent
   needs to be connected to receive**.
 - Per-machine (D4): each host's daemon maintains mailboxes for the personas registered on it.
+
+## D18 — `completion` is its own `type` with a `completion-v1` `meta`, not an overloaded `ack`
+**Decision (2026-07-29):** represent a public-feed-eligible completion event as a **new envelope
+`type: completion`** carrying a **new optional `meta` object** validated against a strict
+`completion-v1` schema (`protocol/envelope-v1.md` §4a). Both are additive per §9, so **no `v` bump**.
+A `completion` envelope whose `meta` is missing or fails validation **degrades to `chat`** (the same
+rule §9 applies to an unknown `type`); the prose `body` is untouched. This is the first phase of the
+#28 egress-feed chain — schema and envelope plumbing only; the allowlist/redaction/publisher (#30)
+and transport (#31) are separate.
+
+**Why a new `type` instead of overloading `ack` with a `meta` field:**
+- **The allowlist check in #30 stays a single string compare** (`type == "completion"`) instead of
+  "is this `ack` *shaped like* completion metadata" (`type == "ack" AND meta.schema ==
+  "completion-v1"`). This is the input to a redaction/allowlist pass that gates what crosses the E2E
+  trust boundary — ambiguous "is this really a completion?" parsing is exactly the false-positive
+  class that could leak non-allowlisted content. A dedicated `type` removes the ambiguity by
+  construction.
+- **`ack` is common and human-facing; `completion` is rare and security-sensitive.** A plain `ack`
+  (acknowledging a `task`) is extremely common today and carries no structured payload. Conflating it
+  with "public-feed-eligible" would make every routine acknowledgement a thing the egress path has to
+  reason about, and risks a bare `ack` being mistaken for a feed source. Keeping them distinct means
+  "acknowledgement" and "publishable completion" never share a code path.
+
+**Why the schema does not parse `body`:** §8 requires the event/envelope `body` to be human-legible
+prose standing alone (a human reads it in Element, D6). Extracting structured facts from free-form
+prose is both a §8 violation and the ambiguous-parsing pattern flagged above — a JSON blob stuffed in
+`body` would render as gibberish to the human and still be fragile to parse. `meta` is the machine
+view (exactly as the envelope `body` is the machine view of the event `body`, §2); the two are
+consistent but independently authoritative for their audience.
+
+**Why degrade-to-`chat` rather than reject the envelope outright:** rejecting would either drop a
+message a human may still want to read or force a hard parse failure on the sync path. Degrading keeps
+delivery and human legibility intact (the `body` is unchanged) while guaranteeing a non-validating
+`completion` is never classified as a completion or reaches the feed — the safe default the security
+framing demands. Strict `completion-v1` validation (`validate_completion_meta`) is the single gate;
+#30's publisher applies the same "non-validating ⇒ non-feed-eligible" rule.
+
+**Consequences:**
+- `KNOWN_TYPES` in `safehoused/src/envelope.rs` gains `"completion"`; `Envelope` gains
+  `meta: Option<Value>` (serialized only when present). `CompletionMeta` / `CompletionResult` /
+  `validate_completion_meta` define and enforce `completion-v1`.
+- Agent-originated `completion` `meta` is **not** yet wired through the RPC send path — that, with
+  validation at egress, is #30. This phase only guarantees `meta` round-trips through parse/serialize
+  and that malformed completions degrade safely.

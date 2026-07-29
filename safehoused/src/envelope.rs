@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const ENVELOPE_KEY: &str = "org.safehouse.envelope";
-pub const KNOWN_TYPES: [&str; 4] = ["chat", "task", "handoff", "ack"];
+pub const KNOWN_TYPES: [&str; 5] = ["chat", "task", "handoff", "ack", "completion"];
+
+/// The one `meta.schema` value a `completion` envelope's `meta` must carry
+/// (envelope-v1.md §4a). Anything else is not `completion-v1` and is never
+/// feed-eligible (#30).
+pub const COMPLETION_SCHEMA: &str = "completion-v1";
 
 /// The daemon's own persona for system-generated messages, e.g. §5.1's
 /// unknown-persona ack. Distinct from any configured agent persona — the
@@ -49,6 +54,135 @@ pub struct Envelope {
     /// it survives into `safehouse_check` output (D17).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<bool>,
+    /// Structured metadata, present **only** for `type == "completion"`
+    /// (envelope-v1.md §4a). Its contents are the `completion-v1` public-feed
+    /// payload — see [`CompletionMeta`] / [`validate_completion_meta`]. Carried
+    /// as raw [`Value`] so a malformed `meta` never fails envelope parsing
+    /// (§9 forward-compat); strict validation is a separate, downstream gate.
+    /// `body` stays required human-legible prose regardless (§8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+}
+
+/// The strict `completion-v1` payload carried in [`Envelope::meta`] when
+/// `type == "completion"` (envelope-v1.md §4a). This is the public-feed shape
+/// #30 will publish; a `meta` that does not parse against it is never
+/// feed-eligible. Field names are `[A-Za-z0-9_]`-safe per §1.3 (`ref` is a
+/// JSON key, not a Rust identifier — hence the `serde(rename)`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionMeta {
+    /// Schema discriminator — MUST equal [`COMPLETION_SCHEMA`].
+    pub schema: String,
+    /// The persona that performed the work (mirrors the envelope `from`).
+    pub agent: String,
+    /// Repository the work happened in, e.g. `rjwalters/safehouse`.
+    pub repo: String,
+    /// PR/issue URL or number the completion refers to. `ref` in JSON.
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// Terminal outcome.
+    pub result: CompletionResult,
+    /// RFC3339 timestamp the work started.
+    pub started_at: String,
+    /// RFC3339 timestamp the work completed.
+    pub completed_at: String,
+}
+
+/// The terminal outcome of a `completion` event. Serializes lowercase
+/// (`"success"` / `"failure"`) to match the wire schema.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CompletionResult {
+    Success,
+    Failure,
+}
+
+/// Strictly validate a `meta` value against `completion-v1` (envelope-v1.md
+/// §4a). Returns the typed payload on success, or a human-readable reason on
+/// failure. **Never panics.** Callers on the egress path (#30) MUST treat any
+/// `Err` — and a `completion` envelope with no `meta` at all — as
+/// non-feed-eligible and never publish it.
+pub fn validate_completion_meta(meta: &Value) -> Result<CompletionMeta, String> {
+    let parsed: CompletionMeta = serde_json::from_value(meta.clone())
+        .map_err(|e| format!("not a valid completion-v1 object: {e}"))?;
+    if parsed.schema != COMPLETION_SCHEMA {
+        return Err(format!(
+            "meta.schema must be \"{COMPLETION_SCHEMA}\", got \"{}\"",
+            parsed.schema
+        ));
+    }
+    if parsed.agent.is_empty() {
+        return Err("meta.agent must be non-empty".to_owned());
+    }
+    if parsed.repo.is_empty() {
+        return Err("meta.repo must be non-empty".to_owned());
+    }
+    if parsed.reference.is_empty() {
+        return Err("meta.ref must be non-empty".to_owned());
+    }
+    if !is_rfc3339(&parsed.started_at) {
+        return Err(format!(
+            "meta.started_at is not an RFC3339 timestamp: \"{}\"",
+            parsed.started_at
+        ));
+    }
+    if !is_rfc3339(&parsed.completed_at) {
+        return Err(format!(
+            "meta.completed_at is not an RFC3339 timestamp: \"{}\"",
+            parsed.completed_at
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Lightweight RFC3339 date-time sanity check — enough to reject free-form
+/// prose without pulling in a date library (which envelope schema validation
+/// doesn't otherwise need). Verifies the `YYYY-MM-DDTHH:MM:SS` skeleton with an
+/// optional fractional part and a required `Z`/`±HH:MM` offset; it does **not**
+/// range-check calendar validity (e.g. month 13). #30 may tighten this.
+fn is_rfc3339(s: &str) -> bool {
+    let b = s.as_bytes();
+    // "YYYY-MM-DDTHH:MM:SS" is the minimum 19-char prefix.
+    if b.len() < 20 {
+        return false;
+    }
+    let digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+    let at = |i: usize, c: u8| b.get(i) == Some(&c);
+    if !(digit(0) && digit(1) && digit(2) && digit(3) && at(4, b'-'))
+        || !(digit(5) && digit(6) && at(7, b'-'))
+        || !(digit(8) && digit(9))
+        || !(at(10, b'T') || at(10, b't'))
+        || !(digit(11) && digit(12) && at(13, b':'))
+        || !(digit(14) && digit(15) && at(16, b':'))
+        || !(digit(17) && digit(18))
+    {
+        return false;
+    }
+    // Optional fractional seconds: a dot followed by ≥1 digit.
+    let mut i = 19;
+    if at(i, b'.') {
+        i += 1;
+        let start = i;
+        while digit(i) {
+            i += 1;
+        }
+        if i == start {
+            return false; // dot with no digits
+        }
+    }
+    // Required offset: 'Z' | 'z' | ±HH:MM.
+    match b.get(i) {
+        Some(&c) if c == b'Z' || c == b'z' => i + 1 == b.len(),
+        Some(&c) if c == b'+' || c == b'-' => {
+            digit(i + 1)
+                && digit(i + 2)
+                && at(i + 3, b':')
+                && digit(i + 4)
+                && digit(i + 5)
+                && i + 6 == b.len()
+        }
+        _ => false,
+    }
 }
 
 pub fn valid_persona(s: &str) -> bool {
@@ -180,7 +314,22 @@ pub fn from_event_json(
         // Supported version (or a malformed envelope with no integer `v`):
         // best-effort parse. A well-formed v1 envelope returns here; anything
         // else falls through to human synthesis, preserving prior behavior.
-        if let Ok(env) = serde_json::from_value::<Envelope>(raw.clone()) {
+        if let Ok(mut env) = serde_json::from_value::<Envelope>(raw.clone()) {
+            // §4a: a `completion` envelope whose `meta` is absent or fails
+            // strict `completion-v1` validation is **degraded to `chat`** (the
+            // §9 unknown-type rule) so it can never be mistaken for a
+            // feed-eligible completion downstream (#30). The prose `body` is
+            // untouched, so the human still reads exactly what was sent.
+            if env.kind == "completion" {
+                let valid = env
+                    .meta
+                    .as_ref()
+                    .is_some_and(|m| validate_completion_meta(m).is_ok());
+                if !valid {
+                    env.kind = "chat".to_owned();
+                    env.meta = None;
+                }
+            }
             return Inbound::Envelope(env, None);
         }
     }
@@ -222,6 +371,7 @@ fn synthesize_for_human(
                         task_id: None,
                         body: stripped,
                         wake: None,
+                        meta: None,
                     },
                     None,
                 );
@@ -247,6 +397,7 @@ fn synthesize_for_human(
                 task_id: None,
                 body: body.to_owned(),
                 wake: None,
+                meta: None,
             },
             None,
         );
@@ -264,6 +415,7 @@ fn broadcast(sender: &str, body: &str) -> Envelope {
         task_id: None,
         body: body.to_owned(),
         wake: None,
+        meta: None,
     }
 }
 
@@ -288,6 +440,7 @@ pub fn unknown_persona_ack(to: &str, token: &str, personas: &[String]) -> Envelo
         task_id: None,
         body: format!("Unknown persona \"@{token}\" — known personas: {known}"),
         wake: None,
+        meta: None,
     }
 }
 
@@ -440,6 +593,7 @@ mod tests {
             task_id: None,
             body: body.to_owned(),
             wake: None,
+            meta: None,
         }
     }
 
@@ -869,5 +1023,184 @@ mod tests {
     fn thread_root_from_content_none_when_absent() {
         let content = json!({ "body": "no relation here" });
         assert!(thread_root_from_content(&content).is_none());
+    }
+
+    // ---- §4a — completion type + completion-v1 meta ----------------------
+
+    fn valid_completion_meta() -> Value {
+        json!({
+            "schema": "completion-v1",
+            "agent": "builder_agent",
+            "repo": "rjwalters/safehouse",
+            "ref": "https://github.com/rjwalters/safehouse/pull/42",
+            "result": "success",
+            "started_at": "2026-07-29T10:00:00Z",
+            "completed_at": "2026-07-29T10:12:30Z"
+        })
+    }
+
+    fn completion_content(meta: Value) -> Value {
+        json!({
+            "msgtype": "m.text",
+            "body": "builder-agent → * · completion\nMerged PR #42.",
+            ENVELOPE_KEY: {
+                "v": 1,
+                "from": "builder_agent",
+                "to": "*",
+                "type": "completion",
+                "body": "Merged PR #42.",
+                "meta": meta,
+            }
+        })
+    }
+
+    #[test]
+    fn completion_is_a_known_type() {
+        assert!(KNOWN_TYPES.contains(&"completion"));
+    }
+
+    /// A `completion` envelope with valid `meta` round-trips through
+    /// parse → serialize unchanged (§4a).
+    #[test]
+    fn completion_with_valid_meta_round_trips() {
+        let content = completion_content(valid_completion_meta());
+        let env = match from_event_json(&content, "@safehoused-hosta:server", &personas(), None) {
+            Inbound::Envelope(env, unknown) => {
+                assert!(unknown.is_none());
+                env
+            }
+            other => panic!("expected Envelope, got {other:?}"),
+        };
+        assert_eq!(env.kind, "completion");
+        assert_eq!(env.body, "Merged PR #42.");
+        assert_eq!(env.meta.as_ref(), Some(&valid_completion_meta()));
+
+        // meta survives round-tripping back out to event content unchanged.
+        let rendered = to_event_content(&env, None);
+        assert_eq!(rendered[ENVELOPE_KEY]["meta"], valid_completion_meta());
+        assert_eq!(rendered[ENVELOPE_KEY]["type"], "completion");
+    }
+
+    /// The typed `completion-v1` payload itself round-trips through
+    /// serde unchanged (including the `ref` rename and lowercase `result`).
+    #[test]
+    fn completion_meta_typed_round_trip() {
+        let parsed =
+            validate_completion_meta(&valid_completion_meta()).expect("valid meta must validate");
+        assert_eq!(parsed.result, CompletionResult::Success);
+        assert_eq!(
+            parsed.reference,
+            "https://github.com/rjwalters/safehouse/pull/42"
+        );
+        let back = serde_json::to_value(&parsed).expect("serialize");
+        assert_eq!(back, valid_completion_meta());
+    }
+
+    /// Documented rule (§4a): a `completion` envelope with **missing** `meta`
+    /// degrades to `chat` — never panics, never surfaces as a completion.
+    #[test]
+    fn completion_without_meta_degrades_to_chat() {
+        let content = json!({
+            "msgtype": "m.text",
+            "body": "builder-agent → * · completion\nMerged PR #42.",
+            ENVELOPE_KEY: {
+                "v": 1,
+                "from": "builder_agent",
+                "to": "*",
+                "type": "completion",
+                "body": "Merged PR #42."
+            }
+        });
+        match from_event_json(&content, "@safehoused-hosta:server", &personas(), None) {
+            Inbound::Envelope(env, _unknown) => {
+                assert_eq!(env.kind, "chat");
+                assert!(env.meta.is_none());
+                // Prose body is untouched — the human still reads it.
+                assert_eq!(env.body, "Merged PR #42.");
+            }
+            other => panic!("expected Envelope, got {other:?}"),
+        }
+    }
+
+    /// Documented rule (§4a): a `completion` envelope with **malformed** `meta`
+    /// (wrong schema tag, bad timestamp, missing field, …) degrades to `chat`
+    /// without panicking, so it is never mistaken for feed-eligible.
+    #[test]
+    fn completion_with_malformed_meta_degrades_to_chat() {
+        let malformed = [
+            json!({ "schema": "not-completion-v1", "agent": "a", "repo": "r",
+                    "ref": "1", "result": "success",
+                    "started_at": "2026-07-29T10:00:00Z",
+                    "completed_at": "2026-07-29T10:12:30Z" }),
+            // bad timestamp
+            json!({ "schema": "completion-v1", "agent": "a", "repo": "r",
+                    "ref": "1", "result": "success",
+                    "started_at": "yesterday",
+                    "completed_at": "2026-07-29T10:12:30Z" }),
+            // missing completed_at
+            json!({ "schema": "completion-v1", "agent": "a", "repo": "r",
+                    "ref": "1", "result": "success",
+                    "started_at": "2026-07-29T10:00:00Z" }),
+            // bad result enum
+            json!({ "schema": "completion-v1", "agent": "a", "repo": "r",
+                    "ref": "1", "result": "maybe",
+                    "started_at": "2026-07-29T10:00:00Z",
+                    "completed_at": "2026-07-29T10:12:30Z" }),
+            // meta not even an object
+            json!("just a string"),
+        ];
+        for meta in malformed {
+            let content = completion_content(meta.clone());
+            match from_event_json(&content, "@safehoused-hosta:server", &personas(), None) {
+                Inbound::Envelope(env, _unknown) => {
+                    assert_eq!(env.kind, "chat", "meta {meta} should degrade");
+                    assert!(env.meta.is_none(), "meta {meta} should be cleared");
+                    assert_eq!(env.body, "Merged PR #42.");
+                }
+                other => panic!("expected Envelope, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_completion_meta_accepts_failure_result() {
+        let mut meta = valid_completion_meta();
+        meta["result"] = json!("failure");
+        let parsed = validate_completion_meta(&meta).expect("failure is valid");
+        assert_eq!(parsed.result, CompletionResult::Failure);
+    }
+
+    #[test]
+    fn validate_completion_meta_rejects_wrong_schema() {
+        let mut meta = valid_completion_meta();
+        meta["schema"] = json!("v2");
+        let err = validate_completion_meta(&meta).expect_err("wrong schema rejected");
+        assert!(err.contains("completion-v1"));
+    }
+
+    #[test]
+    fn validate_completion_meta_rejects_empty_required_string() {
+        let mut meta = valid_completion_meta();
+        meta["repo"] = json!("");
+        assert!(validate_completion_meta(&meta).is_err());
+    }
+
+    #[test]
+    fn is_rfc3339_accepts_common_forms() {
+        assert!(is_rfc3339("2026-07-29T10:00:00Z"));
+        assert!(is_rfc3339("2026-07-29t10:00:00z"));
+        assert!(is_rfc3339("2026-07-29T10:00:00.123Z"));
+        assert!(is_rfc3339("2026-07-29T10:00:00+02:00"));
+        assert!(is_rfc3339("2026-07-29T10:00:00.5-05:00"));
+    }
+
+    #[test]
+    fn is_rfc3339_rejects_malformed() {
+        assert!(!is_rfc3339(""));
+        assert!(!is_rfc3339("2026-07-29"));
+        assert!(!is_rfc3339("2026-07-29T10:00:00")); // no offset
+        assert!(!is_rfc3339("2026/07/29T10:00:00Z"));
+        assert!(!is_rfc3339("2026-07-29T10:00:00.Z")); // dot, no digits
+        assert!(!is_rfc3339("last tuesday"));
     }
 }

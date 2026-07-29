@@ -508,6 +508,7 @@ async fn surface_unsupported_version(room: &Room, client: &Client, sender: &str,
             envelope::SUPPORTED_VERSION
         ),
         wake: None,
+        meta: None,
     };
     let content = envelope::to_event_content(&env, None);
     if let Err(err) = room.send_raw("m.room.message", content).await {

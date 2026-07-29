@@ -72,9 +72,10 @@ MUST read `org.safehouse.envelope.body` and MUST NOT parse the header out of the
 | `v` | ✅ | integer | Envelope version. `1`. Receivers MUST ignore envelopes with a `v` they don't support, and SHOULD surface them to the human as unhandled. |
 | `from` | ✅ | string | Sending persona, e.g. `writer_agent`. For a human, the full Matrix user ID (`@robb:safehouse.local`). **Stamped by the daemon — never taken from the agent.** See §6. |
 | `to` | ✅ | string | Target persona, a Matrix user ID, or `"*"` for room-broadcast. |
-| `type` | ✅ | string | One of `chat`, `task`, `handoff`, `ack`. See §4. |
+| `type` | ✅ | string | One of `chat`, `task`, `handoff`, `ack`, `completion`. See §4. |
 | `task_id` | — | string | Stable, human-meaningful task identifier, `[A-Za-z0-9_]`. Groups related messages independently of Matrix threading. |
 | `body` | ✅ | string | The message content, as the agent should receive it. Plain text. |
+| `meta` | — | object | Structured metadata, present **only** for `type: completion` — the `completion-v1` payload (§4a). Never parsed for any other `type`. `body` stays required prose regardless (§8). |
 | `wake` | — | boolean | Advisory hint only, for an *optional external waker* — safehouse itself never spawns or pushes an agent, on any host (`decisions.md` D16). §4's "suggested `wake`?" column and §7's classification describe the recommended default for such a waker to apply; they are not daemon behavior. |
 | `in_reply_to` | — | string | `task_id`-scoped logical reply target, when Matrix threading isn't sufficient. |
 
@@ -98,10 +99,54 @@ something safehoused acts on.
 | `task` | A unit of work with a lifecycle. SHOULD carry `task_id`. | Yes |
 | `handoff` | Transfer of responsibility — the sender is done and the target is now on the hook. | Yes |
 | `ack` | Acknowledgement or completion. SHOULD carry the `task_id` it closes. | No |
+| `completion` | A structured, **public-feed-eligible** completion event — an agent finished a unit of work in a repo. MUST carry a valid `completion-v1` `meta` (§4a). | No |
 
 `task` deliberately leaves room to borrow A2A's Task-object lifecycle later without disturbing `chat`,
 which must stay human-readable above all. Additional types are a v2 concern; a v1 receiver seeing an
 unknown `type` MUST treat it as `chat`.
+
+`ack` and `completion` are distinct on purpose: `ack` is the common, human-facing acknowledgement of
+a `task`, and it carries no structured payload; `completion` is the rare, machine-consumed,
+egress-eligible event that a public feed derives from (`decisions.md` D18). A plain `ack` must never
+be mistaken for a feed source — hence a dedicated `type` a receiver can match with a single string
+compare rather than "is this `ack` shaped like completion metadata".
+
+### 4a. `completion` and the `completion-v1` meta
+
+A `completion` envelope carries structured facts about a finished unit of work in the additive `meta`
+object. This is the payload a public egress feed (see the #28 chain) is built from. `meta` is present
+**only** for `type: completion`; it is never read for any other `type`.
+
+`body` is still required, human-legible prose (§8) — a human reading Element sees a sentence, not
+JSON. `meta` is the *machine* view, exactly as the envelope `body` is the machine view of the event
+`body` (§2). The two are consistent, but a receiver MUST NOT parse structured facts out of `body`.
+
+`meta` MUST be a JSON object matching **`completion-v1`**:
+
+```jsonc
+"meta": {
+  "schema": "completion-v1",           // discriminator — MUST equal this exact string
+  "agent": "builder_agent",            // persona that did the work (mirrors envelope `from`)
+  "repo": "rjwalters/safehouse",       // repository the work happened in
+  "ref": "https://github.com/rjwalters/safehouse/pull/42", // PR/issue URL or number
+  "result": "success",                 // "success" | "failure"
+  "started_at": "2026-07-29T10:00:00Z",   // RFC3339
+  "completed_at": "2026-07-29T10:12:30Z"  // RFC3339
+}
+```
+
+All seven fields are required and their names are `[A-Za-z0-9_]`-safe (§1.3). `ref` is a JSON key
+only — it is not a reserved word on the wire.
+
+**Validation and the malformed-`meta` rule.** `meta` is carried on the wire as an opaque object so a
+malformed `completion` never breaks envelope parsing (§9 forward-compat). Validation against
+`completion-v1` is a separate, strict gate. **A `completion` envelope whose `meta` is absent or fails
+`completion-v1` validation is degraded to `chat`** — the same rule §9 applies to an unknown `type` —
+so it can never be surfaced as a completion or reach the public feed. The prose `body` is left intact,
+so the human still reads exactly what was sent; only the machine classification changes. This is the
+safe default demanded by the security framing: anything that does not strictly validate is treated as
+ordinary conversation, never as a feed source. (The egress publisher — a separate concern, #30 — must
+likewise treat any non-validating `meta` as non-feed-eligible.)
 
 ## 5. Human messages have no envelope
 
