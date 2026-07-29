@@ -220,7 +220,7 @@ fi
 ### Primary Queue (Priority)
 
 1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
-2. **Claim PR**: `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
+2. **Claim PR** (staleness-aware — see "Stale `loom:reviewing` Claim Check" immediately below before running this): `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
 3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
    ```bash
    MERGE_STATE=$(gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus')
@@ -243,6 +243,63 @@ fi
 11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **The label update is the PRIMARY deliverable — always run it immediately after the comment using `&&`:**
    - If approved: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"` (blue badge - ready for Champion auto-merge)
    - If changes needed: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"` (amber badge - Doctor will address)
+
+### Stale `loom:reviewing` Claim Check (Step 2)
+
+Run this **before** claiming a PR in step 2 above. `gh pr list
+--label="loom:review-requested"` can surface a PR that another Judge already
+claimed (`loom:review-requested` and `loom:reviewing` coexist while a review
+is in progress) — including one whose claiming Judge's process died mid-review
+(parent sweep crash). Without this check, that dead claim blocks the PR from
+ever being reviewed again. This is the minutes-scale analog of the
+`loom:building` staleness convention (`LOOM_STALE_BUILDING_HOURS`,
+`loom-daemon/src/claim_reconciliation.rs`) — reviews run 5–15 minutes in
+practice, not hours, so the grace period is minutes, not hours.
+
+**If the PR does NOT carry `loom:reviewing`:** proceed to claim as today — no
+behavior change: `gh pr edit <number> --add-label "loom:reviewing"`.
+
+**If the PR DOES carry `loom:reviewing`:** determine the claim's age and
+whether anyone has commented since the claim was made:
+
+```bash
+N=<pr-number>
+CLAIMED_AT=$(gh api "repos/{owner}/{repo}/issues/$N/timeline" --paginate \
+  --jq '[.[] | select(.event=="labeled" and .label.name=="loom:reviewing")] | last | .created_at')
+COMMENTS_AFTER=$(gh api "repos/{owner}/{repo}/issues/$N/comments" \
+  | jq --arg t "$CLAIMED_AT" '[.[] | select(.created_at > $t)] | length')
+```
+
+Then decide:
+
+| Condition | Verdict | Action |
+|-----------|---------|--------|
+| Claim age < `LOOM_STALE_REVIEWING_MINUTES` (default **30**), OR `COMMENTS_AFTER > 0` | **Fresh** — a Judge is actively working this PR | **Do not stomp the claim.** Skip this PR and continue the batch to the next candidate PR. |
+| Claim age ≥ `LOOM_STALE_REVIEWING_MINUTES` AND `COMMENTS_AFTER == 0` | **Stale** — the claiming Judge's process almost certainly died mid-review | Reclaim (see below), then proceed with the normal review from step 3. |
+| Timeline API call fails or returns empty (`CLAIMED_AT` unset) | **Unknown — fail safe** | Treat as **fresh**. Never stomp a claim on API failure or missing data. |
+
+**Reclaiming a stale claim:**
+
+```bash
+gh pr edit $N --remove-label "loom:reviewing"
+gh pr comment $N --body "Reclaiming stale loom:reviewing claim (age > ${LOOM_STALE_REVIEWING_MINUTES:-30}m, no follow-up comment) — a prior Judge's parent sweep likely died mid-review."
+gh pr edit $N --add-label "loom:reviewing"
+# Continue to step 3 (Check merge state) and evaluate normally
+```
+
+**Env var**: `LOOM_STALE_REVIEWING_MINUTES` (default **30**) — named to
+mirror `LOOM_STALE_BUILDING_HOURS` (`loom-daemon/src/claim_reconciliation.rs`,
+the analogous no-record staleness threshold for `loom:building` claims), but
+on a **minutes**, not hours, scale, since review turnaround (5–15 minutes) is
+two orders of magnitude faster than a build.
+
+**Applies everywhere a Judge claims a PR from a multi-PR pass** — not just
+this single-PR narrative. This same check-then-claim rule governs the batch
+loop in "Autonomous mode (configured with targetInterval)" under Completion
+below, and any cron-invoked pass over `loom:review-requested` PRs: a
+cron-invoked Judge and a `/loom:sweep`-dispatched Judge must apply the
+identical rule so neither stomps the other's fresh claim nor stalls behind a
+dead one.
 
 **Pre-approval checklist** (verify before executing approval commands):
 - [ ] I am using `gh pr comment`, NOT `gh pr review`
@@ -400,15 +457,17 @@ This check applies everywhere the judge would run `gh pr checkout`:
 
 This catches merge conflicts early in the evaluation cycle, preventing wasted effort on code that will need to be rebased anyway.
 
-> ### ⛔ NEVER mutate the main checkout's real git index during a merge simulation or inspection
+> ### ⛔ NEVER mutate the main checkout's real git index, run a throwaway test-merge, or touch the stash stack during a merge simulation or inspection
 >
-> **You run in the shared main checkout** — you either reuse the builder's `.loom/worktrees/issue-N` worktree or `gh pr checkout` in place. You do **not** own a disposable git index. Any command that writes the repository's real staging index corrupts the live checkout for every role that touches it next.
+> **You run in the shared main checkout** — you either reuse the builder's `.loom/worktrees/issue-N` worktree or `gh pr checkout` in place. You do **not** own a disposable git index, a disposable branch, or a disposable stash stack. Any command that writes the repository's real staging index, creates a throwaway test-merge branch, or pops/drops/clears an entry off the main checkout's stash corrupts or destroys shared state for every role that touches it next.
 >
-> **NEVER run any of these against the main checkout's real index** to "simulate a merge", preview a tree, or inspect conflicts:
+> **NEVER run any of these against the main checkout** to "simulate a merge", preview a tree, or inspect conflicts:
 >
 > - **`git read-tree`** (bare, or `git read-tree <tree>` **without** an isolated `GIT_INDEX_FILE`) — a bare `git read-tree` is equivalent to `git read-tree --empty`: it silently empties the index, turning **every tracked file into a phantom staged deletion**. The working tree and `HEAD` are untouched and **no reflog entry is written**, so the damage is near-invisible until the next `git add -A` commits it.
 > - **`git commit-tree`** piped from a `read-tree`-populated index.
 > - **`git reset`**, **`git rm --cached`**, **`git add`**, or **`git checkout .`** used "just to simulate" a merge or a conflicting state.
+> - **A throwaway test-merge branch** (`git checkout -b tmp-test && git merge <pr-branch>`, or the reverse — merging the PR branch into main on a scratch branch) created **in the main checkout** to eyeball how a merge resolves. There is no such thing as a disposable branch in shared state: the checkout, the index, and the stash stack it touches are all live for every other role.
+> - **Any stash-stack mutation** (`git stash pop` / `git stash drop` / `git stash clear`) run **in the main checkout** for any reason, including "just to get a clean tree for a test-merge." The main checkout's stash stack is **operator-owned** — it may hold deliberately preserved diagnostic state (e.g. sweep-contamination evidence parked for investigation) with no marker distinguishing "safe to pop" from "evidence, do not touch." The 2026-07-28 incident this rule exists for: a Judge's throwaway main-checkout test-merge inadvertently `git stash pop`'d a preserved stash entry; the pop happened to conflict, so nothing was lost that time, but a clean pop would have silently destroyed it with no recovery path. (`git stash push` / `apply` / `list` are non-destructive and are not the concern here — the danger is specifically `pop`/`drop`/`clear`.) The destructive-command guard asks for confirmation on these three subcommands when the cwd resolves to the main checkout (`guards.stashScope` / `LOOM_GUARD_STASH_SCOPE`, see `defaults/docs/guard-hooks.md`) — but do not rely on the guard catching it; the rule is to never issue the command there in the first place.
 >
 > **Instead, use the index-free approach** (the same one `doctor.md` uses — see `doctor.md`'s merge-conflict check, `git merge-tree origin/main | grep -q "^+<<<<<<<"`):
 >
@@ -420,13 +479,25 @@ This catches merge conflicts early in the evaluation cycle, preventing wasted ef
 > git merge-tree <base> <branch>
 > ```
 >
+> `git merge-tree` is the right tool for **conflict detection only** — it answers "does this merge cleanly?" without a working tree. When an integration check genuinely needs a real working tree (e.g. to run the test suite against the merged result, not just detect conflicts), do it **inside the already-isolated worktree you're evaluating in** (the builder's `.loom/worktrees/issue-N`, or one created via `pr-worktree.sh`) — merge `origin/main` **into the PR branch there**, never the reverse, and never in the main checkout:
+>
+> ```bash
+> # Inside the isolated PR-branch worktree (NOT the main checkout):
+> git fetch origin
+> git merge --no-commit --no-ff origin/main
+> # ...inspect the merged working tree / run tests...
+> git merge --abort   # always undo — this worktree stays on the PR branch, not a merge commit
+> ```
+>
+> This gives the identical integration signal a main-checkout test-merge would, with zero main-checkout mutation: the worktree's own index and working tree are disposable, the main checkout's are not.
+>
 > If you genuinely must populate an index (you almost never do), **isolate it** so the real index is never touched:
 >
 > ```bash
 > GIT_INDEX_FILE="$(mktemp)" git read-tree <tree>
 > ```
 >
-> **Why this matters:** bare `read-tree` empties the live index, leaves the working tree and `HEAD` untouched, and writes **no reflog entry**, so recovery is hard and the corruption is easy to miss. Every role that operates in the main checkout (Judge, Champion, Auditor, Guide) is exposed to the same hazard — prefer `git merge-tree --write-tree` for any merge preview and reach for index-mutating plumbing only under an isolated `GIT_INDEX_FILE`.
+> **Why this matters:** bare `read-tree` empties the live index, leaves the working tree and `HEAD` untouched, and writes **no reflog entry**, so recovery is hard and the corruption is easy to miss; a stash pop is similarly silent-on-conflict-free-success with no reflog trace of what was lost. Every role that operates in the main checkout (Judge, Champion, Auditor, Guide) is exposed to the same hazard — prefer `git merge-tree --write-tree` for conflict detection, the merge-origin-into-the-PR-branch-worktree pattern for anything needing a working tree, and reach for index-mutating plumbing only under an isolated `GIT_INDEX_FILE`. Never touch the main checkout's stash stack.
 
 ### Check Merge State
 
@@ -1348,6 +1419,17 @@ EOF
 # Note: PR now has loom:pr (blue badge) - ready for Champion auto-merge
 ```
 
+## Fleet-Comms Etiquette (optional)
+
+If the `safehouse_send` / `safehouse_read` MCP tools are present in this
+session, post one line with your verdict summary (approve / changes-requested
++ one-line why) — not the full review comment, that's what `gh pr comment` is
+for. A genuine blocker gets `type: handoff`. If the MCP tools are absent (they
+are for this subagent's tool allowlist), fall back to
+`.loom/scripts/fleet-send.sh --task-id <repo>_<N> --type task --body "<line>"`,
+which exits 0 silently when the room is unreachable. If neither resolves,
+proceed exactly as above — this is normal, not an error. Full etiquette: `.loom/docs/fleet-comms.md`.
+
 ## Terminal Probe Protocol
 
 When you receive a probe command, respond with: `AGENT:Judge:<brief-task>` — e.g. `AGENT:Judge:evaluating-PR-123`.
@@ -1358,12 +1440,12 @@ When you receive a probe command, respond with: `AGENT:Judge:<brief-task>` — e
 
 **After completing an evaluation, stop or continue based on how you were invoked:**
 
-### Manual invocation (via `/judge` or `/judge <number>`)
+### Manual invocation (via `/loom:judge` or `/loom:judge <number>`)
 
 After completing **one** PR evaluation (PR labeled `loom:pr` or `loom:changes-requested`):
 - **Stop immediately** — do not search for additional PRs
 - Report a brief summary of what was evaluated and the outcome
-- The user can run `/judge` again if they want to evaluate another PR
+- The user can run `/loom:judge` again if they want to evaluate another PR
 
 If no work was found (no PRs with `loom:review-requested`), report that and stop.
 
@@ -1377,5 +1459,7 @@ If no work was found (no PRs with `loom:review-requested`), report that and stop
 4. Once the queue is empty, execute `/clear` to reset context for the next interval
 
 This batch processing prevents PRs from waiting unnecessarily when multiple are queued. Under the wave-parallel sweep model, several sweeps can land PRs at once, so the judge must drain the queue efficiently rather than processing one PR per interval.
+
+**Apply the "Stale `loom:reviewing` Claim Check" (see Primary Queue, step 2) to every PR in this loop, not just the first.** A `loom:review-requested` PR already carrying a fresh `loom:reviewing` claim from a concurrently-running Judge must be skipped (continue to the next PR in the batch); one carrying a stale claim is reclaimed then reviewed. This keeps a cron-invoked batch pass and a `/loom:sweep`-dispatched pass consistent with each other.
 
 If no work is available at the start of an iteration, execute `/clear` and wait for the next trigger.

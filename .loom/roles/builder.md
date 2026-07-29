@@ -293,6 +293,12 @@ echo "$WORKTREE_ABS"  # MUST end in /.loom/worktrees/issue-<number>
 
 # 3. Verify the worktree's branch (works from anywhere via -C)
 git -C "$WORKTREE_ABS" branch --show-current  # MUST show: feature/issue-<number>
+
+# 4. Assert $WORKTREE_ABS is actually a managed worktree (not the main
+#    checkout under a misleading variable name) BEFORE any edit — the same
+#    two checks guard-worktree-paths.sh uses to confine Edit/Write (#4178):
+[[ -f "$WORKTREE_ABS/.loom-managed" ]] || echo "FATAL: no .loom-managed sentinel at $WORKTREE_ABS"
+[[ "$(git -C "$WORKTREE_ABS" rev-parse --show-toplevel)" == "$WORKTREE_ABS" ]] || echo "FATAL: $WORKTREE_ABS is not its own git toplevel"
 ```
 
 ### CRITICAL: Absolute-Path Discipline (cwd does NOT persist across tool calls)
@@ -358,10 +364,20 @@ Before writing any code, confirm ALL of these:
 - [ ] Worktree exists at `.loom/worktrees/issue-<N>`
 - [ ] Captured the worktree ABSOLUTE path once (`WORKTREE_ABS="$(cd .loom/worktrees/issue-<N> && pwd)"`)
 - [ ] Branch is `feature/issue-<N>` (not `main`) — `git -C "$WORKTREE_ABS" branch --show-current`
+- [ ] `.loom-managed` sentinel is present at `$WORKTREE_ABS` AND `git -C "$WORKTREE_ABS" rev-parse --show-toplevel` equals `$WORKTREE_ABS` (#4178 — the same assertion the worktree-isolation guard applies to every Edit/Write and Bash write)
 - [ ] Will use absolute paths under `$WORKTREE_ABS` for every Write/Edit/Bash file operation (cwd does NOT persist across tool calls)
 - [ ] Issue is claimed with `loom:building` label
 
 **If any of these fail, STOP and fix the setup before proceeding.**
+
+**A denial is not a signal to retry via Bash.** `guard-worktree-paths.sh`
+confines the Edit/Write tools to your worktree; `guard-destructive-generic.sh`
+independently confines the common Bash write idioms (`>`/`>>` redirection,
+`tee`, `sed -i`, `cp`/`mv`) the same way (#4178). If either denies a write, the
+fix is always the same: re-run the assertions above and use `$WORKTREE_ABS`,
+never to fall back to the other tool for the same target path — that fallback
+is exactly how sweep #4063 escaped and edited live guard hooks in the main
+checkout.
 
 ### Working with gh CLI from a Worktree
 
@@ -797,6 +813,33 @@ git diff   # Read the actual changes
 
 **The PR title and commit message MUST describe what the code change does, not reference the issue.** See builder-pr.md for the full rules, anti-patterns, and examples.
 
+### Commit Conventions: DCO / sign-off
+
+Some repos require a DCO `Signed-off-by:` trailer on **every** commit (enforced by
+a required `sign-off`/`DCO` status check). Honor it so your PR passes on the first
+Judge pass instead of burning a Doctor cycle on `git commit --amend --signoff`:
+
+```bash
+# Load-bearing: if commit.signoff is true in .loom/config.json, pass --signoff
+# on EVERY commit you author (including --amend).
+if [ "$(jq -r '.commit.signoff // false' .loom/config.json 2>/dev/null)" = "true" ]; then
+  git commit --signoff -m "fix: ..."
+else
+  git commit -m "fix: ..."
+fi
+```
+
+- **Knob (deterministic)**: `commit.signoff: true` in `.loom/config.json` ⇒ always
+  `--signoff`. Read it the same way you read `buildGate.command`. Absent ⇒ behavior
+  unchanged, except:
+- **Heuristic (advisory fallback, knob unset)**: before your first commit, if
+  `CONTRIBUTING.md`/a `DCO` file mentions `Signed-off-by`/DCO, **or** a required
+  status check name matches `dco`/`sign-?off`, use `--signoff` too and note it in
+  the PR body.
+- `--signoff` is harmless when not required (only adds a trailer); git does not add
+  a duplicate trailer for an identity already present. Full reference:
+  `defaults/docs/commit-signoff.md`.
+
 ### Closing vs Partial Increments (family/epic issues)
 
 Decide whether this PR **fully** resolves the issue (`Closes #N`) or is only a
@@ -847,6 +890,19 @@ When creating PR:
 After PR creation:
 - [ ] STOP - do not touch any PR labels
 - [ ] Move to next issue
+
+## Fleet-Comms Etiquette (optional)
+
+If the `safehouse_send` / `safehouse_read` MCP tools are present in this
+session, post sparingly to the fleet room: one line on claim ("starting issue
+#N: `<title>`"), one line on PR creation, and any *notable* mid-task finding
+(surprising discovery, a concern worth human eyes) — not routine progress. A
+genuine blocker gets `type: handoff`. If the MCP tools are absent (they are for
+this subagent's tool allowlist), fall back to
+`.loom/scripts/fleet-send.sh --task-id <repo>_<N> --type task --body "<line>"`,
+which exits 0 silently when the room is unreachable. If neither resolves,
+proceed exactly as above — this is normal, not an error. Full etiquette
+(detection, threading, what NOT to do): `.loom/docs/fleet-comms.md`.
 
 ## Terminal Probe Protocol
 

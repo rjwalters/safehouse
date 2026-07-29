@@ -203,6 +203,9 @@ if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
       git fetch origin main
       git rebase origin/main
       # ... resolve conflicts ...
+      # If commit.signoff is true (or the repo requires DCO), re-signed commits
+      # must keep their Signed-off-by: trailer — use `git commit --amend --signoff`
+      # when re-authoring a commit during the rebase. See defaults/docs/commit-signoff.md.
       git push --force-with-lease
 
       # Comment but don't add labels
@@ -320,6 +323,7 @@ gh pr edit 588 --remove-label "loom:treating" --add-label "loom:review-requested
    - Do NOT push until all local checks pass
    - This prevents multiple fix-push-fail cycles
 9. **Commit and push**: Push your fixes to the PR branch
+   - **DCO / sign-off**: if `commit.signoff` is `true` in `.loom/config.json` (read it the same way as `buildGate.command`), or the repo has a DCO / required `sign-off` check, add `--signoff` to **every** commit you author — including `git commit --amend --signoff` when re-authoring during a rebase — so each carries a `Signed-off-by:` trailer. Harmless when not required; git will not add a duplicate trailer. Reference: `defaults/docs/commit-signoff.md`.
    - **9a. Rebase any stacked children** (best-effort): if the just-pushed branch matches `feature/issue-<N>` (i.e. you amended a stacked *parent*), run:
      ```bash
      ./.loom/scripts/rebase-stacked-children.sh feature/issue-<N>
@@ -615,6 +619,10 @@ pnpm check:ci   # your repo's check command — see buildGate.command in .loom/c
 
 # Commit and push
 git add .
+# DCO / sign-off: if commit.signoff is true in .loom/config.json (or the repo has a
+# DCO / required sign-off check), add --signoff so the commit carries a
+# Signed-off-by: trailer — same rule the Builder follows. Applies to EVERY commit
+# you author, including --amend. See defaults/docs/commit-signoff.md.
 git commit -m "Address review feedback
 
 - Fix null handling in foo.ts:15
@@ -810,6 +818,17 @@ Reviewer                    Fixer                     Reviewer
 - **Reviewer**: Initial review, request changes (→ `loom:changes-requested`), approval (→ `loom:pr`), final label management
 - **Fixer**: Address feedback, resolve conflicts, signal completion (→ `loom:review-requested`)
 - **Handoff**: Fixer transitions `loom:changes-requested` → `loom:review-requested` after fixing
+
+## Fleet-Comms Etiquette (optional)
+
+If the `safehouse_send` / `safehouse_read` MCP tools are present in this
+session, post one line on what you fixed after pushing. A genuine blocker
+(e.g. feedback you cannot address) gets `type: handoff`. If the MCP tools are
+absent (they are for this subagent's tool allowlist), fall back to
+`.loom/scripts/fleet-send.sh --task-id <repo>_<N> --type task --body "<line>"`,
+which exits 0 silently when the room is unreachable. If neither resolves,
+proceed exactly as above — this is normal, not an error. Full
+etiquette: `.loom/docs/fleet-comms.md`.
 
 ## Terminal Probe Protocol
 
