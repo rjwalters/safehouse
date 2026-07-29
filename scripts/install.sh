@@ -357,6 +357,13 @@ install_systemd() {
 		ExecStart=$BIN $CONFIG
 		Restart=always
 		RestartSec=5
+		# Stop with SIGINT so the daemon runs its clean-shutdown path (socket
+		# cleanup + room-key backup flush) instead of dying on the default
+		# SIGTERM. The daemon also handles SIGTERM identically, so this is
+		# belt-and-braces; the generous timeout covers wait_for_steady_state's
+		# network I/O before systemd escalates to SIGKILL.
+		KillSignal=SIGINT
+		TimeoutStopSec=120
 
 		[Install]
 		WantedBy=default.target
