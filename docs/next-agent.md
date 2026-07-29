@@ -128,6 +128,13 @@ when `meta` doesn't validate (#29 ✅). Next: the allowlist/redaction/publisher 
   critical path.
 
 ## Housekeeping
+- **One-command host installer (#40):** `scripts/install.sh` brings a new host into the fleet with no
+  manual Matrix steps — builds the binary into `~/.local/bin`, prompts for homeserver + bot creds +
+  recovery passphrase (generates the store passphrase), writes a `0600` config, verifies the first
+  boot against the daemon's own cold-start path, registers a supervised service (launchd on macOS /
+  `systemd --user` on Linux), and prints the loom-daemon handoff block. Pure host orchestration — zero
+  Matrix logic; the login/cross-sign/recovery it "does" is just the daemon's `boot`. Bot-account
+  creation on the homeserver stays an admin action (non-goal; the script points at the #25 docs).
 - **Public since 2026-07-26:** https://github.com/rjwalters/safehouse (Apache-2.0, DCO
   contributions per `CONTRIBUTING.md`).
 - Provenance for every decision lives in `research/` — eight passes, all 2026-07-26.
