@@ -11,6 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -26,7 +27,7 @@ use matrix_sdk::{
         },
         room::RoomType,
         serde::Raw,
-        OwnedServerName, OwnedUserId,
+        OwnedServerName, OwnedUserId, RoomId,
     },
     Client, Room, RoomState,
 };
@@ -434,6 +435,14 @@ async fn handle_op(
             if let Some(parent) = &parent {
                 link_room_to_space(client, parent, &room).await?;
             }
+            // Read-your-writes (#58): the SDK stores the new room immediately,
+            // but its name (`m.room.name`) and room type (`m.room.create`) only
+            // land with the next sync — until then `resolve_room` by name and
+            // `is_space` cannot see what this op just reported creating, and
+            // the natural "create Space, then create child into it by name"
+            // sequence fails. Wait (bounded) for the state to arrive before
+            // acknowledging, so a follow-up op can address the room by `name`.
+            await_room_name_visible(client, room.room_id(), name).await;
             Ok(json!({
                 "ok": true,
                 "room_id": room.room_id(),
@@ -722,6 +731,34 @@ fn pick_room_index(rooms: &[RoomAddr], spec: Option<&str>) -> Result<usize> {
         }
         None if rooms.len() == 1 => Ok(0),
         None => anyhow::bail!("`room` required: {} rooms joined", rooms.len()),
+    }
+}
+
+/// How long `create_room` waits for the concurrent sync loop to deliver the
+/// new room's state before acknowledging anyway (#58). Normally one sync
+/// round-trip (well under a second); the ceiling only matters when the
+/// homeserver is struggling, where blocking the RPC longer helps nobody.
+const CREATE_ROOM_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Poll the store until the just-created `room_id` resolves to `name`, or the
+/// bounded wait expires. Timeout is soft: the room exists either way, only
+/// by-name addressing lags until the next sync — log it and move on.
+async fn await_room_name_visible(client: &Client, room_id: &RoomId, name: &str) {
+    let deadline = tokio::time::Instant::now() + CREATE_ROOM_VISIBILITY_TIMEOUT;
+    loop {
+        if let Some(room) = client.get_room(room_id) {
+            if room.name().as_deref() == Some(name) {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!(
+                "safehoused: created room {room_id} still not name-resolvable after \
+                 {CREATE_ROOM_VISIBILITY_TIMEOUT:?} — by-name addressing lags until the next sync"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
