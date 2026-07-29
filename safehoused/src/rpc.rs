@@ -610,6 +610,9 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
         task_id,
         body: body.to_owned(),
         wake,
+        // Agent-originated `completion` meta is not wired through this send
+        // path yet — that (with strict validation) is the egress work in #30.
+        meta: None,
     })
 }
 
@@ -1162,6 +1165,7 @@ mod tests {
             task_id: task_id.map(str::to_owned),
             body: "go".to_owned(),
             wake: None,
+            meta: None,
         }
     }
 
@@ -1176,6 +1180,7 @@ mod tests {
             task_id: None,
             body: "hi".to_owned(),
             wake: None,
+            meta: None,
         }
     }
 

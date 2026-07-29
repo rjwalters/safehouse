@@ -114,6 +114,12 @@ unchanged, per D16 (the daemon never acts on it — only optional external waker
 ### 6. Wire one real agent and retire the copy-paste relay.
 Start with the two-project handoff use case that motivated all this: one agent writing a long-form document, another holding the facts it needs, today bridged by a human copy-pasting.
 
+### 7. Public completion feed (#28 chain).
+Schema groundwork is in: envelope v1 now has a `completion` `type` + `completion-v1` `meta`
+(`protocol/envelope-v1.md` §4a, D18) that round-trips through `safehoused` and degrades to `chat`
+when `meta` doesn't validate (#29 ✅). Next: the allowlist/redaction/publisher (#30) and transport
+(#31) that actually emit the feed.
+
 ## Deferred, with a deadline
 - ~~**D11 — CLA vs. DCO.**~~ ✅ Decided 2026-07-26: **DCO** (`CONTRIBUTING.md`, D11).
 - **Claude Code Channels push-wake** remains a **v1** item. `safehouse-mcp` covers the tools story

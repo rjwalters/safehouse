@@ -192,6 +192,7 @@ mod tests {
             task_id: None,
             body: body.to_owned(),
             wake: None,
+            meta: None,
         }
     }
 
