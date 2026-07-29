@@ -1,13 +1,26 @@
-//! safehouse-mcp — a keyless stdio MCP server over safehoused's unix socket.
+//! safehouse-mcp — a keyless stdio MCP server over safehoused's unix socket,
+//! doubling as a one-shot operator CLI over the same socket path (#33).
 //!
-//! Holds no Matrix keys, no tokens, no crypto: every tool call opens the
-//! daemon socket, identifies as $SAFEHOUSE_PERSONA (gated by the daemon's
-//! allowlist), performs one op, and closes. The daemon stamps `from`; this
-//! shim cannot impersonate anyone (envelope-v1 §6).
+//! Holds no Matrix keys, no tokens, no crypto: every tool call (or CLI
+//! subcommand) opens the daemon socket, identifies as $SAFEHOUSE_PERSONA
+//! (gated by the daemon's allowlist), performs one op, and closes. The
+//! daemon stamps `from`; this shim cannot impersonate anyone (envelope-v1
+//! §6).
 //!
-//! Deliberately dependency-light: hand-rolled JSON-RPC 2.0 over stdio, so the
+//! Deliberately dependency-light: hand-rolled JSON-RPC 2.0 over stdio (for
+//! MCP) and hand-rolled argv parsing (for the CLI subcommands below), so the
 //! whole agent-facing surface stays a documented, language-agnostic protocol
 //! (D8) rather than an SDK contract.
+//!
+//! ## Operator CLI (see also README "Scripting the socket")
+//!
+//! `safehouse-mcp read|send|check|list-rooms` runs one op against the
+//! daemon and prints the JSON reply — no MCP client, no hand-rolled
+//! envelope-v1 socket client required. `check` defaults to **peek** (never
+//! advances a persona's mailbox cursor); pass `--consume` to advance it
+//! explicitly. Running with no arguments (or an argument this dispatcher
+//! doesn't recognize as a subcommand) preserves the original stdio-MCP-server
+//! behavior exactly.
 
 use std::{
     env,
@@ -18,10 +31,18 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+/// Message `type` values the daemon accepts (mirrors
+/// `safehoused::envelope::KNOWN_TYPES`; duplicated rather than depending on
+/// the `safehoused` crate to keep this shim dependency-light, per its module
+/// doc comment).
+const KNOWN_MESSAGE_TYPES: [&str; 4] = ["chat", "task", "handoff", "ack"];
+
 fn main() -> Result<()> {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+
     // Answer --help/--version before anything else so they work regardless of
     // whether stdin is a TTY, a pipe, or /dev/null (e.g. in CI).
-    for arg in env::args().skip(1) {
+    for arg in &raw_args {
         match arg.as_str() {
             "--help" | "-h" => {
                 print_usage(&mut std::io::stdout());
@@ -32,6 +53,21 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             _ => {}
+        }
+    }
+
+    // One-shot operator CLI: `safehouse-mcp <subcommand> [flags...]`. Only
+    // dispatches for a recognized subcommand name in first position, so a
+    // bare invocation (no args) falls through unchanged to the stdio MCP
+    // server below — see AC "no subcommand preserves existing behavior".
+    if let Some(sub) = raw_args.first() {
+        if let Some(op) = build_cli_op(sub, &raw_args[1..])? {
+            return run_cli(sub, op);
+        }
+        if !sub.starts_with('-') {
+            eprintln!("safehouse-mcp: unknown subcommand {sub:?}");
+            print_usage(&mut std::io::stderr());
+            std::process::exit(2);
         }
     }
 
@@ -89,8 +125,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// One-line usage note for humans who ran the binary directly instead of via an
-/// MCP client. Written to stderr on the TTY-hang guard, stdout for `--help`.
+/// Usage note for humans who ran the binary directly. Written to stderr on
+/// the TTY-hang guard / unknown-subcommand error, stdout for `--help`.
 fn print_usage(out: &mut impl Write) {
     let _ = writeln!(
         out,
@@ -101,6 +137,176 @@ fn print_usage(out: &mut impl Write) {
         out,
         "Set SAFEHOUSED_SOCKET / SAFEHOUSE_PERSONA and connect via JSON-RPC MCP framing on stdin."
     );
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "Or run a one-shot operator command against the same socket (SAFEHOUSED_SOCKET /"
+    );
+    let _ = writeln!(
+        out,
+        "SAFEHOUSE_PERSONA still required — see README \"Scripting the socket\"):"
+    );
+    let _ = writeln!(
+        out,
+        "  safehouse-mcp read [--room <id|name|alias>] [--limit N]"
+    );
+    let _ = writeln!(
+        out,
+        "  safehouse-mcp send --to <persona|*> --body <text> [--type chat|task|handoff|ack]"
+    );
+    let _ = writeln!(
+        out,
+        "                      [--task-id ID] [--room <id|name|alias>] [--wake]"
+    );
+    let _ = writeln!(
+        out,
+        "  safehouse-mcp check [--limit N] [--consume]   # defaults to peek: never advances the cursor"
+    );
+    let _ = writeln!(out, "  safehouse-mcp list-rooms");
+}
+
+/// Builds the daemon op JSON for a CLI subcommand. Returns `Ok(None)` when
+/// `sub` isn't a recognized subcommand name, signaling the caller to fall
+/// through to stdio-MCP-server mode instead. Pure and socket-free — the
+/// unit tests below exercise this directly, no daemon required.
+fn build_cli_op(sub: &str, args: &[String]) -> Result<Option<Value>> {
+    let op = match sub {
+        "read" => build_read_op(args)?,
+        "send" => build_send_op(args)?,
+        "check" => build_check_op(args)?,
+        "list-rooms" => build_list_rooms_op(args)?,
+        _ => return Ok(None),
+    };
+    Ok(Some(op))
+}
+
+fn build_read_op(args: &[String]) -> Result<Value> {
+    let mut op = json!({"op": "read"});
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--room" => {
+                let v = flag_value(args, &mut i, "--room")?;
+                op["room"] = json!(v);
+            }
+            "--limit" => {
+                let v = flag_u64(args, &mut i, "--limit")?;
+                op["limit"] = json!(v);
+            }
+            other => bail!("read: unknown argument {other:?}"),
+        }
+    }
+    Ok(op)
+}
+
+fn build_send_op(args: &[String]) -> Result<Value> {
+    let mut op = json!({"op": "send"});
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--to" => {
+                let v = flag_value(args, &mut i, "--to")?;
+                op["to"] = json!(v);
+            }
+            "--body" => {
+                let v = flag_value(args, &mut i, "--body")?;
+                op["body"] = json!(v);
+            }
+            "--type" => {
+                let v = flag_value(args, &mut i, "--type")?;
+                anyhow::ensure!(
+                    KNOWN_MESSAGE_TYPES.contains(&v.as_str()),
+                    "send: --type must be one of {KNOWN_MESSAGE_TYPES:?}, got {v:?}"
+                );
+                op["type"] = json!(v);
+            }
+            "--task-id" => {
+                let v = flag_value(args, &mut i, "--task-id")?;
+                op["task_id"] = json!(v);
+            }
+            "--room" => {
+                let v = flag_value(args, &mut i, "--room")?;
+                op["room"] = json!(v);
+            }
+            "--wake" => {
+                op["wake"] = json!(true);
+                i += 1;
+            }
+            other => bail!("send: unknown argument {other:?}"),
+        }
+    }
+    anyhow::ensure!(op.get("to").is_some(), "send: --to is required");
+    anyhow::ensure!(op.get("body").is_some(), "send: --body is required");
+    Ok(op)
+}
+
+/// `check` inverts the MCP tool's default: run bare, this is always a
+/// stateless peek (no cursor advance). Advancing the persona's mailbox
+/// cursor requires the explicit `--consume` flag. This is the read-vs-check
+/// trap the issue calls out — the CLI makes the safe choice the default.
+fn build_check_op(args: &[String]) -> Result<Value> {
+    let mut consume = false;
+    let mut limit: Option<u64> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--consume" => {
+                consume = true;
+                i += 1;
+            }
+            "--peek" => {
+                // Already the default; accepted so `--peek` is always valid
+                // to write explicitly at the call site.
+                i += 1;
+            }
+            "--limit" => {
+                limit = Some(flag_u64(args, &mut i, "--limit")?);
+            }
+            other => bail!("check: unknown argument {other:?}"),
+        }
+    }
+    let mut op = json!({"op": "check", "peek": !consume});
+    if let Some(limit) = limit {
+        op["limit"] = json!(limit);
+    }
+    Ok(op)
+}
+
+fn build_list_rooms_op(args: &[String]) -> Result<Value> {
+    if let Some(other) = args.first() {
+        bail!("list-rooms: unknown argument {other:?}");
+    }
+    Ok(json!({"op": "list_rooms"}))
+}
+
+/// Reads the value for `flag` at `args[*i]`, advancing `*i` past both.
+fn flag_value(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
+    let value = args
+        .get(*i + 1)
+        .with_context(|| format!("{flag} requires a value"))?
+        .clone();
+    *i += 2;
+    Ok(value)
+}
+
+fn flag_u64(args: &[String], i: &mut usize, flag: &str) -> Result<u64> {
+    let raw = flag_value(args, i, flag)?;
+    raw.parse()
+        .with_context(|| format!("{flag} must be a non-negative integer, got {raw:?}"))
+}
+
+/// Runs one CLI subcommand: hello, op, print the JSON reply, exit non-zero
+/// if the daemon reported `ok: false` (so scripts can check `$?` without
+/// parsing JSON). Connection/protocol failures propagate as `Err` so `main`
+/// reports them the same way it reports any other startup error.
+fn run_cli(sub: &str, op: Value) -> Result<()> {
+    let reply = daemon_call(op).with_context(|| format!("safehouse-mcp {sub}"))?;
+    println!("{}", serde_json::to_string_pretty(&reply)?);
+    if reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        Ok(())
+    } else {
+        std::process::exit(1);
+    }
 }
 
 fn handle_tool_call(msg: &Value) -> Result<Value> {
@@ -286,4 +492,145 @@ fn tool_definitions() -> Value {
             }
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unrecognized_subcommand_falls_through() {
+        // `Ok(None)` is the signal main() uses to fall back to stdio-MCP-server
+        // mode — a bare invocation (empty argv) must never be routed to the
+        // CLI dispatcher at all, and any non-subcommand first word must not
+        // be mistaken for one.
+        assert!(build_cli_op("not-a-subcommand", &[]).unwrap().is_none());
+        assert!(build_cli_op("--help", &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_defaults_to_no_room_or_limit() {
+        let op = build_read_op(&[]).unwrap();
+        assert_eq!(op, json!({"op": "read"}));
+    }
+
+    #[test]
+    fn read_parses_room_and_limit() {
+        let op = build_read_op(&args(&["--room", "fleet-ops", "--limit", "5"])).unwrap();
+        assert_eq!(op, json!({"op": "read", "room": "fleet-ops", "limit": 5}));
+    }
+
+    #[test]
+    fn read_rejects_unknown_flag() {
+        assert!(build_read_op(&args(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn read_rejects_non_numeric_limit() {
+        assert!(build_read_op(&args(&["--limit", "not-a-number"])).is_err());
+    }
+
+    #[test]
+    fn send_requires_to_and_body() {
+        assert!(build_send_op(&[]).is_err());
+        assert!(build_send_op(&args(&["--to", "research_agent"])).is_err());
+        assert!(build_send_op(&args(&["--body", "hi"])).is_err());
+    }
+
+    #[test]
+    fn send_builds_full_op() {
+        let op = build_send_op(&args(&[
+            "--to",
+            "research_agent",
+            "--body",
+            "status?",
+            "--type",
+            "task",
+            "--task-id",
+            "abc123",
+            "--room",
+            "fleet-ops",
+            "--wake",
+        ]))
+        .unwrap();
+        assert_eq!(
+            op,
+            json!({
+                "op": "send",
+                "to": "research_agent",
+                "body": "status?",
+                "type": "task",
+                "task_id": "abc123",
+                "room": "fleet-ops",
+                "wake": true,
+            })
+        );
+    }
+
+    #[test]
+    fn send_rejects_unknown_message_type() {
+        let err = build_send_op(&args(&[
+            "--to",
+            "x",
+            "--body",
+            "hi",
+            "--type",
+            "not-a-real-type",
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains("--type"));
+    }
+
+    #[test]
+    fn check_defaults_to_peek_true() {
+        // The read-vs-check trap the issue names: a bare `check` must never
+        // advance a persona's mailbox cursor.
+        let op = build_check_op(&[]).unwrap();
+        assert_eq!(op, json!({"op": "check", "peek": true}));
+    }
+
+    #[test]
+    fn check_consume_flips_peek_false() {
+        let op = build_check_op(&args(&["--consume"])).unwrap();
+        assert_eq!(op, json!({"op": "check", "peek": false}));
+    }
+
+    #[test]
+    fn check_explicit_peek_flag_stays_peek_true() {
+        let op = build_check_op(&args(&["--peek"])).unwrap();
+        assert_eq!(op, json!({"op": "check", "peek": true}));
+    }
+
+    #[test]
+    fn check_parses_limit() {
+        let op = build_check_op(&args(&["--limit", "10"])).unwrap();
+        assert_eq!(op, json!({"op": "check", "peek": true, "limit": 10}));
+    }
+
+    #[test]
+    fn list_rooms_takes_no_arguments() {
+        assert_eq!(
+            build_list_rooms_op(&[]).unwrap(),
+            json!({"op": "list_rooms"})
+        );
+        assert!(build_list_rooms_op(&args(&["--room", "x"])).is_err());
+    }
+
+    #[test]
+    fn build_cli_op_dispatches_by_subcommand() {
+        assert_eq!(
+            build_cli_op("list-rooms", &[]).unwrap().unwrap(),
+            json!({"op": "list_rooms"})
+        );
+        assert_eq!(
+            build_cli_op("read", &args(&["--room", "x"]))
+                .unwrap()
+                .unwrap(),
+            json!({"op": "read", "room": "x"})
+        );
+    }
 }

@@ -83,8 +83,9 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
 - **Workspace:** [`safehoused/`](safehoused/) (the daemon: boot + recovery, sync v2, decrypt,
   unix-socket RPC, envelope dispatch, per-persona mailbox), [`safehouse-mcp/`](safehouse-mcp/)
   (keyless stdio MCP shim: `safehouse_send` / `safehouse_read` / `safehouse_check` /
-  `safehouse_create_room` / `safehouse_list_rooms`), and
-  [`spikes/qj-coldstart/`](spikes/qj-coldstart/) (Q-J provenance).
+  `safehouse_create_room` / `safehouse_list_rooms` — also runnable as a one-shot operator CLI,
+  see "Scripting the socket"), and [`spikes/qj-coldstart/`](spikes/qj-coldstart/) (Q-J
+  provenance).
 - **Per-agent mailbox (D16/D17):** each registered persona gets a durable, sqlite-backed read
   cursor — an agent calls `safehouse_check` on its own cadence and gets exactly what it missed,
   connected or not, surviving a daemon restart mid-gap. `safehoused` never spawns, wakes, or
@@ -138,6 +139,41 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
    in Element), create or open a room and invite `@safehouse-bot:<your-server>`. The daemon
    auto-joins invites and starts mirroring room traffic to stdout; local agents allowlisted in
    `personas` can now attach over the unix socket at `<state_dir>/safehoused.sock`.
+
+## Scripting the socket
+
+For a human or a script that just needs to read or send into a room — not run an MCP client —
+`safehouse-mcp` doubles as a one-shot CLI over the same unix socket (#33). It builds and sends
+one envelope-v1 op, prints the daemon's JSON reply to stdout, and exits — no need to read
+`safehoused/src/rpc.rs` to learn the hello/op handshake first.
+
+```bash
+export SAFEHOUSED_SOCKET=/var/lib/safehoused/safehoused.sock
+export SAFEHOUSE_PERSONA=operator   # see the `personas` convention below
+
+safehouse-mcp read --room fleet-ops --limit 20
+safehouse-mcp send --to '*' --body 'status?' --room fleet-ops
+safehouse-mcp check --limit 10                 # peek — never advances a cursor
+safehouse-mcp check --consume                  # advances the operator persona's own cursor
+safehouse-mcp list-rooms
+```
+
+Run `safehouse-mcp --help` for the full flag list. With no subcommand (or on a bare TTY), the
+binary keeps its original behavior unchanged: a stdio MCP server for an MCP client to launch.
+
+**The read-vs-check cursor trap:** `read` is *stateless* — it replays recent room history and
+never touches any persona's mailbox. `check` is *stateful* — it's a specific persona's durable,
+sqlite-backed unread-mail cursor (D16/D17), and by default **consuming** it (a second call
+returns nothing new). For scripted/operator access, prefer `read`; that's why this CLI's `check`
+defaults to peek-only (`--consume` opts in to advancing the cursor) — a bare `check` from a
+script or a curious human should never silently eat a real agent's unread mail.
+
+**Which persona to use:** don't borrow a real fleet agent's identity for ad hoc scripting — that
+persona's mailbox cursor and room presence are supposed to reflect what that agent has actually
+seen. Reserve a persona named `operator` in the daemon's `personas` allowlist instead (see the
+comment in [`safehoused/example-config.toml`](safehoused/example-config.toml)); it's a normal
+allowlist entry, not special-cased by the daemon, but it keeps operator traffic out of any real
+agent's identity and mailbox.
 
 ## Chosen stack (verified live)
 
