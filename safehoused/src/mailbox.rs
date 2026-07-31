@@ -16,6 +16,31 @@
 //! genuinely new piece of local state is the read cursor: what a given
 //! persona has already consumed. That's what must survive a restart, and
 //! that's what's persisted here (sqlite, in `state_dir`, per D17).
+//!
+//! **Storage is bounded, not unbounded (#60).** Being a derived/rebuildable
+//! view (above) means it is always safe for `safehoused` to be *lossy* about
+//! what it retains locally — the room, not the mailbox, is the durable
+//! record. Two policies keep a persona's mailbox from growing without bound
+//! when nothing ever consumes it:
+//!
+//! 1. **Ephemeral coordination broadcasts are never persisted per-persona**
+//!    (see [`is_ephemeral_body`]). A `to: "*"` broadcast whose `body` is a
+//!    JSON object carrying the [`EPHEMERAL_BODY_MARKER`] key is a live
+//!    coordination heartbeat (e.g. loom-daemon's cross-host claim
+//!    advertisement, re-published every ~30s per in-flight issue) — a stale
+//!    copy has negative value to an agent that checks in after the fact, so
+//!    it is dropped at `deliver()` rather than fanned out into every local
+//!    persona's mailbox. Live delivery to a *connected* socket
+//!    (`Registry::dispatch`) is unaffected — this only changes what gets
+//!    durably stored for later pickup.
+//! 2. **Per-persona retention is capped** (see [`gc_persona`]): every
+//!    `deliver()` also (a) drops rows the persona has already consumed
+//!    (`seq <= cursor` — dead weight, `check` never returns them again
+//!    regardless of retention) and (b) caps the remaining unconsumed backlog
+//!    at [`MAX_UNCONSUMED_PER_PERSONA`], dropping the oldest excess. A
+//!    persona with a live, regularly-advancing cursor never approaches the
+//!    cap in practice, so this only bites a mailbox nobody has ever consumed
+//!    from.
 
 use std::path::Path;
 
@@ -24,6 +49,88 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex;
 
 use crate::envelope::Envelope;
+
+/// JSON object key that marks a `body` payload as an ephemeral coordination
+/// broadcast rather than agent-facing content — e.g. loom-daemon's
+/// cross-host claim-advertisement heartbeat (`peer_claims.rs`'s
+/// `PEER_CLAIM_MARKER`), which rides a `to: "*"` `task` envelope and is
+/// re-published on a short interval for as long as an issue is in flight. A
+/// message matching this marker is never written into any persona's mailbox
+/// (see [`is_ephemeral_body`]) — `safehoused` is a generic protocol daemon
+/// and does not otherwise interpret `body`; this is a narrow, documented
+/// storage-policy exception motivated by #60 (studio's mailbox held 208k+
+/// rows, 92% of which were stale claim heartbeats with an empty `cursors`
+/// table), not a protocol change.
+const EPHEMERAL_BODY_MARKER: &str = "loom_claim";
+
+/// Cap on how many *unconsumed* rows (`seq` greater than the persona's
+/// cursor) a single persona's mailbox may hold. Chosen generously above any
+/// plausible legitimate backlog for a persona that checks in at all, while
+/// still bounding worst-case storage for one that never does (#60).
+const MAX_UNCONSUMED_PER_PERSONA: i64 = 5_000;
+
+/// True when `body` parses as a JSON object carrying [`EPHEMERAL_BODY_MARKER`]
+/// as a top-level key. Anything that isn't valid JSON, or is JSON but not an
+/// object, or is an object without the marker, is never ephemeral — plain
+/// prose `body` (the overwhelming common case) fails the `serde_json::from_str`
+/// parse immediately and this is a cheap no-op.
+fn is_ephemeral_body(body: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(body),
+        Ok(serde_json::Value::Object(map)) if map.contains_key(EPHEMERAL_BODY_MARKER)
+    )
+}
+
+/// Bound `persona`'s mailbox in `conn`, run after every delivery (#60):
+///
+/// 1. Delete rows already covered by `persona`'s read cursor (`seq <=
+///    cursor`) — `check` never returns them again regardless of retention,
+///    so keeping them around is pure dead weight. A persona with no cursor
+///    yet (never checked in) has nothing deleted by this step.
+/// 2. Cap the remaining (unconsumed) rows at `cap`, deleting the oldest
+///    excess first. A persona whose cursor advances promptly never
+///    accumulates more than a handful of unconsumed rows, so this step is a
+///    no-op for a live consumer — it only bites a mailbox nobody has ever
+///    drained.
+///
+/// Any rows actually dropped are logged (`safehoused: mailbox GC …`) so the
+/// bounded-retention behavior is observable in operation, not just inferred
+/// from a static row count.
+fn gc_persona(conn: &Connection, persona: &str, cap: i64) -> Result<()> {
+    let cursor: i64 = conn
+        .query_row(
+            "SELECT seq FROM cursors WHERE persona = ?1",
+            params![persona],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("reading mailbox cursor for gc")?
+        .unwrap_or(0);
+
+    let consumed_dropped = conn
+        .execute(
+            "DELETE FROM messages WHERE persona = ?1 AND seq <= ?2",
+            params![persona, cursor],
+        )
+        .context("dropping consumed mailbox rows")?;
+
+    let capped_dropped = conn
+        .execute(
+            "DELETE FROM messages WHERE persona = ?1 AND seq NOT IN ( \
+                 SELECT seq FROM messages WHERE persona = ?1 ORDER BY seq DESC LIMIT ?2 \
+             )",
+            params![persona, cap],
+        )
+        .context("capping unconsumed mailbox backlog")?;
+
+    if consumed_dropped > 0 || capped_dropped > 0 {
+        println!(
+            "safehoused: mailbox GC for persona {persona:?}: dropped {consumed_dropped} \
+             consumed row(s), {capped_dropped} over-cap row(s) (cap {cap})"
+        );
+    }
+    Ok(())
+}
 
 /// One delivered-and-stored envelope, as returned by [`Mailbox::check`].
 #[derive(Clone, Debug)]
@@ -89,6 +196,10 @@ impl Mailbox {
     /// (envelope, recipient persona) pair as the room stream is dispatched
     /// (mirrors the addressing rules in envelope-v1 §7); a broadcast fans out
     /// to one row per locally-hosted persona.
+    ///
+    /// A no-op when `env.body` matches [`is_ephemeral_body`] — see the module
+    /// doc for why (#60). Otherwise inserts, then runs [`gc_persona`] to keep
+    /// `persona`'s mailbox bounded.
     pub async fn deliver(
         &self,
         persona: &str,
@@ -97,6 +208,9 @@ impl Mailbox {
         sender: &str,
         env: &Envelope,
     ) -> Result<()> {
+        if is_ephemeral_body(&env.body) {
+            return Ok(());
+        }
         let payload = serde_json::to_string(env).context("serializing envelope for mailbox")?;
         let conn = self.conn.lock().await;
         conn.execute(
@@ -105,6 +219,8 @@ impl Mailbox {
             params![persona, room_id, event_id, sender, payload],
         )
         .context("inserting mailbox row")?;
+        gc_persona(&conn, persona, MAX_UNCONSUMED_PER_PERSONA)
+            .context("garbage-collecting mailbox after delivery")?;
         Ok(())
     }
 
@@ -314,6 +430,190 @@ mod tests {
         let research = mailbox.check("research_agent", true, None).await.unwrap();
         assert_eq!(research.len(), 1);
         assert_eq!(research[0].envelope.body, "for research");
+    }
+
+    /// Mirrors loom-daemon's `ClaimAd::to_body_json` shape closely enough to
+    /// exercise the detector faithfully (see `peer_claims.rs` upstream) —
+    /// `to: "*"`, `type: "task"`, and a `body` that is a JSON object carrying
+    /// the `loom_claim` marker key.
+    fn claim_env(issue: u32) -> Envelope {
+        Envelope {
+            v: 1,
+            from: "loom_daemon".to_owned(),
+            to: "*".to_owned(),
+            kind: "task".to_owned(),
+            task_id: Some(issue.to_string()),
+            body: format!(
+                r#"{{"loom_claim":1,"kind":"advertise","issue":{issue},"repo":"r","host":"h"}}"#
+            ),
+            wake: None,
+            meta: None,
+        }
+    }
+
+    #[test]
+    fn is_ephemeral_body_matches_only_the_marker_shape() {
+        assert!(is_ephemeral_body(
+            r#"{"loom_claim":1,"kind":"advertise","issue":5,"repo":"r","host":"h"}"#
+        ));
+        // Plain prose — the overwhelming common case — is never ephemeral.
+        assert!(!is_ephemeral_body("hmm, the timeline looks off"));
+        // Valid JSON without the marker key is left alone.
+        assert!(!is_ephemeral_body(r#"{"foo":"bar"}"#));
+        // Valid JSON that isn't an object (e.g. an array) is left alone.
+        assert!(!is_ephemeral_body("[1,2,3]"));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_loom_claim_broadcasts_are_never_persisted() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        mailbox
+            .deliver(
+                "loom_builder_1",
+                "!room:x",
+                "$claim1",
+                "@loom:x",
+                &claim_env(60),
+            )
+            .await
+            .unwrap();
+        let unread = mailbox.check("loom_builder_1", true, None).await.unwrap();
+        assert!(
+            unread.is_empty(),
+            "a loom_claim heartbeat must never land in a persona's durable mailbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_body_without_the_marker_is_persisted_normally() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        mailbox
+            .deliver(
+                "writer_agent",
+                "!room:x",
+                "$1",
+                "@robb:x",
+                &env("@robb:x", "writer_agent", r#"{"foo":"bar"}"#),
+            )
+            .await
+            .unwrap();
+        let unread = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(
+            unread.len(),
+            1,
+            "only the exact loom_claim marker shape is treated as ephemeral"
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_drops_rows_already_covered_by_the_cursor() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        for i in 0..3 {
+            mailbox
+                .deliver(
+                    "writer_agent",
+                    "!room:x",
+                    &format!("$event{i}"),
+                    "@robb:x",
+                    &env("@robb:x", "writer_agent", &format!("msg {i}")),
+                )
+                .await
+                .unwrap();
+        }
+        // Consume everything, advancing the cursor past all three rows.
+        mailbox.check("writer_agent", true, None).await.unwrap();
+
+        // One more delivery triggers the next gc pass, which should sweep the
+        // three now-consumed rows away, leaving only the new one.
+        mailbox
+            .deliver(
+                "writer_agent",
+                "!room:x",
+                "$event3",
+                "@robb:x",
+                &env("@robb:x", "writer_agent", "msg 3"),
+            )
+            .await
+            .unwrap();
+
+        let row_count: i64 = {
+            let conn = mailbox.conn.lock().await;
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE persona = 'writer_agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            row_count, 1,
+            "already-consumed rows are garbage-collected on the next delivery"
+        );
+
+        // The consumer's own view is unaffected — the new row is still there.
+        let unread = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(unread.len(), 1);
+        assert_eq!(unread[0].envelope.body, "msg 3");
+    }
+
+    #[tokio::test]
+    async fn bounded_retention_caps_an_unconsumed_backlog() {
+        // A persona that never calls `check` (the exact #60 scenario: 8
+        // loom_builder_N personas, an empty `cursors` table) must not
+        // accumulate an unbounded backlog. Exercise `gc_persona` directly
+        // with a small cap — the mechanism, not the production constant.
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        for i in 0..10 {
+            mailbox
+                .deliver(
+                    "loom_builder_1",
+                    "!room:x",
+                    &format!("$event{i}"),
+                    "@robb:x",
+                    &env("@robb:x", "loom_builder_1", &format!("msg {i}")),
+                )
+                .await
+                .unwrap();
+        }
+        {
+            let conn = mailbox.conn.lock().await;
+            gc_persona(&conn, "loom_builder_1", 3).unwrap();
+        }
+
+        let remaining = mailbox.check("loom_builder_1", false, None).await.unwrap();
+        let bodies: Vec<_> = remaining.iter().map(|e| e.envelope.body.clone()).collect();
+        assert_eq!(
+            bodies,
+            vec!["msg 7", "msg 8", "msg 9"],
+            "the cap keeps only the most recent rows, dropping the oldest excess"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_consumer_never_hits_the_retention_cap() {
+        // Existing consumers with live cursors are unaffected (#60 AC3): a
+        // persona that checks in regularly keeps a small unconsumed backlog
+        // (well under the production cap), so gc never trims anything it
+        // hasn't already delivered and had the chance to advance past.
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        for round in 0..5 {
+            mailbox
+                .deliver(
+                    "writer_agent",
+                    "!room:x",
+                    &format!("$event{round}"),
+                    "@robb:x",
+                    &env("@robb:x", "writer_agent", &format!("msg {round}")),
+                )
+                .await
+                .unwrap();
+            let unread = mailbox.check("writer_agent", true, None).await.unwrap();
+            assert_eq!(unread.len(), 1);
+            assert_eq!(unread[0].envelope.body, format!("msg {round}"));
+        }
+        // A fresh check confirms nothing was skipped or duplicated by gc.
+        let after = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert!(after.is_empty());
     }
 
     #[tokio::test]
