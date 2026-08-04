@@ -75,8 +75,13 @@ The ladder is configured in `.loom/config.json`:
 > `sonnet → sonnet@xhigh → opus → fable` step *down* a generation at the `opus`
 > rung. So every consumer keeps naming `opus` and a **single indirection point**
 > maps the logical tier to the concrete ID the dispatch should use — the
-> `/loom:sweep` skill via `./.loom/scripts/resolve-model.sh`, `loom_tools` via
-> `model_tiers`, and `loom-daemon` via `resolve_dispatch_model`. The shipped map
+> `/loom:sweep` skill via `./.loom/scripts/resolve-model.sh` and `loom-daemon`
+> via `resolve_dispatch_model`. (Issue #4809:
+> a **daemon-dispatched** single-issue sweep resolves through the sibling
+> `resolve_autonomous_dispatch_model`, which inserts the model-cost A/B
+> experiment's forced arm — when resolved-`experiment` mode confirms a canary —
+> ahead of `resolve_dispatch_model`'s own config/default sub-tiers; an explicit
+> dispatch `model` param still wins over both.) The shipped map
 > pins only the stale tier (`opus → claude-opus-5`); `sonnet`/`fable` and pinned
 > IDs pass through unchanged. Repoint or drop a pin per-repo with an additive
 > `.loom/config.json` → `sweep.modelAliases` object (no code change):
@@ -132,7 +137,7 @@ The preset supplies a tier's logical model **only when `sweep.tierModels[<runtim
 | `cost` | `haiku` | `sonnet` | `opus` | The full 3-stratum spread — cheapest model the Judge gate can safely correct. |
 | `speed` | `sonnet` | `opus` | `opus` | Wall-clock in a sweep is dominated by Judge-rejection / Doctor **round-trip count**, not per-turn latency, so `speed` starts a tier higher than `balanced` to buy fewer retries rather than fewer/cheaper tokens per turn. `complex` is already at the ceiling under `balanced`'s own tier-2.5 `complex` bump, so `speed` leaves it unchanged and instead raises `mechanical`/`routine`. |
 
-The profile is expressed in the same runtime-neutral logical tiers (`haiku`/`sonnet`/`opus`) as `sweep.tierModels` and applies uniformly across runtimes — a Codex adapter under the #4167 contract resolves the same logical names to its own IDs, so there is no separate per-runtime preset table. All the tier-map hard bounds above apply identically to the profile: Builder-only, never resolves to `fable`, tier-1/tier-2 pins win, suppressed in model-cost experiment mode. An invalid `sweep.optimization` value (either source) warns and falls back to `balanced` — it never fails dispatch. Implementation: `loom_tools.model_tiers.resolve_optimization_profile` / `optimization_preset`, wired into `resolve_tier_model` (`resolve-tier-model.sh`'s Python backend); see `test_model_tiers.py` for the full profile × stratum × precedence matrix.
+The profile is expressed in the same runtime-neutral logical tiers (`haiku`/`sonnet`/`opus`) as `sweep.tierModels` and applies uniformly across runtimes — a Codex adapter under the #4167 contract resolves the same logical names to its own IDs, so there is no separate per-runtime preset table. All the tier-map hard bounds above apply identically to the profile: Builder-only, never resolves to `fable`, tier-1/tier-2 pins win, suppressed in model-cost experiment mode. An invalid `sweep.optimization` value (either source) warns and falls back to `balanced` — it never fails dispatch. Implementation: `resolve_optimization_profile` / `optimization_preset` in `loom-daemon/src/script_helpers/model_tiers.rs`, wired into `resolve_tier_model` (`resolve-tier-model.sh`'s native backend, reached via `resolve-model.sh --tier`); see that module's unit tests for the full profile × stratum × precedence matrix.
 
 **Workspace override example** (`.loom/config.json`):
 

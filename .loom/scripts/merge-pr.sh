@@ -28,6 +28,16 @@
 #                          parent branch (feature/issue-N) still has open
 #                          stacked child PRs targeting it (operator asserts the
 #                          children are already reconciled). See #3747 item 2.
+#   --no-cleanup-primary   Skip the automatic primary-checkout branch cleanup
+#                          (#5015): when the merged branch is checked out in
+#                          the PRIMARY repo checkout (not a worktree) and it
+#                          is provably safe (clean tree, no stash entries,
+#                          tip matches the merged PR head SHA), the script
+#                          normally checks out the default branch there and
+#                          deletes the merged branch automatically instead of
+#                          just printing manual instructions. Pass this to
+#                          always print the manual instructions instead.
+#   --cleanup-primary      (no-op, primary-checkout cleanup is the default)
 #
 # By default, the local worktree AND the local branch it held are cleaned up
 # after a successful merge (#4100). Pass --no-cleanup-worktree to skip both
@@ -52,6 +62,16 @@
 # git itself refuses, and the refusal is reported with a specific message
 # rather than the generic "unmerged commits" warning. The repo's default
 # branch is never a delete target.
+#
+# Primary-checkout auto-cleanup (#5015): the one case above that is "checked
+# out as the current HEAD" AND is specifically the repo's PRIMARY checkout
+# (not a linked worktree) gets one extra step: if the tip-matches-head safety
+# check already passed AND the primary checkout's working tree is clean with
+# no stash entries (re-checked immediately before the mutating step, not
+# cached), the script checks out the default branch there and force-deletes
+# the branch automatically. A dirty tree, a stash entry, a tip mismatch, or
+# --no-cleanup-primary all fall back to printing the manual two-step
+# instructions unchanged.
 #
 # Override: pass --worktree-path <dir> to opt into removing a non-Loom
 # worktree (the sentinel guard is bypassed only when this flag is supplied).
@@ -118,6 +138,14 @@ Options:
                          Pass this flag only after you have manually reconciled
                          (or verified) the children — the operator asserts
                          responsibility, mirroring --worktree-path.
+  --no-cleanup-primary   Skip automatic primary-checkout branch cleanup (#5015).
+                         When the merged branch is checked out in the PRIMARY
+                         repo checkout (not a worktree), the script normally
+                         auto-checks-out the default branch and force-deletes
+                         it there ONLY when provably safe (clean tree, no
+                         stash entries, tip matches the merged PR head SHA).
+                         Pass this to always print manual instructions instead.
+  --cleanup-primary      (no-op, primary-checkout cleanup is the default)
   -h, --help             Show this help and exit
 
 By default, the local worktree AND the local branch it held are cleaned up
@@ -140,6 +168,15 @@ a squash merge): a matching tip uses 'git branch -D'; a non-matching tip
 branch and reports it instead of force-deleting. The branch currently
 checked out (main worktree or any other) is never deleted, and the repo's
 default branch is never a delete target.
+
+Primary-checkout auto-cleanup (#5015): the one exception to "checked out
+branches are never deleted" is when the branch is checked out in the repo's
+PRIMARY checkout specifically (not a linked worktree) AND it is provably
+safe — the tip-matches-head safety check above passed, the primary
+checkout's working tree is clean, and it has no stash entries. In that case
+the script checks out the default branch there and force-deletes the merged
+branch automatically instead of just printing instructions. Pass
+--no-cleanup-primary to always print the manual instructions instead.
 
 When --worktree-path <dir> is passed explicitly, the operator is taking
 responsibility for the cleanup decision: the sentinel guard is bypassed
@@ -181,6 +218,10 @@ Examples:
   ./.loom/scripts/merge-pr.sh 123 --worktree-path ../adhoc-wt
     Merges PR #123 and removes the worktree at ../adhoc-wt plus its
     matching local branch (bypasses the .loom-managed sentinel guard).
+
+  ./.loom/scripts/merge-pr.sh 123 --no-cleanup-primary
+    Merges PR but always prints manual instructions instead of
+    auto-cleaning a branch checked out in the primary repo checkout.
 EOF
 }
 
@@ -254,6 +295,10 @@ REPO_NWO="$(forge_get_repo_nwo "$GH")" || \
 # Parse arguments
 PR_NUMBER=""
 CLEANUP_WORKTREE=true
+# CLEANUP_PRIMARY_CHECKOUT (#5015): gates the automatic primary-checkout
+# branch cleanup performed by _maybe_delete_local_branch. Defaults on
+# (mirrors CLEANUP_WORKTREE's default); --no-cleanup-primary opts out.
+CLEANUP_PRIMARY_CHECKOUT=true
 DRY_RUN=false
 AUTO_MERGE=false
 WORKTREE_PATH_OVERRIDE=""
@@ -263,6 +308,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --cleanup-worktree) shift ;;  # no-op, cleanup is now the default
     --no-cleanup-worktree) CLEANUP_WORKTREE=false; shift ;;
+    --cleanup-primary) shift ;;  # no-op, primary-checkout cleanup is now the default
+    --no-cleanup-primary) CLEANUP_PRIMARY_CHECKOUT=false; shift ;;
     --worktree-path)
       [[ $# -lt 2 ]] && error "--worktree-path requires a value"
       WORKTREE_PATH_OVERRIDE="$2"
@@ -288,7 +335,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children]"
+[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--no-cleanup-worktree] [--no-cleanup-primary] [--worktree-path <dir>] [--dry-run] [--auto] [--allow-stacked-children]"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || error "PR number must be numeric: $PR_NUMBER"
 
 # Validate --worktree-path early (before any network calls) so bad input
@@ -430,6 +477,266 @@ Or, if you have already verified/reconciled them, re-run with --allow-stacked-ch
 # Invoke the guard before either merge path attempts the actual merge API call.
 _check_no_open_stacked_children
 
+# ---------------------------------------------------------------------------
+# Partial-increment closing-keyword conflict detection (#4569, extended by
+# #4595 to cover commit messages).
+#
+# ROOT CAUSE (established from the rjwalters/censusapi#5 -> censusapi#2 incident,
+# NOT from the branch-name theory the report floated):
+#
+#   GitHub's closing-reference parser scans the ENTIRE PR body and honors ANY
+#   `close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved` that is
+#   IMMEDIATELY followed by `#N` — wherever it appears, including buried in
+#   prose, inside a list item, or mid-sentence. It is NOT limited to a
+#   line-leading trailer.
+#
+#   censusapi PR #5 ended with the deliberate non-closing trailer
+#   `Contributes to #2`, but an earlier "Operator follow-up (after merge)" step
+#   read "...then close #2". GitHub honored that `close #2` as a real closing
+#   reference and closed issue #2 on squash-merge, silently defeating the #3599
+#   partial-increment convention. The evidence:
+#     - issue #2's timeline has NO `connected` event, so there was no
+#       Development-sidebar / branch-name link -> the `feature/issue-N`
+#       branch-name auto-link hypothesis is RULED OUT;
+#     - the squash commit message contained only `Contributes to #2` (no closing
+#       keyword), so the close did not come from the commit message either;
+#     - the `closed` event has `commit_id: null` with the merger as actor at the
+#       merge instant — the signature of a PR-body closing-reference close.
+#
+# SECOND SOURCE (#4595): the same parser also runs over the SQUASH COMMIT
+#   MESSAGE. forge_merge_pr() squash-merges with no commit_title/commit_message
+#   override, so GitHub composes that message from the PR's own commit messages —
+#   a stray `close #N` in any commit message closes #N on merge even when the PR
+#   body only ever says `Part of #N`. That close is fully attributable (the
+#   `closed` event carries the merge `commit_id`), it is just invisible to both
+#   the body regex and `closingIssuesReferences`, so the commit messages are
+#   consulted as a third signal below.
+#
+# Fix shape: DETECT (here, pre-merge, with a loud actionable warning) plus
+# SELF-HEAL (post-merge reopen in _reset_one_partial_issue below). Prevention by
+# rewriting the PR body at merge time was rejected — mutating a body the Judge
+# already reviewed is a worse failure mode than a seconds-long close/reopen.
+#
+# Two globals are published for the post-merge pass, both space-separated:
+#   PARTIAL_OPEN_BEFORE_MERGE - partial-increment refs that were OPEN right
+#       before the merge (so "closed afterwards" is attributable to this merge).
+#   PARTIAL_CONFLICT_ISSUES   - the subset that ALSO carries a closing reference
+#       from this PR, i.e. the ones GitHub is about to close against the
+#       declared intent. Only these are auto-reopened; that keeps a deliberate
+#       human close inside the merge window (which carries no closing reference)
+#       from being reverted.
+PARTIAL_OPEN_BEFORE_MERGE=""
+PARTIAL_CONFLICT_ISSUES=""
+
+# Strips Markdown fenced code blocks (``` ... ```) from stdin, one line at a
+# time: a fence-open/-close toggle drops everything between the fences
+# (inclusive of the fence markers themselves). Used so a `Part of #N` shown as
+# example/quoted text inside a fenced block reads as documentation, never a
+# live declaration (#5234).
+_strip_fenced_code_blocks() {
+  awk '
+    /^[[:space:]]*```/ { infence = !infence; next }
+    !infence { print }
+  '
+}
+
+# Issue numbers referenced with a NON-closing partial-increment keyword
+# (`Part of #N` / `Contributes to #N`, case-insensitive) as a DECLARATION, one
+# per line, deduped.
+#
+# "Declaration" is deliberately narrower than "appears anywhere in the body"
+# (#5234): a bare `grep` over the whole text also matched a mid-sentence,
+# backticked, conditional mention like "...say so and I will switch the
+# reference to `Part of #4574`" — prose describing a hypothetical, not a
+# declared intent — and treated it as authoritative, reopening a correctly
+# closed issue. To count as a declaration here the keyword must be
+# line-leading, optionally preceded by a list marker (`-`/`*`/`+`/numbered
+# `1.`/blockquote `>`) and/or whitespace — matching the actual shape this
+# convention produces (a one-line `Part of #123` / `Contributes to #456`
+# trailer, per builder-pr.md), not prose that merely references the pattern.
+#
+# Fenced code blocks are stripped first, then inline code spans (`` `...` ``)
+# are blanked so a backticked mention cannot itself satisfy the line-leading
+# anchor (the #5234 repro used backticks specifically to mark the reference as
+# hypothetical, not live).
+#
+# The second stage extracts `#N` tokens FIRST and only then strips the `#`.
+# Scanning the whole matched span for any digit run would also pick up the
+# numbered-list marker's own ordinal (`3. Part of #789` -> `3` and `789`),
+# which is exactly the false-positive-reopen class this guard exists to
+# prevent: a body carrying both `3. Part of #789` and a genuine `Closes #3`
+# would see #3 registered as a declared partial increment AND a closing
+# reference, and get reopened right after a correct close.
+_partial_increment_refs() {
+  { printf '%s\n' "$1" \
+      | _strip_fenced_code_blocks \
+      | sed -E 's/`[^`]*`//g' \
+      | grep -oiE '^[[:space:]]*([-*+>]|[0-9]+\.)?[[:space:]]*(Part of|Contributes to)[[:space:]]+#[0-9]+' \
+      | grep -oE '#[0-9]+' \
+      | tr -d '#' \
+      | sort -un; } || true
+}
+
+# Issue numbers referenced with a GitHub CLOSING keyword anywhere in the text
+# read from stdin, one per line, deduped. The regex is deliberately the same one
+# forge_pr_close_targets() uses on its Gitea branch (the canonical keyword set,
+# with `\b` guarding against substring traps like `Discloses #N`).
+#
+# Why a text regex and not only the authoritative GraphQL
+# `closingIssuesReferences`: that field is GraphQL-only, and the incident this
+# guard exists for happened while GraphQL quota was exhausted (the PR was even
+# created via raw REST for that reason). A quota-free text signal is the one that
+# still works in exactly the conditions where this bug bites.
+_closing_refs_stdin() {
+  { grep -oiE '\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[[:space:]]+#[0-9]+' \
+      | grep -oE '[0-9]+' \
+      | sort -un; } || true
+}
+
+# Same, for text passed as $1 (the PR body, historically the only source).
+_body_closing_refs() {
+  { printf '%s\n' "$1" | _closing_refs_stdin; } || true
+}
+
+# The literal offending snippets ("close #N", "Fixes #N", …) that reference
+# issue $2 with a closing keyword inside the text $1, rendered for a warning as
+# `snippet", "snippet`. Empty when the text carries no such reference — which is
+# how the caller tells WHICH source (body vs. commit messages) is at fault.
+_closing_ref_snippets() {
+  { printf '%s\n' "$1" \
+      | grep -oiE "\\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\\b[[:space:]]+#$2\\b" \
+      | sort -u | tr '\n' '|' | sed 's/|$//; s/|/", "/g'; } || true
+}
+
+# The literal declaration text (`Part of #N` / `Contributes to #N`) that
+# _partial_increment_refs read as authoritative for issue $2 inside text $1,
+# rendered the same way _closing_ref_snippets renders the closing-keyword side
+# (`snippet", "snippet`) — so the pre-merge warning can show an operator BOTH
+# sides of the conflict and judge for themselves whether the declaration was
+# real (AC #4, #5234). Runs the identical fenced-block/inline-code-span
+# stripping as _partial_increment_refs so the quoted snippet always matches
+# what was actually matched, never a code-block artifact.
+_partial_increment_ref_snippets() {
+  { printf '%s\n' "$1" \
+      | _strip_fenced_code_blocks \
+      | sed -E 's/`[^`]*`//g' \
+      | grep -oiE "^[[:space:]]*([-*+>]|[0-9]+\\.)?[[:space:]]*(Part of|Contributes to)[[:space:]]+#$2\\b" \
+      | sed -E 's/^[[:space:]]+//' \
+      | sort -u | tr '\n' '|' | sed 's/|$//; s/|/", "/g'; } || true
+}
+
+# Every commit message of this PR, concatenated (#4595). merge-pr.sh squash-
+# merges without overriding the commit message (forge_merge_pr passes no
+# commit_title/commit_message), so GitHub composes the squash message from these
+# commits — a `close #N` in any of them is a real closing reference that neither
+# the PR body regex nor `closingIssuesReferences` reveals.
+#
+# REST (not GraphQL), so it survives the same quota exhaustion the body regex
+# exists for, and `--paginate` so a >30-commit PR is not silently truncated.
+# Plain `gh api` (not $GH) for freshness, `--jq` deliberately avoided in favor of
+# a jq pipe (jq is already a hard dependency). Best-effort: any failure yields an
+# empty string, which degrades to the pre-#4595 behavior (no attribution).
+_pr_commit_messages() {
+  { gh api "repos/$REPO_NWO/pulls/$PR_NUMBER/commits" --paginate 2>/dev/null \
+      | jq -r '.[].commit.message' 2>/dev/null; } || true
+}
+
+# Membership tests over the space-separated globals above.
+_partial_ref_is_conflicted() {
+  [[ -n "${PARTIAL_CONFLICT_ISSUES:-}" ]] || return 1
+  [[ " $PARTIAL_CONFLICT_ISSUES " == *" $1 "* ]]
+}
+_partial_ref_was_open_before_merge() {
+  [[ -n "${PARTIAL_OPEN_BEFORE_MERGE:-}" ]] || return 1
+  [[ " $PARTIAL_OPEN_BEFORE_MERGE " == *" $1 "* ]]
+}
+
+# Populate the two globals and warn about each detected conflict. Best-effort:
+# never fails the merge, and a lookup failure simply yields a smaller set.
+_check_partial_increment_close_conflict() {
+  [[ "$FORGE_TYPE" == "github" ]] || return 0
+
+  local pr_body
+  pr_body="$(echo "$PR_JSON" | jq -r '.body // ""')"
+  [[ -n "$pr_body" ]] || return 0
+
+  local partial_refs
+  partial_refs="$(_partial_increment_refs "$pr_body")"
+  [[ -n "$partial_refs" ]] || return 0
+
+  # Closing references GitHub will honor on merge, from three unioned signals:
+  #   1. the body's own closing keywords (quota-free regex);
+  #   2. this PR's COMMIT MESSAGES (#4595) — quota-free REST, and the source of
+  #      the squash commit message this script does not override;
+  #   3. GitHub's authoritative closingIssuesReferences (best-effort — empty
+  #      under GraphQL quota exhaustion, but when it does answer it also
+  #      surfaces a Development-sidebar link that no text reveals).
+  # The commit fetch happens only past the partial_refs early-return above, so
+  # the common (non-partial-increment) path costs zero extra API calls.
+  local body_close_refs commit_messages commit_close_refs graphql_close_refs close_refs
+  body_close_refs="$(_body_closing_refs "$pr_body")"
+  commit_messages="$(_pr_commit_messages)"
+  commit_close_refs="$(printf '%s\n' "$commit_messages" | _closing_refs_stdin)"
+  graphql_close_refs="$(forge_pr_close_targets "$PR_NUMBER" "$GH" 2>/dev/null || true)"
+  close_refs="$(printf '%s\n%s\n%s\n' "$body_close_refs" "$commit_close_refs" "$graphql_close_refs" \
+    | grep -E '^[0-9]+$' | sort -un || true)"
+
+  local issue_num issue_json
+  while IFS= read -r issue_num; do
+    [[ -n "$issue_num" ]] || continue
+
+    # Fresh (uncached) read — plain `gh api`, not $GH, mirroring
+    # _reset_one_partial_issue's freshness discipline. Skip PRs that slipped
+    # through the regex (the issues endpoint also returns PRs).
+    issue_json="$(gh api "repos/$REPO_NWO/issues/$issue_num" 2>/dev/null || echo '{}')"
+    if [[ "$(echo "$issue_json" | jq -r 'has("pull_request")')" == "true" ]]; then
+      continue
+    fi
+    # Only an issue that is OPEN right now can be closed BY this merge; one that
+    # is already closed was closed by something else and is not ours to revert.
+    if [[ "$(echo "$issue_json" | jq -r '.state // ""')" != "open" ]]; then
+      continue
+    fi
+    PARTIAL_OPEN_BEFORE_MERGE="${PARTIAL_OPEN_BEFORE_MERGE:+$PARTIAL_OPEN_BEFORE_MERGE }$issue_num"
+
+    if ! grep -qx "$issue_num" <<<"$close_refs"; then
+      continue
+    fi
+    PARTIAL_CONFLICT_ISSUES="${PARTIAL_CONFLICT_ISSUES:+$PARTIAL_CONFLICT_ISSUES }$issue_num"
+
+    local body_offending commit_offending partial_offending dr=""
+    # Match _check_no_open_stacked_children's dry-run contract: report the
+    # would-be outcome without claiming a merge is happening.
+    [[ "${DRY_RUN:-false}" == "true" ]] && dr="[dry-run] "
+    body_offending="$(_closing_ref_snippets "$pr_body" "$issue_num")"
+    commit_offending="$(_closing_ref_snippets "$commit_messages" "$issue_num")"
+    # The declaration text itself (AC #4, #5234) — quoted alongside the closing
+    # keyword below so an operator can see both sides and judge for themselves
+    # whether the declaration was a real trailer or, e.g., prose that happened
+    # to survive the structural anchor.
+    partial_offending="$(_partial_increment_ref_snippets "$pr_body" "$issue_num")"
+
+    # Name the source, because the operator remedy differs per source: edit the
+    # PR body, reword/amend a commit, or unlink a Development-sidebar reference.
+    if [[ -n "$body_offending" ]]; then
+      warning "${dr}Partial-increment conflict (#4569): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num (\"$partial_offending\"), but its body ALSO carries a closing reference to #$issue_num (\"$body_offending\") — GitHub honors a closing keyword ANYWHERE in the body, so merging this PR WILL close #$issue_num against the declared intent."
+      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, edit the PR body so no closing keyword is immediately followed by \`#$issue_num\` (e.g. write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`), then re-run this merge."
+    elif [[ -n "$commit_offending" ]]; then
+      warning "${dr}Partial-increment conflict (#4595): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num (\"$partial_offending\"), but a closing keyword in a commit message of this PR references #$issue_num (\"$commit_offending\") — this merge squashes without overriding the commit message, so GitHub composes the squash message from these commits and merging WILL close #$issue_num against the declared intent."
+      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, reword the offending commit message (\`git commit --amend\` / \`git rebase -i\` + force-push) so no closing keyword is immediately followed by \`#$issue_num\`, then re-run this merge."
+    else
+      warning "${dr}Partial-increment conflict (#4569): PR #$PR_NUMBER declares a NON-closing \`Part of\`/\`Contributes to\` reference to #$issue_num (\"$partial_offending\"), but GitHub reports #$issue_num as a closing target of this PR (no closing keyword found in the body or commit messages — most likely a Development-sidebar link), so merging this PR WILL close #$issue_num against the declared intent."
+      warning "  ${dr}merge-pr.sh would reopen #$issue_num immediately after the merge. To avoid the close/reopen flicker entirely, unlink #$issue_num from this PR's Development sidebar, then re-run this merge."
+    fi
+  done <<< "$partial_refs"
+
+  return 0
+}
+
+# Runs before either merge path so the operator sees the conflict BEFORE the
+# close happens, and so --dry-run reports it without merging. Best-effort.
+_check_partial_increment_close_conflict || true
+
 info "Merging PR #$PR_NUMBER: $PR_TITLE"
 info "Branch: $PR_BRANCH"
 
@@ -466,7 +773,7 @@ info "Branch: $PR_BRANCH"
 # second builder), or is actually a PR.
 _reset_one_partial_issue() {
   local issue_num="$1"
-  local issue_json issue_state issue_labels
+  local issue_json issue_state issue_labels reopened=false
 
   # Fresh (uncached) read so we see the label state AS OF the merge, not as of
   # PR creation. Plain `gh api` is uncached; use it directly (not $GH, which may
@@ -481,8 +788,35 @@ _reset_one_partial_issue() {
 
   issue_state="$(echo "$issue_json" | jq -r '.state // ""')"
   if [[ "$issue_state" != "open" ]]; then
-    info "Partial-increment reset: issue #$issue_num is not open (state='${issue_state:-unknown}') — skipping"
-    return 0
+    # #4569: a partial-increment issue that was OPEN pre-merge and is closed now
+    # was closed BY this merge. If the pre-merge guard recorded a closing
+    # reference to it from this very PR (a stray `close #N` in prose, or a
+    # Development-sidebar link), that close contradicts the PR's own declared
+    # `Part of` / `Contributes to` intent — revert it, then fall through to the
+    # normal label swap so the issue re-enters the ready queue.
+    if _partial_ref_is_conflicted "$issue_num"; then
+      warning "Partial-increment reset: issue #$issue_num was auto-closed by PR #$PR_NUMBER's merge despite its non-closing \`Part of\`/\`Contributes to\` reference (a closing reference to #$issue_num was detected pre-merge) — reopening (#4569)"
+      # forge_gh_reopen_issue_rl_safe (#4856): falls back to a REST PATCH
+      # (state=open) when `gh issue reopen`'s GraphQL mutation is rate-limited.
+      if forge_gh_reopen_issue_rl_safe "$REPO_NWO" "$issue_num" 2>/dev/null; then
+        success "Issue #$issue_num reopened (premature auto-close reverted)"
+        reopened=true
+        _post_premature_close_comment "$issue_num"
+      else
+        warning "Could not reopen issue #$issue_num after its premature auto-close — reopen manually: gh issue reopen $issue_num --repo $REPO_NWO"
+        return 0
+      fi
+    elif _partial_ref_was_open_before_merge "$issue_num"; then
+      # Open before the merge, closed after it, but this PR carries no closing
+      # reference we can attribute it to. Could be a deliberate close by a human
+      # or another agent in the same window, so do NOT revert it — just make the
+      # coincidence loud enough to investigate.
+      warning "Partial-increment reset: issue #$issue_num was open before PR #$PR_NUMBER merged and is now closed (state='${issue_state:-unknown}'), but no closing reference to it was detected on this PR — NOT reopening automatically (it may be a deliberate close). If this was a premature auto-close, reopen it with: gh issue reopen $issue_num --repo $REPO_NWO"
+      return 0
+    else
+      info "Partial-increment reset: issue #$issue_num is not open (state='${issue_state:-unknown}') — skipping"
+      return 0
+    fi
   fi
 
   issue_labels="$(echo "$issue_json" | jq -r '.labels[]?.name' 2>/dev/null || true)"
@@ -492,18 +826,20 @@ _reset_one_partial_issue() {
   fi
 
   info "Partial-increment reset: PR #$PR_NUMBER merged as a partial slice of #$issue_num; returning it to the ready queue"
-  if gh issue edit "$issue_num" \
-       --repo "$REPO_NWO" \
-       --remove-label "loom:building" \
-       --add-label "loom:issue" >/dev/null 2>&1; then
+  # forge_gh_swap_label_rl_safe (#4856): falls back to REST (DELETE the old
+  # label, POST the new one) when `gh issue edit`'s GraphQL mutation is
+  # rate-limited, rather than silently dropping the label swap.
+  if forge_gh_swap_label_rl_safe "$REPO_NWO" "$issue_num" "loom:building" "loom:issue" 2>/dev/null; then
     success "Issue #$issue_num: loom:building -> loom:issue (partial increment; issue remains open)"
-    local ts comment
+    local ts comment reopen_note=""
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    [[ "$reopened" == "true" ]] && reopen_note="
+- **Reopened** this issue (GitHub had auto-closed it from a stray closing keyword in PR #$PR_NUMBER's body or one of its commit messages — see #4569)"
     comment="## Partial Increment Merged
 
 PR #$PR_NUMBER merged with a non-closing \`Part of\` / \`Contributes to\` reference, so this issue remains **open** for further work.
 
-**Action taken**:
+**Action taken**:$reopen_note
 - Removed \`loom:building\` label
 - Added \`loom:issue\` label to return to the ready queue
 
@@ -511,11 +847,36 @@ This issue is now available for the next increment (a subsequent \`/loom:sweep\`
 
 ---
 *Reset by merge-pr.sh (#3667) at $ts*"
-    gh issue comment "$issue_num" --repo "$REPO_NWO" --body "$comment" >/dev/null 2>&1 || \
+    # forge_gh_comment_rl_safe (#4856): falls back to the REST comments
+    # endpoint on a GraphQL rate-limit rejection.
+    forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num" "$comment" 2>/dev/null || \
       warning "Could not post partial-increment comment on issue #$issue_num (label swap still applied)"
   else
     warning "Could not reset labels on issue #$issue_num (partial increment) — may need manual 'gh issue edit'"
   fi
+}
+
+# Audit trail for a reverted premature auto-close (#4569). Posted right after
+# the reopen so the record survives even when the label swap below is skipped
+# (e.g. the issue no longer carries loom:building). Best-effort.
+_post_premature_close_comment() {
+  local issue_num="$1" ts comment
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  comment="## Premature Auto-Close Reverted
+
+PR #$PR_NUMBER referenced this issue with a **non-closing** \`Part of\` / \`Contributes to\` keyword — a declared partial increment, so this issue was meant to stay **open** after the merge. GitHub closed it anyway, because a **closing keyword** (\`close\`/\`fix\`/\`resolve\` and their tense variants) immediately followed by \`#$issue_num\` appeared elsewhere in the PR — in the body, or in one of the PR's commit messages (this merge squashes without overriding the commit message, so GitHub composes the squash message from those commits).
+
+GitHub honors a closing keyword **anywhere** in a PR body or squash commit message — not only in a line-leading trailer — so prose like \"…then close #$issue_num\" in a follow-up checklist, or a stray \`close #$issue_num\` in a commit message, creates a real closing link that overrides the intended \`Contributes to #$issue_num\`.
+
+**Action taken**: reopened this issue.
+
+**To avoid this**: never put a closing keyword immediately before \`#$issue_num\` anywhere in a partial-increment PR's body **or commit messages**. Write \`close the issue\` or \`close issue #$issue_num\` instead of \`close #$issue_num\`.
+
+---
+*Reopened by merge-pr.sh (#4569) at $ts*"
+  # forge_gh_comment_rl_safe (#4856): REST fallback on GraphQL rate limit.
+  forge_gh_comment_rl_safe "$REPO_NWO" "$issue_num" "$comment" 2>/dev/null || \
+    warning "Could not post premature-close comment on issue #$issue_num (reopen still applied)"
 }
 
 # Parse the merged PR body for non-closing partial-increment references and
@@ -527,14 +888,11 @@ _reset_partial_increment_labels() {
   pr_body="$(echo "$PR_JSON" | jq -r '.body // ""')"
   [[ -n "$pr_body" ]] || return 0
 
-  # Extract issue numbers referenced with a NON-closing partial-increment
-  # keyword: "Part of #N" / "Contributes to #N" (case-insensitive), deduped.
-  # grep -oiE emits e.g. "Part of #123"; a second grep strips to the number.
+  # Issue numbers referenced with a NON-closing partial-increment keyword.
+  # Shares _partial_increment_refs with the pre-merge #4569 conflict guard so the
+  # two passes can never disagree about which issues are partial increments.
   local refs
-  refs="$(printf '%s\n' "$pr_body" \
-    | grep -oiE '(Part of|Contributes to)[[:space:]]+#[0-9]+' \
-    | grep -oE '[0-9]+' \
-    | sort -u || true)"
+  refs="$(_partial_increment_refs "$pr_body")"
   [[ -n "$refs" ]] || return 0
 
   local issue_num
@@ -630,7 +988,10 @@ Parent branch \`$parent_branch\` squash-merged, but this child's issue #$child_i
 
 ---
 *Deferred by merge-pr.sh (#3747) at $ts*"
-    gh pr comment "$child_pr" --repo "$REPO_NWO" --body "$comment" >/dev/null 2>&1 || \
+    # forge_gh_comment_rl_safe (#4856): the REST comments endpoint is shared
+    # by issues and PRs, so the same helper covers this `gh pr comment` call
+    # site's GraphQL rate-limit fallback.
+    forge_gh_comment_rl_safe "$REPO_NWO" "$child_pr" "$comment" 2>/dev/null || \
       warning "Could not post deferred-reconciliation comment on PR #$child_pr"
     return 0
   fi
@@ -991,6 +1352,50 @@ if [[ "$AUTO_MERGE" == "true" ]]; then
       # Not immediately mergeable — preserve the terminal error (do NOT bypass a
       # genuine merge blocker just because auto-merge happens to be disabled).
       error "Failed to enable auto-merge for PR #$PR_NUMBER: $AUTO_MERGE_OUTPUT"
+    fi
+
+    # GraphQL-layer unavailability fallback (#4447). GitHub's
+    # enablePullRequestAutoMerge mutation is GraphQL-only; when the shared
+    # credential's GraphQL quota is exhausted (or the native `loom-daemon`
+    # path cannot resolve the repo NWO via `gh repo view`, which is itself a
+    # GraphQL call), the mutation never has a chance to run. Unlike #3763
+    # (a permanent repo-level setting), this is a TRANSIENT environmental
+    # condition — REST (used by `forge_get_pr_nocache`, `forge_get_check_runs`,
+    # `forge_get_required_status_check_contexts`, and the synchronous merge
+    # itself) has a separate quota and typically still has headroom. It
+    # matches NEITHER the "is in clean status" NOR the "is in unstable status"
+    # grep below, so before this fix it fell through to the generic terminal
+    # error even when a plain synchronous REST merge would have succeeded
+    # immediately (the observed failure: `could not resolve repository NWO`
+    # under GraphQL quota exhaustion, 0/5000 remaining while REST had ~4000
+    # left).
+    #
+    # As with #3763, recheck mergeability first (immediate merge if already
+    # mergeable). If not yet mergeable (checks still running / `.mergeable`
+    # not yet computed), degrade to the same #3820 wait-for-checks-then-merge
+    # path used for repo-level auto-merge-disabled — its helpers are REST-only
+    # and do not depend on the exhausted GraphQL quota. Do NOT re-attempt the
+    # native/shell auto-merge mutation itself; it is the same GraphQL call and
+    # will fail identically.
+    if echo "$AUTO_MERGE_OUTPUT" | grep -Eq "API rate limit|rate limit exceeded|RATE_LIMITED|was submitted too quickly|could not resolve repository NWO"; then
+      info "PR #$PR_NUMBER: auto-merge enablement unavailable (GraphQL rate limit) — degrading to immediate/wait merge"
+      _RLF_RECHECK_JSON="$(forge_get_pr_nocache "$REPO_NWO" "$PR_NUMBER" "$GH" 2>/dev/null || echo '{}')"
+      _RLF_MERGEABLE="$(echo "$_RLF_RECHECK_JSON" | jq -r '.mergeable // empty')"
+      unset _RLF_RECHECK_JSON 2>/dev/null || true
+      if [[ "$_RLF_MERGEABLE" == "true" ]]; then
+        unset _RLF_MERGEABLE 2>/dev/null || true
+        AUTO_MERGE=false      # let the synchronous-merge block below run
+        AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
+        break
+      fi
+      unset _RLF_MERGEABLE 2>/dev/null || true
+      # Not yet mergeable — reuse the #3820 REST-only wait path. It either
+      # returns 0 (safe to proceed to the synchronous merge) or error()s out
+      # terminally (a required check genuinely failed, or the wait timed out).
+      _wait_for_checks_then_sync_merge
+      AUTO_MERGE=false      # let the synchronous-merge block below run
+      AUTO_MERGE_OK=true    # bypass the post-loop "after N attempts" guard
+      break
     fi
 
     # PR is already CLEAN — GitHub's enablePullRequestAutoMerge mutation rejects
@@ -1458,6 +1863,16 @@ _find_worktree_by_branch() {
 # behaviour: Git's own "not fully merged" safety net, which keeps the branch
 # and reports it rather than force-deleting.
 #
+# Primary-checkout auto-cleanup (#5015): when the branch turns out to be
+# checked out in the repo's PRIMARY working copy rather than a removable
+# worktree, and the tip-matches-head safety check above already held, and
+# the primary checkout's working tree is clean with no stash entries (see
+# the auto-cleanup block below for the exact gate), this checks out the
+# default branch there and force-deletes the now-unreferenced branch
+# instead of just printing manual instructions. Opt out with
+# --no-cleanup-primary (CLEANUP_PRIMARY_CHECKOUT=false) if silently moving
+# HEAD in the operator's primary checkout is unwanted.
+#
 # Never fails the cleanup pipeline — always returns 0, warns on errors.
 _maybe_delete_local_branch() {
   local branch="$1"
@@ -1510,6 +1925,37 @@ _maybe_delete_local_branch() {
     checkout_loc="$(_find_worktree_by_branch "$branch")"
     if [[ -n "$checkout_loc" ]] && _is_primary_worktree_path "$checkout_loc"; then
       local default_label="${DEFAULT_BRANCH_NAME:-<default-branch>}"
+
+      # Auto-cleanup (#5015): the two-step remediation below (checkout the
+      # default branch, then force-delete) is exactly what this script
+      # already knows is safe to do itself whenever ALL of the following
+      # hold — do it instead of just printing instructions:
+      #   1. Not opted out via --no-cleanup-primary / CLEANUP_PRIMARY_CHECKOUT.
+      #   2. The default branch actually resolved (never silently guess one).
+      #   3. delete_flag == "-D" — the tip-matches-merged-head-SHA safety
+      #      check above already passed, so every commit on $branch is part
+      #      of the merged PR; nothing is lost by deleting it.
+      #   4. The primary checkout's working tree is clean (no uncommitted
+      #      changes, no staged changes) AND has no stash entries — checked
+      #      HERE, immediately before the mutating `checkout`, not cached
+      #      earlier, to avoid a TOCTOU gap against a concurrent process
+      #      working in the same checkout.
+      # A dirty tree, a present stash, an opt-out, or a tip mismatch all fall
+      # straight through to the manual two-step instructions unchanged.
+      if [[ "${CLEANUP_PRIMARY_CHECKOUT:-true}" == "true" ]] && \
+         [[ -n "$DEFAULT_BRANCH_NAME" ]] && \
+         [[ "$delete_flag" == "-D" ]] && \
+         [[ -z "$(git -C "$checkout_loc" status --porcelain 2>/dev/null)" ]] && \
+         [[ -z "$(git -C "$checkout_loc" stash list 2>/dev/null)" ]]; then
+        if git -C "$checkout_loc" checkout -q "$DEFAULT_BRANCH_NAME" 2>/dev/null && \
+           git -C "$checkout_loc" branch -D "$branch" >/dev/null 2>&1; then
+          success "Local branch '$branch' deleted$safety_note"
+          info "Primary checkout ($checkout_loc) was on '$branch' — automatically switched to '$DEFAULT_BRANCH_NAME' to free it up for deletion"
+          return 0
+        fi
+        warning "Attempted to auto-clean up '$branch' in the primary checkout ($checkout_loc) but the checkout or delete failed — falling back to manual instructions"
+      fi
+
       warning "Could not delete local branch '$branch' — it is checked out in the primary repository checkout ($checkout_loc)."
       warning "To clean it up: git -C '$checkout_loc' checkout $default_label && git -C '$checkout_loc' branch -D $branch"
     else
@@ -1580,6 +2026,47 @@ _remove_loom_worktree() {
   if [[ "$current_dir" == "$worktree_real"* ]]; then
     in_worktree=true
     cd "$REPO_ROOT"
+  fi
+  # Data-loss guard (#5031): NEVER force-remove a worktree that still holds
+  # uncommitted work. Post-merge cleanup keys the worktree only by branch name
+  # (feature/issue-<N>) — the worktree.sh naming convention makes that name
+  # collide deterministically whenever two hosts/sessions independently claim
+  # the same issue number. When a *different*, still-live builder has that
+  # branch checked out with unsaved edits, the blanket `git worktree remove
+  # --force` below would silently destroy them (observed 2026-08-03 on #5001:
+  # a live sibling session lost its in-flight, never-committed edits). The
+  # neighbouring guards check only *identity/ownership* (primary-worktree #3710,
+  # .loom-managed sentinel), never *live content*, so none of them catch this.
+  # Refuse-and-warn instead: the merge itself already succeeded, so skipping
+  # cleanup is a safe no-op for the merge while the sibling's work survives on
+  # disk to be committed/pushed. The clean common case is unaffected — a
+  # worktree that already committed+pushed the merged PR reports no changes, and
+  # Loom's own gitignored runtime markers (.loom-managed / .loom-in-use /
+  # .loom-checkpoint / .no-changes-needed / .snapshots/) are filtered out so a
+  # bare/stale checkout that surfaces them as untracked is still removed.
+  #
+  # Not to be re-conflated in triage (distinct root causes):
+  #   - #4463 (closed): same-HOST duplicate dispatch — fixed lock *ownership* so
+  #     a live sweep's lock is not stolen by a peer's reaper. That is about lock
+  #     records, not worktree/branch-name collision, and would not have caught
+  #     #5031 (the colliding worktree came from a separate host that never
+  #     touched this daemon's lock).
+  #   - #4146 (open, loom:operator-only): *measures* the cross-host collision
+  #     rate (observation only, behavior unchanged on collision by design). This
+  #     guard is the behavioral mitigation for the data-loss instance #4146 is
+  #     meant to eventually quantify.
+  local dirty
+  dirty="$(git -C "$worktree_path" status --porcelain 2>/dev/null \
+    | grep -vE '[ /]\.loom-managed$|[ /]\.loom-in-use$|[ /]\.loom-checkpoint$|[ /]\.no-changes-needed$|[ /]\.snapshots/' \
+    | grep -vE '^[[:space:]]*$' || true)"
+  if [[ -n "$dirty" ]]; then
+    local live_branch
+    live_branch="$(_worktree_branch_for "$worktree_path" 2>/dev/null || true)"
+    warning "Refusing to remove worktree at $worktree_path — it has uncommitted changes${live_branch:+ on branch '$live_branch'} (data-loss guard, #5031)."
+    warning "A different, still-live builder session likely shares this branch name (cross-host duplicate dispatch). Leaving it in place so that work is not lost."
+    warning "Remove it manually once those changes are saved/committed:"
+    echo "  git -C \"$REPO_ROOT\" worktree remove \"$worktree_path\" --force"
+    return 0
   fi
   info "Removing worktree: $worktree_path"
   if git -C "$REPO_ROOT" worktree remove "$worktree_path" --force 2>/dev/null; then

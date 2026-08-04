@@ -31,6 +31,7 @@ crypto-store/
 .loom-in-use
 .loom-checkpoint
 .loom-managed
+.no-changes-needed
 .loom/.daemon.pid
 .loom/.daemon.log
 .loom/daemon.sock
@@ -44,6 +45,7 @@ crypto-store/
 .loom/interventions/
 .loom/worktrees/
 .loom/worktrees-local/
+.claude/worktrees/
 .loom/state.json
 .loom/mcp-command.json
 .loom/activity.db
@@ -66,9 +68,13 @@ crypto-store/
 .loom/claude-config/
 .loom/tokens/
 .loom/accounts.env
+.loom/account-health.json
+.loom/account-health.lock
 .loom/CANARY
 .loom/*.log
 .loom/*.sock
+.loom/*.tmp
+.loom/*.bak
 .loom/logs/
 # <<< loom-managed <<<
 

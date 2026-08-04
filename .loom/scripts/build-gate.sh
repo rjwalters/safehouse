@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build-gate.sh - buildGate.command for this repo: fast build+test backstop
-# across Rust, Python, and bash. Runs in the worktree; exits non-zero on the
-# first failing stage (set -e) so buildGate.command's single exit code is
+# across Rust and bash. Runs in the worktree; exits non-zero on the first
+# failing stage (set -e) so buildGate.command's single exit code is
 # meaningful. See .loom/docs/build-gate.md.
 #
 # Scope decisions (issue #3749):
@@ -17,12 +17,23 @@
 #     `cargo test --workspace`, so the integration targets are covered exactly
 #     where their environment is guaranteed. See "Local gate vs. CI" in
 #     .loom/docs/build-gate.md.
-#   - loom-tools pytest runs via `uv run` so the package is importable from
-#     the project venv; scoped to exclude the live-network e2e suite
-#     (tests/integration) and the known slow real-time bypass-poll integration
-#     test file (already stubbed in-tree, but excluded here to keep the gate
-#     fast and stable).
+#   - The gate is ZERO-PYTHON as of epic #4081 Phase 4 (#4557). It used to run
+#     `cd loom-tools && uv run pytest tests/` (full tier) and
+#     `uv run python -c "import loom_tools"` (fast tier); the Python package was
+#     retired, so both stages would now fail against a deleted path. The
+#     package's last Python residue, the opt-in `loom-search` carve-out, was
+#     itself retired in #4970 (per the operator's RETIRE decision on #4608) —
+#     there is now no Python anywhere in the repo, load-bearing or otherwise,
+#     and no Python-conditional stage left to run.
 #   - bash scripts/test-installer.sh runs the 131-case installer suite.
+#   - bash scripts/test-changelog.sh runs scripts/changelog.sh's unit suite
+#     (#5196) against a disposable scratch repo (CHANGELOG_REPO_ROOT) -- no
+#     network, no dependency on this repo's own history, sub-second.
+#   - bash scripts/test-install-local-mode.sh (#5276) covers install-loom.sh
+#     --local/--gitignore mode -- no daemon build, no network, sub-second.
+#   - bash scripts/test-migrate-consumer.sh (#5276) covers scripts/install/
+#     migrate-consumer.sh (Epic #3835 Phase 6) against throwaway git fixtures
+#     -- no network, no real daemon, sub-second.
 #   - mcp-loom (TypeScript) is intentionally EXCLUDED: it needs npm install/ci
 #     in a fresh worktree (no guaranteed warm node_modules), which adds
 #     unpredictable latency to a gate that also runs once per PR. CI still
@@ -82,20 +93,81 @@ if [[ -z "${LOOM_BUILD_GATE_NICED:-}" \
   exec nice -n "${_gate_niceness}" "$0" "$@"
 fi
 
+# Machine-wide build slot (#4512).
+#
+# #4512 removed the CPU-headroom term from the daemon's admission formula (it
+# priced every sweep as a build and throttled a 95%-idle host to 2 concurrent
+# sweeps) and moved the protection HERE, to the stage that actually burns the
+# cores. Every invocation of this gate — the daemon's main-health gate, and each
+# sweep's post-builder quality gate in its own worktree — takes one machine-wide
+# slot before compiling, so N sweeps can run while at most LOOM_BUILD_SLOTS of
+# them build. Without this, deleting the admission-time CPU term would leave
+# nothing between N concurrent `cargo test --workspace` runs and the host.
+#
+# The lease NEVER blocks indefinitely and NEVER fails: it waits at most
+# LOOM_BUILD_SLOT_WAIT_SECS (default 300) and then degrades open, so a wedged or
+# crashed holder costs one build's worth of serialization, never this gate's
+# liveness. LOOM_BUILD_SLOTS=0 opts out entirely. When the daemon already holds
+# a slot around this command it exports LOOM_BUILD_SLOT_HELD=1 and the acquire
+# below is a re-entrant no-op rather than a wait on our own parent's slot.
+_build_slot_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/build-slot.sh"
+if [[ -f "$_build_slot_lib" ]]; then
+  # shellcheck source=lib/build-slot.sh
+  source "$_build_slot_lib"
+  trap loom_build_slot_release EXIT
+  loom_build_slot_acquire "build-gate(${LOOM_BUILD_GATE_TIER:-full})"
+else
+  echo "[build-gate] note: lib/build-slot.sh not found — running unserialized (#4512)" >&2
+fi
+
 cd "$(git rev-parse --show-toplevel)"
+
+# Tiered gate mode (#4259). LOOM_BUILD_GATE_TIER selects the stage set:
+#
+#   - unset / "full" (the DEFAULT): the full three-stage suite below. CI parity,
+#     manual invocations, and the per-builder post-builder quality gate are all
+#     byte-for-byte unchanged when the variable is absent.
+#   - "fast": a cheap, bounded compile+smoke subset. The daemon's main-health
+#     gate selects this tier (by setting LOOM_BUILD_GATE_TIER=fast) when the host
+#     is saturated past the max-defer bound and the full suite would otherwise
+#     time out under concurrent-sweep contention (the #4020/#4084 recurrence).
+#
+# A fast-tier GREEN is NOT equivalent to a full-suite GREEN: it verifies only the
+# compile/startup breakage class (#3647 step-8 — a `cargo build --workspace` catch)
+# plus a daemon-binary startup smoke, NOT the Rust unit tests or the installer
+# suite. See .loom/docs/build-gate.md "Tiered gate (#4259)".
+_gate_tier="${LOOM_BUILD_GATE_TIER:-full}"
+if [[ "${_gate_tier}" == "fast" ]]; then
+  echo "[build-gate] FAST tier (compile + smoke only — NOT a full-suite verdict, #4259)"
+  echo "[build-gate] cargo build --workspace --lib --bins (compile check — catches #3647 step-8-class breakage)"
+  cargo build --workspace --lib --bins
+  # Startup smoke. This slot used to hold `cd loom-tools && uv run python -c
+  # "import loom_tools"` — a Python-importability check that became a hard
+  # failure the moment epic #4081 Phase 4 (#4557) deleted the package. The
+  # like-for-like replacement is running the binary the gate just built: it
+  # catches the same "compiles but won't start" class (a panic in a static
+  # initializer, a broken clap command tree, a missing dynamic dependency) with
+  # no Python toolchain in the picture. `--version` is chosen deliberately: it
+  # touches no repo state, no forge, and no daemon socket.
+  echo "[build-gate] loom-daemon startup smoke (cargo run -- --version)"
+  cargo run --quiet --package loom-daemon --bin loom-daemon -- --version
+  echo "[build-gate] fast tier passed (compile + startup smoke)"
+  exit 0
+fi
 
 echo "[build-gate] cargo test --lib --bins (workspace unit tests; host-dependent integration targets are CI-only, #3985)"
 cargo test --workspace --lib --bins
 
-echo "[build-gate] loom-tools pytest (scoped, excludes network e2e + known slow poll test)"
-(
-  cd loom-tools
-  uv run pytest tests/ -q \
-    --ignore=tests/integration \
-    --ignore=tests/tokens/test_agent_spawn_integration.py
-)
-
 echo "[build-gate] bash installer suite"
 bash scripts/test-installer.sh
+
+echo "[build-gate] bash changelog generator suite"
+bash scripts/test-changelog.sh
+
+echo "[build-gate] bash install --local/--gitignore mode suite"
+bash scripts/test-install-local-mode.sh
+
+echo "[build-gate] bash migrate-consumer suite"
+bash scripts/test-migrate-consumer.sh
 
 echo "[build-gate] all stages passed"
