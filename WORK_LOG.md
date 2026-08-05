@@ -3,6 +3,10 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-08-05
+
+- **PR #62**: docs: Guide document maintenance update
+
 ### 2026-07-31
 
 - **PR #61**: fix(safehoused): bound per-persona mailbox growth with GC and ephemeral skip
