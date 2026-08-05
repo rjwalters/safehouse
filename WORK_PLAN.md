@@ -19,7 +19,7 @@ the Guide triage agent. Regenerated whenever label state changes.
 
 ## Proposed
 
-(none)
+- **#24**: Retire the Studio rollback backup once the EC2 homeserver is proven stable *(curated)*
 
 ## Epics
 
