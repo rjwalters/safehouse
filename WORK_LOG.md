@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-06
 
+- **Issue #85** (closed): safehoused cannot distinguish 'room is quiet' from 'cut off' — expose last_event_received_at over the RPC socket
+- **PR #87**: feat: expose sync liveness/staleness over the RPC socket
 - **Issue #82** (closed): Guide role docs-maintenance commits missing --signoff again (regressed by fa2751d)
 - **PR #83**: fix(loom): re-apply --signoff to Guide's docs-maintenance commit
 - **Issue #79** (closed): safehoused wedges silently on a hung Matrix sync — 11h pulse outage, launchd cannot detect it
