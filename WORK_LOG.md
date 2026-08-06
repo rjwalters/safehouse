@@ -5,6 +5,10 @@ triage agent. Newest first.
 
 ### 2026-08-06
 
+- **PR #74**: docs: Guide document maintenance update
+- **Issue #72** (closed): Guide's docs-maintenance PR creates a self-referential churn loop with no fixed point
+- **PR #73**: fix(loom): sign off Guide role's docs-maintenance commit
+- **Issue #71** (closed): Guide role docs-maintenance commits fail the DCO sign-off check
 - **PR #70**: docs: Guide document maintenance update
 - **PR #69**: docs: Guide document maintenance update
 - **PR #67**: docs: Guide document maintenance update
