@@ -19,6 +19,7 @@ the Guide triage agent. Regenerated whenever label state changes.
 ## Proposed
 
 - **#24**: Retire the Studio rollback backup once the EC2 homeserver is proven stable *(curated)*
+- **#76**: Guide docs-maintenance PR #75 regressed the #72 self-referential WORK_LOG fix *(curated)*
 
 ## Epics
 
