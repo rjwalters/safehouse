@@ -1355,6 +1355,24 @@ create_docs_pr() {
     return
   fi
 
+  # #76 BUG, DO NOT REINTRODUCE: GUIDE_DOCS_PR_EXCLUDE (Step 2) only filters
+  # update_work_log()'s OWN `new_prs` query. PR #75 proved that filter does not
+  # compose with every code path that can add a line to WORK_LOG.md — an agent
+  # reasoning "this PR couldn't log itself last tick, I'll add it now" can
+  # hand-stage an excluded entry and bypass the generator entirely. This is the
+  # mechanical backstop: inspect the FINAL STAGED diff (not the generator's
+  # internal output), re-verify every newly-added `- **PR #N**: ...` line's
+  # real headRefName/title via `gh pr view` (the rendered line only carries
+  # title text, not the branch name the exclusion also matches on), and abort
+  # — no commit, no push, no PR — if any staged entry matches
+  # GUIDE_DOCS_PR_EXCLUDE. Fails closed if a PR can't be re-verified.
+  if ! ./.loom/scripts/check-work-log-diff.sh "$DOCS_WT" "$GUIDE_DOCS_PR_EXCLUDE"; then
+    echo "ABORT: staged WORK_LOG.md diff contains an excluded PR entry (see check-work-log-diff.sh output above)."
+    echo "Not committing, not pushing, not creating a PR."
+    git -C "$DOCS_WT" reset -- WORK_LOG.md WORK_PLAN.md README.md
+    return
+  fi
+
   # Commit and push
   git -C "$DOCS_WT" commit -m "docs: update WORK_LOG, WORK_PLAN, and README
 
@@ -1409,6 +1427,9 @@ Document Maintenance Phase
   ├─ Update "$DOCS_WT/WORK_PLAN.md" (regenerate if labels changed)
   ├─ Check "$DOCS_WT/README.md" staleness (only if architecture changed)
   ├─ If any changes:
+  │    ├─ Stage, then run check-work-log-diff.sh against the FINAL staged
+  │    │    WORK_LOG.md diff — abort (no commit/push/PR) on any excluded
+  │    │    entry however it got staged (see the #76 note in Step 5)
   │    ├─ Commit all document changes (git -C "$DOCS_WT")
   │    ├─ Push and create PR with loom:review-requested
   │    └─ (committed WORK_LOG.md / WORK_PLAN.md ARE the durable state)
@@ -1433,6 +1454,13 @@ Document Maintenance Phase
   `docs: Guide document maintenance update` title. Without that exclusion the
   phase is self-perpetuating: its own merged PR is "new content" for the next
   tick, so merging PR N always justifies PR N+1 and the loop never terminates
+- **The exclusion is also enforced mechanically on the final staged diff**
+  (#76, `.loom/scripts/check-work-log-diff.sh`) — `GUIDE_DOCS_PR_EXCLUDE`
+  above only filters `update_work_log()`'s own query; a hand-staged
+  `WORK_LOG.md` line for an excluded PR (any code path, not just that query)
+  still aborts the commit, since the check re-verifies every staged
+  `- **PR #N**` line's real headRefName/title via `gh pr view` before
+  `create_docs_pr()` is allowed to commit
 - WORK_PLAN is only regenerated when label state actually changes — which
   requires `render_plan_body`'s output and the committed marker region to be
   comparable byte-for-byte (see the #5413 bug note in Step 3)
