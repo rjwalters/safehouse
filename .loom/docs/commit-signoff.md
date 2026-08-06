@@ -11,13 +11,6 @@ DCO-requiring repo will fail those PRs on the first Judge pass unless the roles
 sign off. This page documents the opt-in knob that makes them do so
 deterministically.
 
-The Guide role also authors a commit directly — the bundled docs-maintenance
-commit created by `create_docs_pr()` (`.loom/roles/guide.md`). Guide has
-exactly one commit path, so instead of reading the `commit.signoff` knob it
-applies `--signoff` unconditionally on that commit; the guarantee below still
-holds for Guide-authored PRs, just via a simpler (always-on) mechanism than
-the knob + heuristic described for Builder/Doctor.
-
 ## The knob
 
 Add to the repo's `.loom/config.json`:
