@@ -14,12 +14,15 @@
 //!
 //! ## Operator CLI (see also README "Scripting the socket")
 //!
-//! `safehouse-mcp read|send|check|list-rooms` runs one op against the
+//! `safehouse-mcp read|send|check|list-rooms|status` runs one op against the
 //! daemon and prints the JSON reply — no MCP client, no hand-rolled
 //! envelope-v1 socket client required. `check` defaults to **peek** (never
 //! advances a persona's mailbox cursor); pass `--consume` to advance it
-//! explicitly. Running with no arguments (or an argument this dispatcher
-//! doesn't recognize as a subcommand) preserves the original stdio-MCP-server
+//! explicitly. `status` (#85) is the liveness/staleness one-liner —
+//! `last_event_received`/`last_sync_completed`/connection/retry state — for
+//! telling "healthy and idle" apart from "cut off" without reading logs.
+//! Running with no arguments (or an argument this dispatcher doesn't
+//! recognize as a subcommand) preserves the original stdio-MCP-server
 //! behavior exactly.
 
 use std::{
@@ -163,6 +166,10 @@ fn print_usage(out: &mut impl Write) {
         "  safehouse-mcp check [--limit N] [--consume]   # defaults to peek: never advances the cursor"
     );
     let _ = writeln!(out, "  safehouse-mcp list-rooms");
+    let _ = writeln!(
+        out,
+        "  safehouse-mcp status   # last_event_received/last_sync_completed/retry state — a one-line liveness check"
+    );
 }
 
 /// Builds the daemon op JSON for a CLI subcommand. Returns `Ok(None)` when
@@ -175,6 +182,7 @@ fn build_cli_op(sub: &str, args: &[String]) -> Result<Option<Value>> {
         "send" => build_send_op(args)?,
         "check" => build_check_op(args)?,
         "list-rooms" => build_list_rooms_op(args)?,
+        "status" => build_status_op(args)?,
         _ => return Ok(None),
     };
     Ok(Some(op))
@@ -277,6 +285,18 @@ fn build_list_rooms_op(args: &[String]) -> Result<Value> {
         bail!("list-rooms: unknown argument {other:?}");
     }
     Ok(json!({"op": "list_rooms"}))
+}
+
+/// #85 — the daemon's liveness/staleness one-liner: `last_event_received`
+/// vs. `last_sync_completed` (are they diverging?), connection state, and any
+/// in-progress retry/backoff attempt, so diagnosing "is this cut off" doesn't
+/// require reading a multi-MB log and running `lsof`. Takes no flags, same
+/// shape as `list-rooms`.
+fn build_status_op(args: &[String]) -> Result<Value> {
+    if let Some(other) = args.first() {
+        bail!("status: unknown argument {other:?}");
+    }
+    Ok(json!({"op": "status"}))
 }
 
 /// Reads the value for `flag` at `args[*i]`, advancing `*i` past both.
@@ -620,6 +640,14 @@ mod tests {
         assert!(build_list_rooms_op(&args(&["--room", "x"])).is_err());
     }
 
+    // ---- `status` subcommand (#85) -----------------------------------------
+
+    #[test]
+    fn status_takes_no_arguments() {
+        assert_eq!(build_status_op(&[]).unwrap(), json!({"op": "status"}));
+        assert!(build_status_op(&args(&["--bogus"])).is_err());
+    }
+
     #[test]
     fn build_cli_op_dispatches_by_subcommand() {
         assert_eq!(
@@ -631,6 +659,10 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             json!({"op": "read", "room": "x"})
+        );
+        assert_eq!(
+            build_cli_op("status", &[]).unwrap().unwrap(),
+            json!({"op": "status"})
         );
     }
 }

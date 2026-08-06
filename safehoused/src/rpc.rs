@@ -11,7 +11,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -60,6 +60,36 @@ pub struct Registry {
     /// Delivery to a live connection above is a low-latency convenience; the
     /// mailbox is what makes receipt independent of being connected at all.
     mailbox: Mailbox,
+    /// #85 — liveness/staleness observability, exposed via the `status` RPC
+    /// op. `Instant`, not wall-clock time: the daemon only ever reports "how
+    /// long ago", never an absolute timestamp, which sidesteps clock-skew
+    /// concerns and is what an operator diagnosing "is this cut off" actually
+    /// wants. Plain `std::sync::Mutex`, not the `tokio::sync::Mutex` used
+    /// elsewhere in this struct — every critical section here is a single
+    /// field read/write with no `.await` inside it, so a blocking mutex adds
+    /// no async-runtime risk and keeps the call sites (an event handler hot
+    /// path, a per-sync-response callback) synchronous.
+    last_event_received_at: std::sync::Mutex<Option<Instant>>,
+    /// The instant the most recently *completed* sync cycle finished (#85) —
+    /// tracked separately from `last_event_received_at` so "the room is
+    /// quiet" (events stopped, sync still completing) and "sync is not
+    /// returning" (nothing completing at all) are distinguishable from each
+    /// other, not just from healthy.
+    last_sync_completed_at: std::sync::Mutex<Option<Instant>>,
+    /// The in-progress sync retry/backoff attempt, if any (#85) — mirrors the
+    /// existing `"sync error (attempt N), retrying in Ms"` log line
+    /// (`main.rs`'s `retry_sync_attempts`). Cleared back to `None` the moment
+    /// a sync cycle completes successfully, so `status`'s `connected` field
+    /// reflects live reality, not a stale in-backoff snapshot.
+    retry_state: std::sync::Mutex<Option<RetryState>>,
+}
+
+/// A snapshot of an in-progress sync retry/backoff cycle (#85). See
+/// `Registry::retry_state`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryState {
+    pub attempt: u32,
+    pub backoff_secs: u64,
 }
 
 /// In-memory thread bookkeeping. All state here is derived from observed
@@ -145,6 +175,60 @@ impl Registry {
             surfaced_unsupported: Mutex::new(HashSet::new()),
             threads: ThreadState::default(),
             mailbox,
+            last_event_received_at: std::sync::Mutex::new(None),
+            last_sync_completed_at: std::sync::Mutex::new(None),
+            retry_state: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Record that a room event (message, invite, redaction, or
+    /// undecryptable-event notice) was just received over sync (#85). Called
+    /// from every relevant event handler in `main.rs` — not only
+    /// `on_message` — since narration chatter, not only agent completions, is
+    /// the sensitive liveness signal the issue calls out.
+    pub fn record_event_received(&self) {
+        *self.last_event_received_at.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Record that a sync cycle just completed successfully (#85), and clear
+    /// any in-progress retry/backoff state — a completed cycle is definitive
+    /// proof the connection is no longer in backoff.
+    pub fn record_sync_completed(&self) {
+        *self.last_sync_completed_at.lock().unwrap() = Some(Instant::now());
+        *self.retry_state.lock().unwrap() = None;
+    }
+
+    /// Record that the sync loop is about to sleep before retry attempt
+    /// `attempt`, backing off for `backoff_secs` (#85) — called alongside the
+    /// existing `"sync error (attempt N), retrying in Ms"` log line in
+    /// `main.rs::retry_sync_attempts`, so the two never drift apart.
+    pub fn record_retry_attempt(&self, attempt: u32, backoff_secs: u64) {
+        *self.retry_state.lock().unwrap() = Some(RetryState {
+            attempt,
+            backoff_secs,
+        });
+    }
+
+    /// The `status` RPC op's payload (#85): how long ago the last room event
+    /// and last completed sync cycle were, plus the in-progress retry attempt
+    /// if the sync loop is currently backing off. Deliberately reports
+    /// elapsed seconds, never an absolute timestamp — an operator
+    /// disambiguating "healthy and idle" from "cut off" wants "how long ago",
+    /// which sidesteps clock-skew entirely. A field that has never fired
+    /// (e.g. no sync has completed yet) is `null`, not a bogus zero.
+    pub fn status(&self) -> Value {
+        let now = Instant::now();
+        let secs_ago = |at: Option<Instant>| at.map(|t| now.saturating_duration_since(t).as_secs());
+        let last_event = secs_ago(*self.last_event_received_at.lock().unwrap());
+        let last_sync = secs_ago(*self.last_sync_completed_at.lock().unwrap());
+        let retry = *self.retry_state.lock().unwrap();
+        json!({
+            "ok": true,
+            "connected": retry.is_none(),
+            "last_event_received_secs_ago": last_event,
+            "last_sync_completed_secs_ago": last_sync,
+            "retry_attempt": retry.map(|r| r.attempt),
+            "retry_backoff_secs": retry.map(|r| r.backoff_secs),
         })
     }
 
@@ -306,6 +390,15 @@ async fn handle_conn(stream: UnixStream, client: Client, registry: Arc<Registry>
                         }),
                         None => json!({"ok": false, "error": "hello requires persona"}),
                     }
+                } else if op == "status" {
+                    // #85: deliberately queryable *before* `hello` — unlike
+                    // every other op, which requires an authenticated persona
+                    // (gated below). A wedged daemon is exactly the scenario
+                    // where a lower-friction healthcheck matters most, and
+                    // `status` carries no persona-specific data to protect —
+                    // it's daemon-wide liveness, safe for any local caller
+                    // that can open the unix socket at all.
+                    registry.status()
                 } else if persona.is_none() {
                     json!({"ok": false, "error": "hello first"})
                 } else {
@@ -969,6 +1062,79 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("requires persona"));
+    }
+
+    // ---- `status` op (#85) — liveness/staleness observability -------------
+
+    #[tokio::test]
+    async fn status_is_queryable_before_hello() {
+        // Deliberate design choice: unlike every other op, `status` needs no
+        // authenticated persona — a wedged daemon reachable enough to accept
+        // a connection but never getting to persona auth is exactly the case
+        // liveness checking needs to survive.
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(&mut write, json!({"op": "status"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn status_reports_null_fields_before_anything_has_happened() {
+        // Edge case from the issue's test plan: a daemon that has never
+        // completed a sync (or seen an event) reports absent fields, not a
+        // bogus zero timestamp.
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(&mut write, json!({"op": "status"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["connected"], true);
+        assert!(reply["last_event_received_secs_ago"].is_null());
+        assert!(reply["last_sync_completed_secs_ago"].is_null());
+        assert!(reply["retry_attempt"].is_null());
+        assert!(reply["retry_backoff_secs"].is_null());
+    }
+
+    #[tokio::test]
+    async fn status_reflects_recorded_event_and_sync_timestamps() {
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        registry.record_event_received();
+        registry.record_sync_completed();
+
+        send(&mut write, json!({"op": "status"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["connected"], true);
+        assert_eq!(reply["last_event_received_secs_ago"], 0);
+        assert_eq!(reply["last_sync_completed_secs_ago"], 0);
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_an_in_progress_retry_attempt() {
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        registry.record_retry_attempt(3, 8);
+
+        send(&mut write, json!({"op": "status"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(
+            reply["connected"], false,
+            "an in-progress retry means not currently connected"
+        );
+        assert_eq!(reply["retry_attempt"], 3);
+        assert_eq!(reply["retry_backoff_secs"], 8);
+    }
+
+    #[tokio::test]
+    async fn status_a_completed_sync_clears_a_stale_retry_state() {
+        // A sync succeeding after a retry must clear the retry snapshot —
+        // otherwise `status` would keep reporting a stale in-backoff state
+        // after the connection actually recovered.
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        registry.record_retry_attempt(2, 4);
+        registry.record_sync_completed();
+
+        send(&mut write, json!({"op": "status"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["connected"], true);
+        assert!(reply["retry_attempt"].is_null());
+        assert!(reply["retry_backoff_secs"].is_null());
     }
 
     #[tokio::test]

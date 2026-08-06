@@ -177,6 +177,10 @@ async fn run() -> Result<()> {
     // no-wake §5.3 broadcast until some later event re-establishes the thread.
     replay_thread_history(&client, &registry).await;
 
+    // #85: cloned before `registry` moves into `rpc::serve` below — the sync
+    // loop needs its own handle to record `last_sync_completed_at` and any
+    // in-progress retry/backoff attempt.
+    let registry_for_sync = registry.clone();
     let rpc = tokio::spawn(rpc::serve(client.clone(), registry, socket_path.clone()));
 
     println!("safehoused: entering sync loop (sync v2); ctrl-c to stop");
@@ -187,7 +191,7 @@ async fn run() -> Result<()> {
     // bounded exponential backoff, reserving a fatal return for genuinely
     // unrecoverable errors (auth/config/unsupported endpoint). ctrl-c / SIGTERM
     // still cancel it mid-backoff via the select! below.
-    let sync = resilient_sync(&client);
+    let sync = resilient_sync(&client, &registry_for_sync);
     // SIGTERM is the routine supervised-stop signal (systemd `stop`, launchctl
     // `bootout`, bare `kill`), so it MUST reach the same clean-shutdown path as
     // ctrl-c below — otherwise the default termination action skips both the
@@ -303,6 +307,13 @@ async fn retry_sync_attempts<A, Fut, E, S, SFut>(
     classify: impl Fn(&E) -> SyncDisposition,
     describe: impl Fn(&E) -> String,
     mut sleep: S,
+    // #85: called with (attempt, backoff_secs) right alongside the
+    // "retrying in Ns" log line below, so `Registry::retry_state` (exposed
+    // over the `status` RPC op) never drifts from what the log already says.
+    // A plain sync closure — `Registry`'s bookkeeping methods are
+    // synchronous (std::sync::Mutex, no `.await` inside), so no extra
+    // `Future` plumbing is needed here the way `sleep` needs one.
+    mut on_retry: impl FnMut(u32, u64),
 ) -> std::result::Result<(), E>
 where
     A: FnMut() -> Fut,
@@ -332,6 +343,7 @@ where
                         "safehoused: sync error (attempt {consecutive}), retrying in {backoff}s: {}",
                         describe(&err)
                     );
+                    on_retry(consecutive, backoff);
                     sleep(backoff).await;
                 }
             },
@@ -344,12 +356,26 @@ where
 /// existing fatal-exit path still fires for those. Resuming after backoff just
 /// re-enters `client.sync`, which reuses the persisted sync token internally, so
 /// no bespoke checkpointing is needed.
-async fn resilient_sync(client: &Client) -> Result<()> {
+///
+/// #85: uses `sync_with_callback` (rather than plain `sync`) so
+/// `registry.record_sync_completed()` fires after every successfully-fetched
+/// sync response — the hook that makes `last_sync_completed_at` and the
+/// `status` op's `connected` field meaningful, not just the existing
+/// retry/backoff log line.
+async fn resilient_sync(client: &Client, registry: &Registry) -> Result<()> {
     retry_sync_attempts(
-        || client.sync(SyncSettings::default()),
+        || async {
+            client
+                .sync_with_callback(SyncSettings::default(), |_response| async {
+                    registry.record_sync_completed();
+                    matrix_sdk::LoopCtrl::Continue
+                })
+                .await
+        },
         classify_sync_error,
         |err| format!("{err:#}"),
         |secs| tokio::time::sleep(Duration::from_secs(secs)),
+        |attempt, backoff| registry.record_retry_attempt(attempt, backoff),
     )
     .await
     .map_err(|err| anyhow::Error::new(err).context("sync loop exited (unrecoverable)"))
@@ -613,7 +639,10 @@ async fn on_invite(
     room: Room,
     client: Client,
     Ctx(invite_allowlist): Ctx<Arc<Option<Vec<String>>>>,
+    Ctx(registry): Ctx<Arc<Registry>>,
 ) {
+    // #85: counts as liveness too — see `on_message`'s doc comment.
+    registry.record_event_received();
     let Some(own_user) = client.user_id() else {
         return;
     };
@@ -648,6 +677,10 @@ async fn on_message(
     Ctx(registry): Ctx<Arc<Registry>>,
     Ctx(egress): Ctx<EgressHandle>,
 ) {
+    // #85: any room event is evidence of life — narration chatter, not only
+    // completions, is the sensitive liveness signal (it's far more frequent),
+    // so this is recorded unconditionally, before any early return below.
+    registry.record_event_received();
     let own_event = Some(event.sender.as_ref()) == client.user_id();
     let content: Value = serde_json::from_str(raw.get())
         .ok()
@@ -794,7 +827,10 @@ async fn on_redaction(
     room: Room,
     raw: RawEvent,
     Ctx(egress): Ctx<EgressHandle>,
+    Ctx(registry): Ctx<Arc<Registry>>,
 ) {
+    // #85: counts as liveness too — see `on_message`'s doc comment.
+    registry.record_event_received();
     let Some(egress) = egress.as_ref() else {
         return;
     };
@@ -854,7 +890,16 @@ async fn surface_unsupported_version(room: &Room, client: &Client, sender: &str,
 
 /// An event that reaches this handler stayed encrypted after decryption was
 /// attempted. Surface it — silence is how key bugs go unnoticed.
-async fn on_undecryptable(event: OriginalSyncRoomEncryptedEvent, room: Room) {
+async fn on_undecryptable(
+    event: OriginalSyncRoomEncryptedEvent,
+    room: Room,
+    Ctx(registry): Ctx<Arc<Registry>>,
+) {
+    // #85: counts as liveness too — see `on_message`'s doc comment. Arguably
+    // the *most* important of the three non-`on_message` handlers to count:
+    // an undecryptable event is proof something is arriving on the wire even
+    // though it can't be read.
+    registry.record_event_received();
     eprintln!(
         "safehoused: UNDECRYPTABLE event {} from {} in {}",
         event.event_id,
@@ -1201,6 +1246,7 @@ mod sync_retry_tests {
         // Ok, never propagating an error (which would exit the daemon).
         let backoffs = RefCell::new(Vec::new());
         let attempts = RefCell::new(0u32);
+        let retries_seen: RefCell<Vec<(u32, u64)>> = RefCell::new(Vec::new());
         let result = retry_sync_attempts(
             || {
                 let n = {
@@ -1223,6 +1269,7 @@ mod sync_retry_tests {
                 backoffs.borrow_mut().push(secs);
                 std::future::ready(())
             },
+            |attempt, backoff| retries_seen.borrow_mut().push((attempt, backoff)),
         )
         .await;
 
@@ -1233,6 +1280,10 @@ mod sync_retry_tests {
             vec![2, 4, 8],
             "each retry backs off longer than the last"
         );
+        // #85: `on_retry` (the Registry-bookkeeping hook) must be called with
+        // exactly the same (attempt, backoff) pairs the log line reports —
+        // one call per retry, never per success.
+        assert_eq!(*retries_seen.borrow(), vec![(1, 2), (2, 4), (3, 8)]);
     }
 
     #[tokio::test]
@@ -1241,6 +1292,7 @@ mod sync_retry_tests {
         // non-recoverable (auth) error must propagate out so the daemon still
         // exits fatally for genuine failures — and must not waste a backoff.
         let backoffs = RefCell::new(Vec::new());
+        let retries_seen: RefCell<Vec<(u32, u64)>> = RefCell::new(Vec::new());
         let result = retry_sync_attempts(
             || {
                 std::future::ready(Err(FakeSyncError {
@@ -1254,6 +1306,7 @@ mod sync_retry_tests {
                 backoffs.borrow_mut().push(secs);
                 std::future::ready(())
             },
+            |attempt, backoff| retries_seen.borrow_mut().push((attempt, backoff)),
         )
         .await;
 
@@ -1267,6 +1320,10 @@ mod sync_retry_tests {
         assert!(
             backoffs.borrow().is_empty(),
             "a fatal error must exit immediately, never backing off"
+        );
+        assert!(
+            retries_seen.borrow().is_empty(),
+            "a fatal error must never invoke the retry-state hook"
         );
     }
 }

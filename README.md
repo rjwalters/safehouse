@@ -197,7 +197,18 @@ safehouse-mcp send --to '*' --body 'status?' --room fleet-ops
 safehouse-mcp check --limit 10                 # peek — never advances a cursor
 safehouse-mcp check --consume                  # advances the operator persona's own cursor
 safehouse-mcp list-rooms
+safehouse-mcp status                           # liveness one-liner — see below
 ```
+
+**Diagnosing "healthy and idle" vs. "cut off" (#85):** `safehouse-mcp status` reports
+`last_event_received_secs_ago` (any room event, including narration — the more sensitive signal),
+`last_sync_completed_secs_ago`, `connected`, and (only while a sync retry is in progress)
+`retry_attempt`/`retry_backoff_secs` — mirroring the daemon's own `"sync error (attempt N),
+retrying in Ms"` log line. A quiet-but-healthy daemon shows `last_sync_completed_secs_ago` staying
+low while `last_event_received_secs_ago` climbs (nothing to report, but still syncing); a cut-off
+daemon shows both climbing together with `connected: false` and a growing `retry_attempt`. Unlike
+every other op, `status` requires no `hello` — it's queryable even against a daemon stuck before
+persona auth, which is exactly the scenario a liveness check needs to survive.
 
 Run `safehouse-mcp --help` for the full flag list. With no subcommand (or on a bare TTY), the
 binary keeps its original behavior unchanged: a stdio MCP server for an MCP client to launch.
