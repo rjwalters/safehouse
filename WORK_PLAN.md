@@ -7,11 +7,10 @@ the Guide triage agent. Regenerated whenever label state changes.
 ## Urgent
 
 - **#22**: Upgrade tuwunel to v1.8.3 for MSC4108 QR login (Element X onboarding) — dependency resolved (tuwunel v1.8.3 shipped 2026-08-05), ready for operator execution; `loom:operator-only`
-- **#71**: Guide role docs-maintenance commits fail the DCO sign-off check — `create_docs_pr()` never applies `--signoff`, breaks every automated Guide docs PR until fixed
 
 ## Ready
 
-(none beyond the two urgent issues above — #22 and #71 are the only `loom:issue` items open)
+(none beyond the urgent issue above — #22 is the only `loom:issue` item open)
 
 ## Blocked
 
