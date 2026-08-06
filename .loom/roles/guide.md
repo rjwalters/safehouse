@@ -1211,7 +1211,11 @@ create_docs_pr() {
   fi
 
   # Commit and push
-  git commit -m "docs: update WORK_LOG, WORK_PLAN, and README
+  # Unconditional --signoff: Guide has exactly one commit path (this one),
+  # and this repo requires a DCO Signed-off-by trailer on every commit
+  # (see .loom/docs/commit-signoff.md). git commit --signoff is a no-op
+  # when a matching trailer is already present, so this is always safe.
+  git commit --signoff -m "docs: update WORK_LOG, WORK_PLAN, and README
 
 Automated document maintenance by Guide triage agent."
 
