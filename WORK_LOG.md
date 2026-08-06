@@ -3,8 +3,15 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-08-06
+
+- **PR #67**: docs: Guide document maintenance update
+
 ### 2026-08-05
 
+- **PR #66**: docs: Guide document maintenance update
+- **PR #65**: docs: Guide document maintenance update
+- **PR #64**: docs: Guide document maintenance update
 - **PR #63**: docs: update WORK_LOG and WORK_PLAN
 - **PR #62**: docs: Guide document maintenance update
 
