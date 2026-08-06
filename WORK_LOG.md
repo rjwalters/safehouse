@@ -5,6 +5,7 @@ triage agent. Newest first.
 
 ### 2026-08-06
 
+- **PR #69**: docs: Guide document maintenance update
 - **PR #67**: docs: Guide document maintenance update
 
 ### 2026-08-05
