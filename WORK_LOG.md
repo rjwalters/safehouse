@@ -5,6 +5,7 @@ triage agent. Newest first.
 
 ### 2026-08-06
 
+- **Issue #79** (closed): safehoused wedges silently on a hung Matrix sync — 11h pulse outage, launchd cannot detect it
 - **PR #78**: fix: block Guide docs-maintenance commits with excluded WORK_LOG entries
 - **Issue #76** (closed): Guide docs-maintenance PR #75 regressed the #72 self-referential WORK_LOG fix
 - **PR #74**: docs: Guide document maintenance update
