@@ -16,6 +16,12 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 - **#22**: Upgrade tuwunel to v1.8.3 for MSC4108 QR login (Element X onboarding)
 
+## Blocked
+
+Issues blocked on a dependency or human input (`loom:blocked`).
+
+- **#24**: Retire the Studio rollback backup once the EC2 homeserver is proven stable
+
 ## In Progress
 
 Issues currently being built (`loom:building`).
@@ -55,6 +61,7 @@ _None._
 |------|-------|
 | Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
+| Blocked (`loom:blocked`) | 1 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
