@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-06
 
+- **PR #78**: fix: block Guide docs-maintenance commits with excluded WORK_LOG entries
+- **Issue #76** (closed): Guide docs-maintenance PR #75 regressed the #72 self-referential WORK_LOG fix
 - **PR #74**: docs: Guide document maintenance update
 - **Issue #72** (closed): Guide's docs-maintenance PR creates a self-referential churn loop with no fixed point
 - **PR #73**: fix(loom): sign off Guide role's docs-maintenance commit

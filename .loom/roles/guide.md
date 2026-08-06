@@ -1210,10 +1210,12 @@ render_plan_body() {
   # Bullet count of a section body ("" -> 0), for the Backlog Balance table.
   count() { [ -z "$1" ] && printf '0' || printf '%s\n' "$1" | grep -c '^- '; }
 
-  local urgent ready building review approved curated proposals epics
+  local urgent ready blocked building review approved curated proposals epics
   urgent=$("$GH_READ" issue list --label "loom:urgent" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
   ready=$("$GH_READ" issue list --label "loom:issue" --state open --limit 200 --json number,title \
+    --jq '.[] | "- **#\(.number)**: \(.title)"')
+  blocked=$("$GH_READ" issue list --label "loom:blocked" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
   building=$("$GH_READ" issue list --label "loom:building" --state open --limit 200 --json number,title \
     --jq '.[] | "- **#\(.number)**: \(.title)"')
@@ -1236,6 +1238,8 @@ render_plan_body() {
   echo
   section "Ready" "Human-approved issues ready for implementation (\`loom:issue\`)." "$ready"
   echo
+  section "Blocked" "Issues blocked on a dependency or human input (\`loom:blocked\`)." "$blocked"
+  echo
   section "In Progress" "Issues currently being built (\`loom:building\`)." "$building"
   echo
   section "PRs Awaiting Review" "PRs waiting on Judge (\`loom:review-requested\`)." "$review"
@@ -1255,6 +1259,7 @@ render_plan_body() {
     '|------|-------|' \
     "| Urgent | $(count "$urgent") |" \
     "| Ready (\`loom:issue\`) | $(count "$ready") |" \
+    "| Blocked (\`loom:blocked\`) | $(count "$blocked") |" \
     "| In Progress (\`loom:building\`) | $(count "$building") |" \
     "| PRs awaiting review | $(count "$review") |" \
     "| Approved PRs awaiting merge | $(count "$approved") |" \
