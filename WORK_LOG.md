@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-06
 
+- **Issue #82** (closed): Guide role docs-maintenance commits missing --signoff again (regressed by fa2751d)
+- **PR #83**: fix(loom): re-apply --signoff to Guide's docs-maintenance commit
 - **Issue #79** (closed): safehoused wedges silently on a hung Matrix sync — 11h pulse outage, launchd cannot detect it
 - **PR #78**: fix: block Guide docs-maintenance commits with excluded WORK_LOG entries
 - **Issue #76** (closed): Guide docs-maintenance PR #75 regressed the #72 self-referential WORK_LOG fix
