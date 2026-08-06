@@ -1379,7 +1379,15 @@ create_docs_pr() {
   fi
 
   # Commit and push
-  git -C "$DOCS_WT" commit -m "docs: update WORK_LOG, WORK_PLAN, and README
+  #
+  # #82 BUG, DO NOT REINTRODUCE: this repo enforces a DCO sign-off check on
+  # every commit. Guide has exactly one commit path (this one), so an
+  # unconditional `--signoff` is a no-op when not required and load-bearing
+  # when it is. #71 fixed this once (PR #73); a subsequent template resync
+  # (`fa2751d`, "chore(loom): commit resynced installed surfaces") silently
+  # clobbered it because the fix lived only in the installed copy, not
+  # upstream. If you are editing this function, keep `--signoff` here.
+  git -C "$DOCS_WT" commit --signoff -m "docs: update WORK_LOG, WORK_PLAN, and README
 
 Automated document maintenance by Guide triage agent."
 
