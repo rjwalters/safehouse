@@ -33,7 +33,7 @@ Issues currently being built (`loom:building`).
 
 PRs waiting on Judge (`loom:review-requested`).
 
-_None._
+- **#87**: feat: expose sync liveness/staleness over the RPC socket (closes #85)
 
 ## Approved (Awaiting Merge)
 
@@ -65,7 +65,7 @@ _None._
 | Ready (`loom:issue`) | 1 |
 | Blocked (`loom:blocked`) | 1 |
 | In Progress (`loom:building`) | 1 |
-| PRs awaiting review | 0 |
+| PRs awaiting review | 1 |
 | Approved PRs awaiting merge | 0 |
 | Curated | 3 |
 | Architect / Hermit proposals | 0 |
