@@ -3,6 +3,11 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-08-07
+
+- **Issue #91** (closed): PreToolUse wiring bypasses the guard-destructive.sh dispatcher, contradicting its own design doc
+- **PR #92**: fix: wire PreToolUse Bash guard through the Loom dispatcher
+
 ### 2026-08-06
 
 - **Issue #85** (closed): safehoused cannot distinguish 'room is quiet' from 'cut off' — expose last_event_received_at over the RPC socket
