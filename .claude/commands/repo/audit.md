@@ -42,11 +42,22 @@ Run each of the following checks and compile results into a single report:
 ### 4. Gitignore Issues (see [[gitignore]])
 - Files that are ignored but probably shouldn't be
 - Build artifacts that aren't ignored but should be
-- Redundant or stale gitignore rules
+- Redundant or stale gitignore rules — but **not** `X` + `X/` pairs unless `X`
+  is verified to be a real, non-symlink directory (`[ -d "X" ] && [ ! -L "X" ]`);
+  see [[gitignore]] for the full check. A trailing slash never matches a
+  symlink, so wrongly deduping such a pair silently un-ignores one.
 
 ### 5. Branch & Worktree Hygiene (see [[branches]])
 - Local branches whose PRs are merged
 - Orphaned or stale worktrees
+
+### Out of scope: host posture (see [[host-optimize]])
+
+This is a repo-scoped audit. The **host** a machine presents to heavy build
+workloads — Gatekeeper scan churn, backup-agent interference, build-tree bloat,
+sudo/concurrency posture — is not checked here. For a build host, run
+[[host-optimize]] instead; unlike this read-only audit, that command applies its
+safe-tier fixes by default.
 
 ## Output Format
 
