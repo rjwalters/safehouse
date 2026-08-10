@@ -76,6 +76,12 @@ skill/command wikilinks, and nested CLAUDE.md paths. Fold its findings in the
 same way. Broken CLAUDE.md paths remain **critical** — they're the primary
 navigation paths for agents.
 
+That includes [[links]]' resolution rules, not just its finding list: where the
+repo declares an install-template mapping in `.repo/link-roots.json`, fold in
+the mapping table too and keep the "resolved via install mapping" annotation on
+individual links. A consolidated report that drops it turns a wrong mapping into
+a silent zero.
+
 ## Output Format
 
 One consolidated report, grouped by layer so it's clear which are mechanical
@@ -115,6 +121,31 @@ the default apply mode.
 
 Never rewrite prose wholesale to "improve" it — the job is accuracy, not a
 style pass. Fix the factual drift and leave the voice alone.
+
+### Verify after write
+
+Applying an edit is not proof it survived. A concurrent writer — another agent
+working in the same clone, a background `git stash` or `git checkout --`, a
+pre-commit hook, a Loom sweep quarantining the primary clone's working tree —
+can revert a file between the moment you fix it and the moment you report it,
+leaving this command claiming a fix that is no longer on disk.
+
+So immediately after applying each fix, and **before counting it as applied**,
+re-read the changed region of the file and confirm your specific edit is
+present. `git diff -- <path>` / `git status --porcelain -- <path>` is a cheap
+first pass, but only proves the path differs from HEAD — it cannot distinguish
+your edit from someone else's, so it must not be the sole check when the file
+may carry other uncommitted changes.
+
+This check is **unconditional** — run it whether or not you have any reason to
+suspect a concurrent writer. Detecting a daemon first would be racy (one can
+start right after the check), and in a repo with no concurrent writer the check
+always finds the edit still applied, so nothing about the reported output
+changes.
+
+If a fix is gone on re-check, report it on its own line as **reverted after
+apply — needs re-run**. Do not silently re-apply it, and do not count it in the
+fixed total — that total must only ever include edits confirmed still on disk.
 
 ## Principles
 
