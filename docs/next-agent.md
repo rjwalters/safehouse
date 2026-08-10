@@ -119,6 +119,15 @@ daemon auto-joins on its next sync, cold-start included. The acceptance policy i
 explicit and, optionally, restrictable: `invite_allowlist` in config (default `None`/unset —
 accept-any, unchanged) limits which senders' invites `on_invite` will join.
 
+**Forward-compatible envelope types (#95, D19).** An envelope `type` this build doesn't know is
+**degraded to `chat` and delivered**, on ingest *and* on an agent's own `send` — the send path used
+to refuse it, which is the one outcome that actually loses the message (`loom` shipped a `digest`
+type before any `safehoused` knew it, and the room silently stopped carrying that class of message
+while both sides reported the link healthy). `digest` is now a first-class type; the degrade is
+implemented once in `envelope::degrade_unknown_type` and warns once per unknown type per session;
+`hello`/`status` advertise `known_types` so a newer caller can spot the skew at handshake. Both
+changes are additive per §9 — no `v` bump.
+
 ### 5. ~~Per-agent mailbox + `safehouse_check` (D16/D17)~~ ✅ DONE 2026-07-26
 Per-persona durable mailbox in `safehoused` (`mailbox.rs`), populated from the same synced room
 timeline that drives live dispatch (`on_message`) — a broadcast (`to: "*"`) fans out to every

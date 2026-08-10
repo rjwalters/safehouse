@@ -3,11 +3,23 @@
 //! The daemon is the only writer of `from` (§6) and the only place rendering
 //! happens (§8). Agents never see Matrix event JSON; they see envelopes.
 
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const ENVELOPE_KEY: &str = "org.safehouse.envelope";
-pub const KNOWN_TYPES: [&str; 5] = ["chat", "task", "handoff", "ack", "completion"];
+/// Every `type` this daemon understands (§4). Additive — a new type does not
+/// bump `v` (§9), which is exactly why an unrecognized type must degrade to
+/// `chat` rather than be refused: see [`degrade_unknown_type`].
+///
+/// `digest` (#95) is a best-effort side-channel signal — periodic narration a
+/// sender emits whether or not anyone is listening. Like every other type the
+/// daemon files it into the mailbox unconditionally (D17) and takes no action
+/// on it (D16); its only type-specific behavior is the §8 header suffix and
+/// the advisory "suggested `wake`: no" classification in the protocol table.
+pub const KNOWN_TYPES: [&str; 6] = ["chat", "task", "handoff", "ack", "completion", "digest"];
 
 /// The one `meta.schema` value a `completion` envelope's `meta` must carry
 /// (envelope-v1.md §4a). Anything else is not `completion-v1` and is never
@@ -185,6 +197,51 @@ fn is_rfc3339(s: &str) -> bool {
     }
 }
 
+/// Unknown envelope `type`s already reported this session, so the §9 degrade
+/// is diagnosable without being a per-message log flood (#95). Process-global
+/// on purpose: skew is a property of the *pair of builds*, not of a room, a
+/// peer, or a connection — hearing about `"digest"` once tells the operator
+/// everything a thousand repeats would.
+static UNKNOWN_TYPES_SEEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Record `kind` as an unknown type seen this session; `true` the first time
+/// this process sees it, `false` for every repeat.
+///
+/// Never panics: a poisoned lock is recovered rather than propagated, since
+/// the worst case is warning about the same type twice — not a reason to take
+/// the daemon down mid-dispatch.
+pub fn note_unknown_type(kind: &str) -> bool {
+    let mut seen = UNKNOWN_TYPES_SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    seen.insert(kind.to_owned())
+}
+
+/// The §9 forward-compatibility rule, applied to `kind`: an unrecognized type
+/// is **degraded to `chat`, never rejected**. A new `type` is an additive
+/// change that does not bump `v`, so a peer (or a local agent) running a newer
+/// build can legitimately name a type this daemon has never heard of. Losing
+/// fidelity is the intended failure mode; losing the message is not.
+///
+/// Returns the type to actually use — `kind` itself when known, `"chat"`
+/// otherwise — and warns once per unknown type per session (`context` names
+/// the path that saw it, e.g. `"received"` / `"send"`) so version skew shows
+/// up in the log without drowning it.
+pub fn degrade_unknown_type<'a>(kind: &'a str, context: &str) -> &'a str {
+    if KNOWN_TYPES.contains(&kind) {
+        return kind;
+    }
+    if note_unknown_type(kind) {
+        eprintln!(
+            "safehoused: warning: unknown envelope type {kind:?} ({context}) \
+             — degrading to \"chat\" (v1 types: {KNOWN_TYPES:?}). \
+             This host is likely older than its peer; further {kind:?} \
+             envelopes are degraded silently."
+        );
+    }
+    "chat"
+}
+
 pub fn valid_persona(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -315,6 +372,16 @@ pub fn from_event_json(
         // best-effort parse. A well-formed v1 envelope returns here; anything
         // else falls through to human synthesis, preserving prior behavior.
         if let Ok(mut env) = serde_json::from_value::<Envelope>(raw.clone()) {
+            // §9: a `type` this build doesn't know is a version skew, not a
+            // protocol violation — degrade it to `chat` (#95) so the message
+            // still reaches the mailbox. `meta` goes with it: `meta` is only
+            // ever defined for `completion` (§4a), so whatever it carried
+            // belonged to the type just discarded and must not be handed
+            // downstream under `chat`.
+            if degrade_unknown_type(&env.kind, "received") != env.kind {
+                env.kind = "chat".to_owned();
+                env.meta = None;
+            }
             // §4a: a `completion` envelope whose `meta` is absent or fails
             // strict `completion-v1` validation is **degraded to `chat`** (the
             // §9 unknown-type rule) so it can never be mistaken for a
@@ -1160,6 +1227,130 @@ mod tests {
                 other => panic!("expected Envelope, got {other:?}"),
             }
         }
+    }
+
+    // ---- §9 — unknown types degrade to `chat` (#95) ----------------------
+
+    /// An envelope of `kind` from a peer daemon, with an optional `meta`.
+    fn typed_content(kind: &str, meta: Option<Value>) -> Value {
+        let mut env = json!({
+            "v": 1,
+            "from": "builder_agent",
+            "to": "*",
+            "type": kind,
+            "body": "3 PRs merged, 1 blocked.",
+        });
+        if let Some(meta) = meta {
+            env["meta"] = meta;
+        }
+        json!({
+            "msgtype": "m.text",
+            "body": format!("builder-agent → everyone · {kind}\n3 PRs merged, 1 blocked."),
+            ENVELOPE_KEY: env,
+        })
+    }
+
+    fn ingest(content: &Value) -> Envelope {
+        match from_event_json(content, "@safehoused-hosta:server", &personas(), None) {
+            Inbound::Envelope(env, unknown) => {
+                assert!(unknown.is_none(), "agent traffic never yields a token");
+                env
+            }
+            other => panic!("expected Envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn digest_is_a_known_type() {
+        assert!(KNOWN_TYPES.contains(&"digest"));
+    }
+
+    /// #95: `digest` arrives intact — it is a first-class type now, not
+    /// something that survives only because unknown types degrade.
+    #[test]
+    fn digest_envelope_is_not_degraded() {
+        let env = ingest(&typed_content("digest", None));
+        assert_eq!(env.kind, "digest");
+        assert_eq!(env.body, "3 PRs merged, 1 blocked.");
+        // §8: a non-`chat` type keeps its rendered header suffix.
+        let (plain, html) = render(&env);
+        assert!(plain.contains(" · digest"), "plain header was {plain:?}");
+        assert!(html.contains("<i>digest</i>"), "html header was {html:?}");
+    }
+
+    /// The §9 rule this issue is really about: a `type` from a newer peer that
+    /// this build has never heard of arrives as `chat`, body intact — losing
+    /// fidelity, not the message.
+    #[test]
+    fn unknown_type_degrades_to_chat() {
+        let env = ingest(&typed_content("telemetry_v3", None));
+        assert_eq!(env.kind, "chat");
+        assert_eq!(env.body, "3 PRs merged, 1 blocked.");
+    }
+
+    /// `meta` belongs to the type that was discarded (it is only ever defined
+    /// for `completion`, §4a), so a degrade must clear it — a downstream
+    /// consumer must never see `type: chat` carrying a foreign schema.
+    #[test]
+    fn unknown_type_degrade_clears_meta() {
+        let content = typed_content(
+            "sitrep_v2",
+            Some(json!({"schema": "sitrep-v2", "hosts": 3})),
+        );
+        let env = ingest(&content);
+        assert_eq!(env.kind, "chat");
+        assert!(
+            env.meta.is_none(),
+            "foreign meta must not survive a degrade"
+        );
+    }
+
+    /// Every known type passes through untouched — the degrade must not be a
+    /// blanket rewrite. (`completion` is excluded here: §4a degrades it on its
+    /// own terms when `meta` is missing, covered by its own tests above.)
+    #[test]
+    fn known_types_are_never_degraded() {
+        for kind in KNOWN_TYPES.iter().filter(|k| **k != "completion") {
+            let env = ingest(&typed_content(kind, None));
+            assert_eq!(&env.kind, kind, "type {kind:?} must survive ingest");
+        }
+    }
+
+    /// The degrade is diagnosable but not a flood: one warning per unknown
+    /// type per session. `note_unknown_type` is the tracker the warning is
+    /// gated on — `true` exactly once per type.
+    #[test]
+    fn unknown_type_warns_once_per_type() {
+        // Names are unique to this test: the tracker is process-global, and
+        // tests share a process.
+        assert_eq!(degrade_unknown_type("warn_once_alpha", "test"), "chat");
+        assert!(
+            !note_unknown_type("warn_once_alpha"),
+            "second sighting of the same type must not re-warn"
+        );
+
+        // Per *type*, not once globally: a different unknown type still warns.
+        assert!(
+            note_unknown_type("warn_once_beta"),
+            "a distinct unknown type must warn on its first sighting"
+        );
+
+        // Repeated ingest of the same unknown type keeps degrading (only the
+        // logging is suppressed).
+        for _ in 0..3 {
+            assert_eq!(ingest(&typed_content("warn_once_alpha", None)).kind, "chat");
+        }
+    }
+
+    /// A known type is never recorded as unknown — no warning, no tracker
+    /// entry.
+    #[test]
+    fn known_type_is_never_noted_as_unknown() {
+        assert_eq!(degrade_unknown_type("handoff", "test"), "handoff");
+        assert!(
+            note_unknown_type("handoff"),
+            "\"handoff\" must not have been recorded by degrade_unknown_type"
+        );
     }
 
     #[test]

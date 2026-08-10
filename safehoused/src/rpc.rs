@@ -229,6 +229,11 @@ impl Registry {
             "last_sync_completed_secs_ago": last_sync,
             "retry_attempt": retry.map(|r| r.attempt),
             "retry_backoff_secs": retry.map(|r| r.backoff_secs),
+            // #95: same advertisement as the `hello` reply, on the one op that
+            // needs no persona — so "connected, but which types does it know?"
+            // is answerable by a healthcheck, not only by an agent that has
+            // already handshaked.
+            "known_types": envelope::KNOWN_TYPES,
         })
     }
 
@@ -382,6 +387,16 @@ async fn handle_conn(stream: UnixStream, client: Client, registry: Arc<Registry>
                                 "ok": true,
                                 "user_id": client.user_id().map(|u| u.to_string()),
                                 "device_id": client.device_id().map(|d| d.to_string()),
+                                // #95: advertise the envelope `type`s this
+                                // build knows, so a newer caller can detect
+                                // skew at handshake instead of inferring it
+                                // from a degraded message (or a log line on
+                                // someone else's host). Purely additive to
+                                // the *local socket* reply — the Matrix wire
+                                // format is untouched, and a caller that
+                                // ignores this field behaves exactly as
+                                // before.
+                                "known_types": envelope::KNOWN_TYPES,
                             })
                         }
                         Some(p) => json!({
@@ -709,12 +724,16 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
         .get("body")
         .and_then(Value::as_str)
         .context("send requires `body`")?;
-    let kind = req.get("type").and_then(Value::as_str).unwrap_or("chat");
-    anyhow::ensure!(
-        envelope::KNOWN_TYPES.contains(&kind),
-        "unknown type {kind:?} (v1 types: {:?})",
-        envelope::KNOWN_TYPES
-    );
+    let requested = req.get("type").and_then(Value::as_str).unwrap_or("chat");
+    // §9 (#95): a type this build doesn't know is **degraded to `chat`, not
+    // rejected** — on this path too, not just on ingest. New types are additive
+    // and don't bump `v`, so the common cause is a caller that is simply newer
+    // than this daemon; refusing the send is the one outcome that actually
+    // loses the message, since the RPC caller does not retry as `chat` itself.
+    // The trade-off is deliberate: an agent that mistypes `type` no longer gets
+    // an error, so the warning (once per type per session) is the sole signal —
+    // and `known_types` in the `hello` reply lets a caller check up front.
+    let kind = envelope::degrade_unknown_type(requested, "send");
     let task_id = req
         .get("task_id")
         .and_then(Value::as_str)
@@ -739,7 +758,7 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
         Some(m) if !m.is_null() => {
             anyhow::ensure!(
                 kind == "completion",
-                "`meta` is only valid for type \"completion\", not {kind:?}"
+                "`meta` is only valid for type \"completion\", not {requested:?}"
             );
             envelope::validate_completion_meta(m)
                 .map_err(|e| anyhow::anyhow!("invalid completion-v1 meta: {e}"))?;
@@ -1064,7 +1083,36 @@ mod tests {
             .contains("requires persona"));
     }
 
+    /// #95: the handshake advertises the type vocabulary, so a caller newer
+    /// than this daemon can see the skew up front instead of inferring it from
+    /// a message that came back degraded.
+    #[tokio::test]
+    async fn hello_advertises_known_types() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["known_types"], json!(envelope::KNOWN_TYPES));
+        assert!(reply["known_types"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("digest")));
+    }
+
     // ---- `status` op (#85) — liveness/staleness observability -------------
+
+    /// #95: same advertisement on the one op that needs no persona, so a
+    /// healthcheck can report skew alongside "connected".
+    #[tokio::test]
+    async fn status_advertises_known_types_before_hello() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(&mut write, json!({"op": "status"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["known_types"], json!(envelope::KNOWN_TYPES));
+    }
 
     #[tokio::test]
     async fn status_is_queryable_before_hello() {
@@ -1324,10 +1372,43 @@ mod tests {
         assert!(build_send_envelope("writer_agent", &json!({"to": "research_agent"})).is_err());
     }
 
+    /// #95 (was `..._rejects_unknown_type`): an unrecognized `type` on an
+    /// agent's own send is a version skew, not a fatal request error — it
+    /// degrades to `chat` and the send proceeds, matching the ingest path.
     #[test]
-    fn build_send_envelope_rejects_unknown_type() {
+    fn build_send_envelope_degrades_unknown_type_to_chat() {
         let req = json!({"to": "research_agent", "body": "hi", "type": "smoke_signal"});
-        assert!(build_send_envelope("writer_agent", &req).is_err());
+        let env = build_send_envelope("writer_agent", &req).unwrap();
+        assert_eq!(env.kind, "chat");
+        assert_eq!(env.body, "hi");
+        assert_eq!(env.to, "research_agent");
+    }
+
+    /// #95: `digest` is a known type now, so it is sent as itself rather than
+    /// being either rejected or degraded.
+    #[test]
+    fn build_send_envelope_accepts_digest() {
+        let req = json!({"to": "*", "body": "3 PRs merged, 1 blocked.", "type": "digest"});
+        let env = build_send_envelope("writer_agent", &req).unwrap();
+        assert_eq!(env.kind, "digest");
+        assert_eq!(env.from, "writer_agent");
+    }
+
+    /// The one send-side rejection that survives the #95 degrade: `meta` is
+    /// still refused for anything but `completion`, and the error names the
+    /// type the caller actually asked for rather than the degraded one.
+    #[test]
+    fn build_send_envelope_rejects_meta_on_an_unknown_type() {
+        let req = json!({
+            "to": "*",
+            "body": "hi",
+            "type": "smoke_signal",
+            "meta": {"schema": "smoke-v1"},
+        });
+        let err = build_send_envelope("writer_agent", &req).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("only valid for type"), "was {msg:?}");
+        assert!(msg.contains("smoke_signal"), "was {msg:?}");
     }
 
     #[test]

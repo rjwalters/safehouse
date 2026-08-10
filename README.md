@@ -210,6 +210,13 @@ daemon shows both climbing together with `connected: false` and a growing `retry
 every other op, `status` requires no `hello` — it's queryable even against a daemon stuck before
 persona auth, which is exactly the scenario a liveness check needs to survive.
 
+**Diagnosing envelope-type skew (#95):** `status` (and the `hello` reply) also carries
+`known_types`, the envelope `type` vocabulary this build understands. A sender newer than the daemon
+it's talking to can compare lists up front instead of inferring the gap from behavior — and nothing
+is lost either way, because an unrecognized `type` is **degraded to `chat`, never rejected** (see
+`docs/protocol/envelope-v1.md` §4/§9). The degrade is logged once per unknown type per session,
+so `journalctl -u safehoused | grep 'unknown envelope type'` names the skew without flooding.
+
 Run `safehouse-mcp --help` for the full flag list. With no subcommand (or on a bare TTY), the
 binary keeps its original behavior unchanged: a stdio MCP server for an MCP client to launch.
 
