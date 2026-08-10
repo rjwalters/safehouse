@@ -446,7 +446,7 @@ async fn handle_op(
 ) -> Result<Value> {
     match op {
         "send" => {
-            let env = build_send_envelope(persona, req)?;
+            let OutboundSend { env, degraded_from } = build_send_envelope(persona, req)?;
             let room = resolve_room(client, req.get("room").and_then(Value::as_str))?;
 
             // §2: task/handoff chains sharing a `task_id` thread under that
@@ -485,7 +485,12 @@ async fn handle_op(
                 registry.threads.observe(&root, &event_id, &env).await;
             }
 
-            Ok(json!({"ok": true, "event_id": event_id, "room_id": room.room_id()}))
+            Ok(send_reply(
+                &event_id,
+                room.room_id().as_str(),
+                &env.kind,
+                degraded_from.as_deref(),
+            ))
         }
         "create_room" => {
             let name = req
@@ -715,7 +720,7 @@ async fn handle_op(
 /// authenticated connection (§6 — the socket connection is the identity), not
 /// from `req`; the request is never even inspected for a `from` field, so a
 /// client cannot spoof it no matter what it sends.
-fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
+fn build_send_envelope(persona: &str, req: &Value) -> Result<OutboundSend> {
     let to = req
         .get("to")
         .and_then(Value::as_str)
@@ -731,9 +736,12 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
     // than this daemon; refusing the send is the one outcome that actually
     // loses the message, since the RPC caller does not retry as `chat` itself.
     // The trade-off is deliberate: an agent that mistypes `type` no longer gets
-    // an error, so the warning (once per type per session) is the sole signal —
-    // and `known_types` in the `hello` reply lets a caller check up front.
+    // an error. The daemon's warning goes to *its* stderr, which a caller on the
+    // far side of the socket never reads, and `known_types` only helps a caller
+    // that diffs it up front — so the degrade is also reported back in-band on
+    // the `send` reply (see `OutboundSend::degraded_from`).
     let kind = envelope::degrade_unknown_type(requested, "send");
+    let degraded_from = (kind != requested).then(|| requested.to_owned());
     let task_id = req
         .get("task_id")
         .and_then(Value::as_str)
@@ -772,16 +780,54 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<Envelope> {
             None
         }
     };
-    Ok(Envelope {
-        v: 1,
-        from: persona.to_owned(), // stamped here; never taken from the request
-        to: to.to_owned(),
-        kind: kind.to_owned(),
-        task_id,
-        body: body.to_owned(),
-        wake,
-        meta,
+    Ok(OutboundSend {
+        env: Envelope {
+            v: 1,
+            from: persona.to_owned(), // stamped here; never taken from the request
+            to: to.to_owned(),
+            kind: kind.to_owned(),
+            task_id,
+            body: body.to_owned(),
+            wake,
+            meta,
+        },
+        degraded_from,
     })
+}
+
+/// The `"send"` success reply.
+///
+/// `type` is always present — it is what actually went on the wire, which is
+/// not necessarily what the caller asked for (§9 degrade). `degraded_from`
+/// appears **only** when the two differ, so an honored send keeps exactly the
+/// reply shape it has always had (purely additive `type`), while a degraded one
+/// is detectable with a single key lookup instead of by reading the daemon's
+/// stderr on another host (#95).
+fn send_reply(event_id: &str, room_id: &str, kind: &str, degraded_from: Option<&str>) -> Value {
+    let mut reply = json!({
+        "ok": true,
+        "event_id": event_id,
+        "room_id": room_id,
+        "type": kind,
+    });
+    if let Some(requested) = degraded_from {
+        reply["degraded_from"] = json!(requested);
+    }
+    reply
+}
+
+/// The result of building an outbound `send`: the envelope to put on the wire,
+/// plus the §9 skew signal the RPC reply owes the caller.
+#[derive(Debug)]
+struct OutboundSend {
+    env: Envelope,
+    /// `Some(requested)` when the caller named a `type` this build does not
+    /// know and it was degraded to `chat` (#95). Without this the reply is
+    /// byte-identical to a fully honored send, so a typo'd or newer-than-daemon
+    /// `type` is 100% silent from the caller's seat: the once-per-session
+    /// warning lands on the daemon's stderr (possibly another host), and the
+    /// `known_types` advertisement only helps a caller that actively diffs it.
+    degraded_from: Option<String>,
 }
 
 /// A joined room's addressable identifiers, projected out of a `Room` so the
@@ -1350,7 +1396,7 @@ mod tests {
     #[test]
     fn build_send_envelope_stamps_from_the_authenticated_persona() {
         let req = json!({"to": "research_agent", "body": "hi"});
-        let env = build_send_envelope("writer_agent", &req).unwrap();
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert_eq!(env.from, "writer_agent");
         assert_eq!(env.to, "research_agent");
         assert_eq!(env.kind, "chat");
@@ -1362,7 +1408,7 @@ mod tests {
         // The request is never even read for `from` — an agent claiming to
         // be someone else has no effect at all.
         let req = json!({"to": "research_agent", "body": "hi", "from": "admin"});
-        let env = build_send_envelope("writer_agent", &req).unwrap();
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert_eq!(env.from, "writer_agent");
     }
 
@@ -1378,10 +1424,60 @@ mod tests {
     #[test]
     fn build_send_envelope_degrades_unknown_type_to_chat() {
         let req = json!({"to": "research_agent", "body": "hi", "type": "smoke_signal"});
-        let env = build_send_envelope("writer_agent", &req).unwrap();
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert_eq!(env.kind, "chat");
         assert_eq!(env.body, "hi");
         assert_eq!(env.to, "research_agent");
+    }
+
+    // ---- the degrade is visible to the caller (#95 review) ----------------
+
+    /// A degraded send reports what the caller *asked* for. Without this the
+    /// daemon's only signal is its own stderr, which the RPC caller on the far
+    /// side of the socket never sees.
+    #[test]
+    fn build_send_envelope_reports_the_degraded_from_type() {
+        let req = json!({"to": "research_agent", "body": "hi", "type": "smoke_signal"});
+        let built = build_send_envelope("writer_agent", &req).unwrap();
+        assert_eq!(built.env.kind, "chat");
+        assert_eq!(built.degraded_from.as_deref(), Some("smoke_signal"));
+    }
+
+    /// An honored send carries no degrade signal — the field must not fire on
+    /// the ordinary path, explicit type or defaulted.
+    #[test]
+    fn build_send_envelope_reports_no_degrade_for_a_known_type() {
+        for req in [
+            json!({"to": "research_agent", "body": "hi", "type": "digest"}),
+            json!({"to": "research_agent", "body": "hi", "type": "chat"}),
+            json!({"to": "research_agent", "body": "hi"}),
+        ] {
+            let built = build_send_envelope("writer_agent", &req).unwrap();
+            assert_eq!(built.degraded_from, None, "req {req} must not degrade");
+        }
+    }
+
+    /// The `send` reply always names the type that actually went on the wire,
+    /// and adds `degraded_from` only when it differs from what was requested —
+    /// so a caller can detect a silent degrade with one key lookup.
+    #[test]
+    fn send_reply_surfaces_a_degrade_to_the_caller() {
+        let honored = send_reply("$evt", "!room:h", "digest", None);
+        assert_eq!(honored["ok"], json!(true));
+        assert_eq!(honored["event_id"], json!("$evt"));
+        assert_eq!(honored["room_id"], json!("!room:h"));
+        assert_eq!(honored["type"], json!("digest"));
+        assert!(
+            honored.get("degraded_from").is_none(),
+            "an honored send must not claim a degrade"
+        );
+
+        let degraded = send_reply("$evt", "!room:h", "chat", Some("smoke_signal"));
+        assert_eq!(degraded["type"], json!("chat"));
+        assert_eq!(degraded["degraded_from"], json!("smoke_signal"));
+        // Still a success: degrade-don't-drop, the message did go out (D19).
+        assert_eq!(degraded["ok"], json!(true));
+        assert_eq!(degraded["event_id"], json!("$evt"));
     }
 
     /// #95: `digest` is a known type now, so it is sent as itself rather than
@@ -1389,7 +1485,7 @@ mod tests {
     #[test]
     fn build_send_envelope_accepts_digest() {
         let req = json!({"to": "*", "body": "3 PRs merged, 1 blocked.", "type": "digest"});
-        let env = build_send_envelope("writer_agent", &req).unwrap();
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert_eq!(env.kind, "digest");
         assert_eq!(env.from, "writer_agent");
     }
@@ -1417,7 +1513,8 @@ mod tests {
             "writer_agent",
             &json!({"to": "research_agent", "body": "hi"}),
         )
-        .unwrap();
+        .unwrap()
+        .env;
         assert_eq!(env.kind, "chat");
     }
 
@@ -1432,7 +1529,7 @@ mod tests {
         // Advisory only (D16) — the daemon never acts on it, it's just
         // preserved for optional external wakers to read later via `check`.
         let req = json!({"to": "research_agent", "body": "hi", "wake": true});
-        let env = build_send_envelope("writer_agent", &req).unwrap();
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert_eq!(env.wake, Some(true));
     }
 
@@ -1442,14 +1539,15 @@ mod tests {
             "writer_agent",
             &json!({"to": "research_agent", "body": "hi"}),
         )
-        .unwrap();
+        .unwrap()
+        .env;
         assert_eq!(env.wake, None);
     }
 
     #[test]
     fn build_send_envelope_accepts_well_formed_task_id() {
         let req = json!({"to": "research_agent", "body": "hi", "task_id": "source_check_1"});
-        let env = build_send_envelope("writer_agent", &req).unwrap();
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert_eq!(env.task_id.as_deref(), Some("source_check_1"));
     }
 
@@ -1475,7 +1573,7 @@ mod tests {
             "type": "completion",
             "meta": completion_meta(),
         });
-        let env = build_send_envelope("writer_agent", &req).unwrap();
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert_eq!(env.kind, "completion");
         assert_eq!(env.meta.as_ref().unwrap()["schema"], "completion-v1");
         assert_eq!(env.meta.as_ref().unwrap()["repo"], "rjwalters/safehouse");
@@ -1516,7 +1614,8 @@ mod tests {
             "writer_agent",
             &json!({"to": "research_agent", "body": "hi"}),
         )
-        .unwrap();
+        .unwrap()
+        .env;
         assert!(env.meta.is_none());
     }
 

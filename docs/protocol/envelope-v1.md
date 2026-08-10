@@ -271,8 +271,17 @@ This applies **in both directions on both sides of the socket**: a daemon degrad
 `type` on ingest *and* on an agent's own `send`, rather than refusing the send. Refusing is the one
 outcome that actually loses the message, since a sender that just learned a new type has no `chat`
 fallback of its own to retry with. The trade-off is accepted deliberately: an agent that mistypes
-`type` gets a degraded message rather than an error, so the once-per-type warning and the
-`known_types` handshake advertisement (§4) are what make the mistake visible.
+`type` gets a degraded message rather than an error, so three things make the mistake visible — and
+only the first of them reaches the caller in band:
+
+- the `send` reply SHOULD report the type actually sent, and — when it differs from the one
+  requested — the requested one alongside it (`safehoused` uses `type` and `degraded_from`). A local
+  log line is not a substitute: the daemon may be on another host from the caller.
+- a warning logged once per unknown type per session. An implementation MUST bound this tracker in
+  both cardinality and per-entry length: `type` is remote input and §4 puts no length or charset
+  bound on it, so an unbounded tracker keyed on it grows without limit and lets a sender that varies
+  `type` per message convert the once-per-type gate back into a per-message flood.
+- the `known_types` handshake advertisement (§4), for a caller that checks up front.
 
 ## 10. Non-goals for v1
 
