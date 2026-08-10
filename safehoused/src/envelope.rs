@@ -3,11 +3,23 @@
 //! The daemon is the only writer of `from` (§6) and the only place rendering
 //! happens (§8). Agents never see Matrix event JSON; they see envelopes.
 
+use std::collections::BTreeSet;
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const ENVELOPE_KEY: &str = "org.safehouse.envelope";
-pub const KNOWN_TYPES: [&str; 5] = ["chat", "task", "handoff", "ack", "completion"];
+/// Every `type` this daemon understands (§4). Additive — a new type does not
+/// bump `v` (§9), which is exactly why an unrecognized type must degrade to
+/// `chat` rather than be refused: see [`degrade_unknown_type`].
+///
+/// `digest` (#95) is a best-effort side-channel signal — periodic narration a
+/// sender emits whether or not anyone is listening. Like every other type the
+/// daemon files it into the mailbox unconditionally (D17) and takes no action
+/// on it (D16); its only type-specific behavior is the §8 header suffix and
+/// the advisory "suggested `wake`: no" classification in the protocol table.
+pub const KNOWN_TYPES: [&str; 6] = ["chat", "task", "handoff", "ack", "completion", "digest"];
 
 /// The one `meta.schema` value a `completion` envelope's `meta` must carry
 /// (envelope-v1.md §4a). Anything else is not `completion-v1` and is never
@@ -185,6 +197,140 @@ fn is_rfc3339(s: &str) -> bool {
     }
 }
 
+/// The most distinct unknown `type` values one process will ever remember, and
+/// the most bytes of any single one it will keep or print.
+///
+/// Both caps exist because `type` is **untrusted, unvalidated remote input**:
+/// it arrives verbatim inside an `m.room.message` from any room member and,
+/// unlike `from` ([`valid_persona`] — charset plus a 64-byte cap) or `task_id`
+/// (`[A-Za-z0-9_]`), §4 puts no charset or length bound on it. Uncapped, a
+/// peer that varies `type` per message — maliciously, or benignly by
+/// interpolating a UUID or a build stamp — grows this set for the life of the
+/// process (one retained `String` each, up to Matrix's ~64 KiB event-body
+/// limit) *and* defeats the once-per-type gate, turning the anti-flood
+/// mechanism into the flood it exists to prevent.
+///
+/// 64 distinct unknown types is far more skew than any real deployment
+/// produces (a build trails its peers by a handful of types, not dozens), and
+/// 64 bytes is the same bound [`valid_persona`] already applies, so no
+/// plausible real type name is ever truncated. Together they bound the tracker
+/// at ~4 KiB for the process lifetime and bound a warning line at a readable
+/// length.
+const MAX_UNKNOWN_TYPES_TRACKED: usize = 64;
+const MAX_TRACKED_TYPE_LEN: usize = 64;
+
+/// `kind` clamped to [`MAX_TRACKED_TYPE_LEN`] bytes on a char boundary — the
+/// form that is stored in the tracker and echoed into the log. Two over-long
+/// types sharing a prefix collapse to one entry, which errs in the safe
+/// direction: fewer entries and fewer log lines, never more.
+fn truncate_type(kind: &str) -> &str {
+    if kind.len() <= MAX_TRACKED_TYPE_LEN {
+        return kind;
+    }
+    let mut end = MAX_TRACKED_TYPE_LEN;
+    while !kind.is_char_boundary(end) {
+        end -= 1;
+    }
+    &kind[..end]
+}
+
+/// Unknown envelope `type`s already reported this session, so the §9 degrade
+/// is diagnosable without being a per-message log flood (#95). Process-global
+/// on purpose: skew is a property of the *pair of builds*, not of a room, a
+/// peer, or a connection — hearing about `"digest"` once tells the operator
+/// everything a thousand repeats would. Bounded in both cardinality and entry
+/// size — see [`MAX_UNKNOWN_TYPES_TRACKED`].
+static UNKNOWN_TYPES_SEEN: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// The tracker decision for one unknown `kind`, over an explicit set.
+///
+/// Factored out of [`note_unknown_type`] so the cap can be exercised on a local
+/// set: the real tracker is process-global and shared across every test in the
+/// binary, so a test that saturated it would break every other test that
+/// depends on a fresh type being newly noted.
+fn note_unknown_type_in(seen: &mut BTreeSet<String>, kind: &str) -> bool {
+    let key = truncate_type(kind);
+    if seen.contains(key) {
+        return false;
+    }
+    // Saturated: stay silent rather than evict. Eviction would let a peer that
+    // cycles `type` values re-report the same type forever, which is exactly
+    // the flood the cap is here to stop — the first 64 types seen are the ones
+    // most likely to be the genuine skew.
+    if seen.len() >= MAX_UNKNOWN_TYPES_TRACKED {
+        return false;
+    }
+    seen.insert(key.to_owned());
+    true
+}
+
+/// Record `kind` as an unknown type seen this session; `true` the first time
+/// this process sees it, `false` for every repeat **and** for every new type
+/// once the tracker is full ([`MAX_UNKNOWN_TYPES_TRACKED`]).
+///
+/// Never panics: a poisoned lock is recovered rather than propagated, since
+/// the worst case is warning about the same type twice — not a reason to take
+/// the daemon down mid-dispatch.
+pub fn note_unknown_type(kind: &str) -> bool {
+    let mut seen = UNKNOWN_TYPES_SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    note_unknown_type_in(&mut seen, kind)
+}
+
+/// How many distinct unknown types this process is currently tracking, for the
+/// one-time "tracker is full" notice.
+fn unknown_types_tracked() -> usize {
+    UNKNOWN_TYPES_SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
+/// The §9 forward-compatibility rule, applied to `kind`: an unrecognized type
+/// is **degraded to `chat`, never rejected**. A new `type` is an additive
+/// change that does not bump `v`, so a peer (or a local agent) running a newer
+/// build can legitimately name a type this daemon has never heard of. Losing
+/// fidelity is the intended failure mode; losing the message is not.
+///
+/// Returns the type to actually use — `kind` itself when known, `"chat"`
+/// otherwise — and warns once per unknown type per session (`context` names
+/// the path that saw it, e.g. `"received"` / `"send"`) so version skew shows
+/// up in the log without drowning it.
+pub fn degrade_unknown_type<'a>(kind: &'a str, context: &str) -> &'a str {
+    if KNOWN_TYPES.contains(&kind) {
+        return kind;
+    }
+    if note_unknown_type(kind) {
+        // Never echo the raw `kind`: it is unvalidated remote input and can be
+        // as long as a Matrix event body. One log line stays one log line.
+        let shown = truncate_type(kind);
+        let elided = if shown.len() < kind.len() {
+            format!(" (truncated from {} bytes)", kind.len())
+        } else {
+            String::new()
+        };
+        eprintln!(
+            "safehoused: warning: unknown envelope type {shown:?}{elided} ({context}) \
+             — degrading to \"chat\" (v1 types: {KNOWN_TYPES:?}). \
+             This host is likely older than its peer; further {shown:?} \
+             envelopes are degraded silently."
+        );
+        // Exactly once per process: only a successful note can reach the cap,
+        // and the note that reaches it is the last one ever accepted.
+        if unknown_types_tracked() >= MAX_UNKNOWN_TYPES_TRACKED {
+            eprintln!(
+                "safehoused: warning: unknown-envelope-type tracker is full \
+                 ({MAX_UNKNOWN_TYPES_TRACKED} distinct types this session) — further \
+                 unrecognized types are still degraded to \"chat\", but are no longer \
+                 reported. A peer varying `type` per message is the likely cause; \
+                 `type` is remote input and carries no length or charset bound."
+            );
+        }
+    }
+    "chat"
+}
+
 pub fn valid_persona(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -315,6 +461,16 @@ pub fn from_event_json(
         // best-effort parse. A well-formed v1 envelope returns here; anything
         // else falls through to human synthesis, preserving prior behavior.
         if let Ok(mut env) = serde_json::from_value::<Envelope>(raw.clone()) {
+            // §9: a `type` this build doesn't know is a version skew, not a
+            // protocol violation — degrade it to `chat` (#95) so the message
+            // still reaches the mailbox. `meta` goes with it: `meta` is only
+            // ever defined for `completion` (§4a), so whatever it carried
+            // belonged to the type just discarded and must not be handed
+            // downstream under `chat`.
+            if degrade_unknown_type(&env.kind, "received") != env.kind {
+                env.kind = "chat".to_owned();
+                env.meta = None;
+            }
             // §4a: a `completion` envelope whose `meta` is absent or fails
             // strict `completion-v1` validation is **degraded to `chat`** (the
             // §9 unknown-type rule) so it can never be mistaken for a
@@ -1160,6 +1316,223 @@ mod tests {
                 other => panic!("expected Envelope, got {other:?}"),
             }
         }
+    }
+
+    // ---- §9 — unknown types degrade to `chat` (#95) ----------------------
+
+    /// An envelope of `kind` from a peer daemon, with an optional `meta`.
+    fn typed_content(kind: &str, meta: Option<Value>) -> Value {
+        let mut env = json!({
+            "v": 1,
+            "from": "builder_agent",
+            "to": "*",
+            "type": kind,
+            "body": "3 PRs merged, 1 blocked.",
+        });
+        if let Some(meta) = meta {
+            env["meta"] = meta;
+        }
+        json!({
+            "msgtype": "m.text",
+            "body": format!("builder-agent → everyone · {kind}\n3 PRs merged, 1 blocked."),
+            ENVELOPE_KEY: env,
+        })
+    }
+
+    fn ingest(content: &Value) -> Envelope {
+        match from_event_json(content, "@safehoused-hosta:server", &personas(), None) {
+            Inbound::Envelope(env, unknown) => {
+                assert!(unknown.is_none(), "agent traffic never yields a token");
+                env
+            }
+            other => panic!("expected Envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn digest_is_a_known_type() {
+        assert!(KNOWN_TYPES.contains(&"digest"));
+    }
+
+    /// #95: `digest` arrives intact — it is a first-class type now, not
+    /// something that survives only because unknown types degrade.
+    #[test]
+    fn digest_envelope_is_not_degraded() {
+        let env = ingest(&typed_content("digest", None));
+        assert_eq!(env.kind, "digest");
+        assert_eq!(env.body, "3 PRs merged, 1 blocked.");
+        // §8: a non-`chat` type keeps its rendered header suffix.
+        let (plain, html) = render(&env);
+        assert!(plain.contains(" · digest"), "plain header was {plain:?}");
+        assert!(html.contains("<i>digest</i>"), "html header was {html:?}");
+    }
+
+    /// The §9 rule this issue is really about: a `type` from a newer peer that
+    /// this build has never heard of arrives as `chat`, body intact — losing
+    /// fidelity, not the message.
+    #[test]
+    fn unknown_type_degrades_to_chat() {
+        let env = ingest(&typed_content("telemetry_v3", None));
+        assert_eq!(env.kind, "chat");
+        assert_eq!(env.body, "3 PRs merged, 1 blocked.");
+    }
+
+    /// `meta` belongs to the type that was discarded (it is only ever defined
+    /// for `completion`, §4a), so a degrade must clear it — a downstream
+    /// consumer must never see `type: chat` carrying a foreign schema.
+    #[test]
+    fn unknown_type_degrade_clears_meta() {
+        let content = typed_content(
+            "sitrep_v2",
+            Some(json!({"schema": "sitrep-v2", "hosts": 3})),
+        );
+        let env = ingest(&content);
+        assert_eq!(env.kind, "chat");
+        assert!(
+            env.meta.is_none(),
+            "foreign meta must not survive a degrade"
+        );
+    }
+
+    /// Every known type passes through untouched — the degrade must not be a
+    /// blanket rewrite. (`completion` is excluded here: §4a degrades it on its
+    /// own terms when `meta` is missing, covered by its own tests above.)
+    #[test]
+    fn known_types_are_never_degraded() {
+        for kind in KNOWN_TYPES.iter().filter(|k| **k != "completion") {
+            let env = ingest(&typed_content(kind, None));
+            assert_eq!(&env.kind, kind, "type {kind:?} must survive ingest");
+        }
+    }
+
+    /// The degrade is diagnosable but not a flood: one warning per unknown
+    /// type per session. `note_unknown_type` is the tracker the warning is
+    /// gated on — `true` exactly once per type.
+    #[test]
+    fn unknown_type_warns_once_per_type() {
+        // Names are unique to this test: the tracker is process-global, and
+        // tests share a process.
+        assert_eq!(degrade_unknown_type("warn_once_alpha", "test"), "chat");
+        assert!(
+            !note_unknown_type("warn_once_alpha"),
+            "second sighting of the same type must not re-warn"
+        );
+
+        // Per *type*, not once globally: a different unknown type still warns.
+        assert!(
+            note_unknown_type("warn_once_beta"),
+            "a distinct unknown type must warn on its first sighting"
+        );
+
+        // Repeated ingest of the same unknown type keeps degrading (only the
+        // logging is suppressed).
+        for _ in 0..3 {
+            assert_eq!(ingest(&typed_content("warn_once_alpha", None)).kind, "chat");
+        }
+    }
+
+    /// A known type is never recorded as unknown — no warning, no tracker
+    /// entry.
+    #[test]
+    fn known_type_is_never_noted_as_unknown() {
+        assert_eq!(degrade_unknown_type("handoff", "test"), "handoff");
+        assert!(
+            note_unknown_type("handoff"),
+            "\"handoff\" must not have been recorded by degrade_unknown_type"
+        );
+    }
+
+    // ---- unknown-type tracker bounds (#95 review) -------------------------
+    //
+    // These exercise `note_unknown_type_in` over a *local* set rather than
+    // `note_unknown_type`'s process-global one: saturating the real tracker
+    // would make every other test's "a fresh type warns" assertion fail,
+    // depending on test execution order.
+
+    /// The tracker saturates instead of growing without bound. `type` is
+    /// unvalidated remote input, so a peer emitting a distinct type per
+    /// message must not be able to grow this set for the life of the process.
+    #[test]
+    fn unknown_type_tracker_saturates_at_the_cap() {
+        let mut seen = BTreeSet::new();
+        for i in 0..MAX_UNKNOWN_TYPES_TRACKED {
+            assert!(
+                note_unknown_type_in(&mut seen, &format!("skew_type_{i}")),
+                "type {i} is within the cap and must be newly noted"
+            );
+        }
+        assert_eq!(seen.len(), MAX_UNKNOWN_TYPES_TRACKED);
+
+        // Full: new types are silently degraded, never tracked, never logged.
+        for i in 0..10 {
+            assert!(
+                !note_unknown_type_in(&mut seen, &format!("overflow_type_{i}")),
+                "past the cap, a new type must not warn"
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            MAX_UNKNOWN_TYPES_TRACKED,
+            "the set must not grow past the cap"
+        );
+
+        // A type already tracked still reports "already seen" (not "new") once
+        // the set is full — saturation must not resurrect duplicate warnings.
+        assert!(!note_unknown_type_in(&mut seen, "skew_type_0"));
+    }
+
+    /// A remote `type` can be as long as a Matrix event body (~64 KiB); only a
+    /// bounded prefix is ever retained or logged.
+    #[test]
+    fn unknown_type_tracker_truncates_over_long_types() {
+        let huge = "x".repeat(70_000);
+        let mut seen = BTreeSet::new();
+        assert!(note_unknown_type_in(&mut seen, &huge));
+        let stored = seen.iter().next().expect("one entry");
+        assert_eq!(
+            stored.len(),
+            MAX_TRACKED_TYPE_LEN,
+            "the stored key must be clamped, not the raw 70 KiB string"
+        );
+
+        // Two over-long types sharing the clamped prefix collapse to one entry
+        // — fewer log lines, never more.
+        assert!(!note_unknown_type_in(
+            &mut seen,
+            &format!("{huge}_and_more")
+        ));
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn truncate_type_leaves_plausible_names_intact() {
+        assert_eq!(truncate_type("digest"), "digest");
+        let exact = "a".repeat(MAX_TRACKED_TYPE_LEN);
+        assert_eq!(truncate_type(&exact), exact);
+    }
+
+    /// Truncation lands on a char boundary — a multi-byte type name must not
+    /// panic the daemon on the degrade path.
+    #[test]
+    fn truncate_type_respects_char_boundaries() {
+        // "€" is 3 bytes and MAX_TRACKED_TYPE_LEN (64) is not a multiple of 3,
+        // so the naive byte cut lands mid-character.
+        let kind = "€".repeat(MAX_TRACKED_TYPE_LEN);
+        let cut = truncate_type(&kind);
+        assert!(cut.len() <= MAX_TRACKED_TYPE_LEN);
+        assert!(kind.starts_with(cut));
+        // Backed off to the boundary rather than panicking on a bad slice.
+        assert_eq!(cut.chars().count(), MAX_TRACKED_TYPE_LEN / 3);
+        assert_eq!(cut.len(), (MAX_TRACKED_TYPE_LEN / 3) * 3);
+    }
+
+    /// End-to-end: an over-long unknown type still degrades to `chat` and does
+    /// not panic (the truncation is in the log/tracker path, not the degrade).
+    #[test]
+    fn over_long_unknown_type_still_degrades_to_chat() {
+        let huge = "z".repeat(70_000);
+        assert_eq!(degrade_unknown_type(&huge, "test"), "chat");
+        assert_eq!(ingest(&typed_content(&huge, None)).kind, "chat");
     }
 
     #[test]

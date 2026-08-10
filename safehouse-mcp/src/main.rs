@@ -34,11 +34,18 @@ use std::{
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-/// Message `type` values the daemon accepts (mirrors
-/// `safehoused::envelope::KNOWN_TYPES`; duplicated rather than depending on
-/// the `safehoused` crate to keep this shim dependency-light, per its module
-/// doc comment).
-const KNOWN_MESSAGE_TYPES: [&str; 4] = ["chat", "task", "handoff", "ack"];
+/// Message `type` values this shim can fully construct — the subset of
+/// `safehoused::envelope::KNOWN_TYPES` that needs no field the CLI has no flag
+/// for (hence no `completion`, which requires a `completion-v1` `meta`).
+/// Duplicated rather than depending on the `safehoused` crate to keep this
+/// shim dependency-light, per its module doc comment.
+///
+/// Since #95 this list is a **typo convenience, not a protocol gate**: the
+/// daemon degrades an unrecognized `type` to `chat` and warns, rather than
+/// refusing the send, so a shim that lags the daemon costs fidelity — never a
+/// message. The authoritative list is whatever `hello`/`status` report as
+/// `known_types`.
+const KNOWN_MESSAGE_TYPES: [&str; 5] = ["chat", "task", "handoff", "ack", "digest"];
 
 fn main() -> Result<()> {
     let raw_args: Vec<String> = env::args().skip(1).collect();
@@ -155,7 +162,7 @@ fn print_usage(out: &mut impl Write) {
     );
     let _ = writeln!(
         out,
-        "  safehouse-mcp send --to <persona|*> --body <text> [--type chat|task|handoff|ack]"
+        "  safehouse-mcp send --to <persona|*> --body <text> [--type chat|task|handoff|ack|digest]"
     );
     let _ = writeln!(
         out,
@@ -444,13 +451,13 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "safehouse_send",
-            "description": "Send a message into a safehouse room. The daemon stamps your persona as the sender; `to` is a persona (e.g. research_agent), a Matrix user id, or \"*\" for room broadcast. Types: chat (conversational), task (unit of work, use task_id), handoff (transfer of responsibility), ack (completion).",
+            "description": "Send a message into a safehouse room. The daemon stamps your persona as the sender; `to` is a persona (e.g. research_agent), a Matrix user id, or \"*\" for room broadcast. Types: chat (conversational), task (unit of work, use task_id), handoff (transfer of responsibility), ack (completion), digest (periodic best-effort narration, no reply expected).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "to": {"type": "string", "description": "Target persona, Matrix user id, or \"*\""},
                     "body": {"type": "string", "description": "Message content (plain text)"},
-                    "type": {"type": "string", "enum": ["chat", "task", "handoff", "ack"], "description": "Message type (default chat)"},
+                    "type": {"type": "string", "enum": ["chat", "task", "handoff", "ack", "digest"], "description": "Message type (default chat)"},
                     "task_id": {"type": "string", "description": "Stable task identifier, [A-Za-z0-9_]"},
                     "room": {"type": "string", "description": "Room id, name, or alias; optional when only one room is joined. An ambiguous name/alias (matching more than one joined room) is an error, never a guess"},
                     "wake": {"type": "boolean", "description": "Advisory hint only — the daemon never acts on it. For optional external wakers deciding whether to nudge the recipient."}

@@ -119,6 +119,21 @@ daemon auto-joins on its next sync, cold-start included. The acceptance policy i
 explicit and, optionally, restrictable: `invite_allowlist` in config (default `None`/unset —
 accept-any, unchanged) limits which senders' invites `on_invite` will join.
 
+**Forward-compatible envelope types (#95, D19).** An envelope `type` this build doesn't know is
+**degraded to `chat` and delivered**, on ingest *and* on an agent's own `send` — the send path used
+to refuse it, which is the one outcome that actually loses the message (`loom` shipped a `digest`
+type before any `safehoused` knew it, and the room silently stopped carrying that class of message
+while both sides reported the link healthy). `digest` is now a first-class type; the degrade is
+implemented once in `envelope::degrade_unknown_type`. The caller is told **in band** — the `send`
+reply always carries `type` (what actually went on the wire) plus `degraded_from` when that differs
+from what was requested — because the other two signals don't reach it: the once-per-type warning
+goes to *safehoused's* stderr, and the `known_types` advertised on `hello`/`status` only helps a
+caller that diffs it at handshake. The warn-once tracker is bounded (64 distinct types per process,
+each clamped to 64 bytes): `type` is unvalidated remote input, so an unbounded tracker keyed on it
+is both a memory and a log-flood lever. Note the ingest side was **not** previously broken — it did
+no type check at all and passed unknown types through intact, so the ingest degrade trades a little
+fidelity for §4/§9 conformance. All of this is additive per §9 — no `v` bump.
+
 ### 5. ~~Per-agent mailbox + `safehouse_check` (D16/D17)~~ ✅ DONE 2026-07-26
 Per-persona durable mailbox in `safehoused` (`mailbox.rs`), populated from the same synced room
 timeline that drives live dispatch (`on_message`) — a broadcast (`to: "*"`) fans out to every

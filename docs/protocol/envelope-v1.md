@@ -72,7 +72,7 @@ MUST read `org.safehouse.envelope.body` and MUST NOT parse the header out of the
 | `v` | ✅ | integer | Envelope version. `1`. Receivers MUST ignore envelopes with a `v` they don't support, and SHOULD surface them to the human as unhandled. |
 | `from` | ✅ | string | Sending persona, e.g. `writer_agent`. For a human, the full Matrix user ID (`@robb:safehouse.local`). **Stamped by the daemon — never taken from the agent.** See §6. |
 | `to` | ✅ | string | Target persona, a Matrix user ID, or `"*"` for room-broadcast. |
-| `type` | ✅ | string | One of `chat`, `task`, `handoff`, `ack`, `completion`. See §4. |
+| `type` | ✅ | string | One of `chat`, `task`, `handoff`, `ack`, `completion`, `digest`. See §4. A receiver that doesn't know the value treats it as `chat` (§4, §9) — it is never a reason to drop the message. |
 | `task_id` | — | string | Stable, human-meaningful task identifier, `[A-Za-z0-9_]`. Groups related messages independently of Matrix threading. |
 | `body` | ✅ | string | The message content, as the agent should receive it. Plain text. |
 | `meta` | — | object | Structured metadata, present **only** for `type: completion` — the `completion-v1` payload (§4a). Never parsed for any other `type`. `body` stays required prose regardless (§8). |
@@ -100,10 +100,21 @@ something safehoused acts on.
 | `handoff` | Transfer of responsibility — the sender is done and the target is now on the hook. | Yes |
 | `ack` | Acknowledgement or completion. SHOULD carry the `task_id` it closes. | No |
 | `completion` | A structured, **public-feed-eligible** completion event — an agent finished a unit of work in a repo. MUST carry a valid `completion-v1` `meta` (§4a). | No |
+| `digest` | Periodic, best-effort narration a sender emits whether or not anyone is listening — a status roll-up, not an address. Carries no structured payload and expects no reply. | No |
 
 `task` deliberately leaves room to borrow A2A's Task-object lifecycle later without disturbing `chat`,
-which must stay human-readable above all. Additional types are a v2 concern; a v1 receiver seeing an
-unknown `type` MUST treat it as `chat`.
+which must stay human-readable above all.
+
+**A v1 receiver seeing an unknown `type` MUST treat it as `chat`, and MUST NOT reject the message.**
+New types are additive and do not bump `v` (§9), so a peer running a newer build naming a type this
+one has never heard of is the *expected* steady state during a rollout, not a protocol violation.
+Degrading costs fidelity (the header suffix and any type-specific handling); rejecting costs the
+message. A receiver SHOULD clear `meta` when it degrades, since `meta` is only ever defined for
+`completion` (§4a) and would otherwise arrive attached to a `chat` under a schema nobody can name.
+An implementation SHOULD log the unknown type once per type per session — enough to diagnose skew,
+not enough to flood — and MAY advertise its known-type list on its own agent-facing interface
+(safehoused reports `known_types` in its unix-socket `hello` and `status` replies; that is a local
+RPC affordance, not part of this wire format).
 
 `ack` and `completion` are distinct on purpose: `ack` is the common, human-facing acknowledgement of
 a `task`, and it carries no structured payload; `completion` is the rare, machine-consumed,
@@ -255,6 +266,22 @@ version they do not support rather than guessing, and MUST preserve unknown fiel
 
 Additive, non-breaking changes (a new optional field, a new `type`) do **not** bump `v` — hence the
 requirement that unknown `type` degrades to `chat` and unknown fields are preserved.
+
+This applies **in both directions on both sides of the socket**: a daemon degrades an unrecognized
+`type` on ingest *and* on an agent's own `send`, rather than refusing the send. Refusing is the one
+outcome that actually loses the message, since a sender that just learned a new type has no `chat`
+fallback of its own to retry with. The trade-off is accepted deliberately: an agent that mistypes
+`type` gets a degraded message rather than an error, so three things make the mistake visible — and
+only the first of them reaches the caller in band:
+
+- the `send` reply SHOULD report the type actually sent, and — when it differs from the one
+  requested — the requested one alongside it (`safehoused` uses `type` and `degraded_from`). A local
+  log line is not a substitute: the daemon may be on another host from the caller.
+- a warning logged once per unknown type per session. An implementation MUST bound this tracker in
+  both cardinality and per-entry length: `type` is remote input and §4 puts no length or charset
+  bound on it, so an unbounded tracker keyed on it grows without limit and lets a sender that varies
+  `type` per message convert the once-per-type gate back into a per-message flood.
+- the `known_types` handshake advertisement (§4), for a caller that checks up front.
 
 ## 10. Non-goals for v1
 

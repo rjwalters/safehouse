@@ -372,3 +372,57 @@ framing demands. Strict `completion-v1` validation (`validate_completion_meta`) 
 - Agent-originated `completion` `meta` is **not** yet wired through the RPC send path — that, with
   validation at egress, is #30. This phase only guarantees `meta` round-trips through parse/serialize
   and that malformed completions degrade safely.
+
+## D19 — An unknown envelope `type` degrades to `chat` on **both** paths, and `digest` joins the v1 set
+**Decision (2026-08-10, #95):** an envelope `type` this build doesn't recognize is **degraded to
+`chat` and delivered** — on ingest from the room *and* on an agent's own `send` over the unix socket.
+The send path previously refused an unknown `type` outright; that refusal is removed. `digest` (a
+best-effort periodic narration signal, no reply expected) is added to `KNOWN_TYPES` as a first-class
+v1 type. Both are additive per §9 — **no `v` bump**.
+
+**Why the send path changes too.** New types are invented in the *senders* (`loom` shipped `digest`
+before any `safehoused` knew it), so "peer is newer than daemon" is the normal ordering during a
+rollout, not an anomaly. Note the asymmetry in what was actually broken: **ingest was not** — before
+this change `from_event_json` ran no `KNOWN_TYPES` check at all, so an unknown `type` reached the
+mailbox and the §8 header with its name intact. Adding the ingest degrade therefore *reduces* ingest
+fidelity (agents lose the raw type string) in exchange for §4/§9 conformance and correct `meta`
+clearing; it is not a fix to a previously broken receive path. On send, refusing lost the
+**message**: an RPC caller that gets `unknown type "digest"` back does not retry as `chat` on its
+own, so the room silently stopped carrying a whole class of message while both sides reported the
+link healthy. For a transport whose contract is explicitly "best-effort side channel, zero hard
+dependency" (loom ADR-0014), degrade-don't-drop is the only defensible default.
+
+**What is given up, deliberately:** an agent that mistypes `type` no longer gets an error — it gets a
+`chat`. Three things replace that signal, because a silent degrade is worse than either failure mode:
+- **`type` (and, on a degrade, `degraded_from`) on the `send` RPC reply** — the only one of the three
+  that reaches the caller *in band*, and therefore the load-bearing one. `type` names what actually
+  went on the wire; `degraded_from` is present only when it differs from what was asked for. The
+  other two signals both miss the caller that matters most: the warning lands on **safehoused's**
+  stderr (possibly another host), and `known_types` only helps a caller that actively diffs it —
+  `loom-daemon` talks to the socket directly and does neither;
+- a **warning logged once per unknown type per session** (process-global, `envelope::note_unknown_type`) —
+  enough to diagnose skew from a log, not enough to flood one at message rate. Bounded on both axes,
+  because `type` is unvalidated remote input with no length or charset limit (§4): at most
+  `MAX_UNKNOWN_TYPES_TRACKED` (64) distinct types are remembered per process, each clamped to 64
+  bytes, so a peer varying `type` per message can neither grow the tracker without bound nor turn the
+  once-per-type gate into the per-message flood it exists to prevent;
+- **`known_types` advertised in the `hello` and `status` RPC replies**, so a caller can compare
+  vocabularies at handshake rather than inferring the gap from behavior. This is a *local socket*
+  affordance only — the Matrix wire format is untouched, and no negotiation is implied: the daemon
+  states what it knows, and the sender decides what to do about it.
+
+**Not done (and why):** no wire-level type negotiation. It would require a v-bump-class change to a
+protocol whose entire forward-compat story is "additive changes don't bump `v`", to solve a problem
+the one-line advertisement above already makes visible.
+
+**Consequences:**
+- `KNOWN_TYPES` gains `"digest"` (6 types). `envelope::degrade_unknown_type` is the single
+  implementation of the §9 rule, called from both `from_event_json` and `rpc::build_send_envelope`.
+- A degrade clears `meta` — it is only ever defined for `completion` (§4a), so it belongs to the
+  discarded type and must not reach a consumer attached to a `chat`.
+- The `send` reply gains `type` (always) and `degraded_from` (only on a degrade). Purely additive:
+  a caller that ignores both sees exactly the reply it saw before.
+- `meta` supplied with a non-`completion` type is still a hard send error (the one send-side
+  rejection that survives), and the error names the type the caller asked for, not the degraded one.
+- `safehouse-mcp`'s client-side `--type` list is now a typo convenience, not a protocol gate; the
+  authoritative list is whatever `hello`/`status` report.
