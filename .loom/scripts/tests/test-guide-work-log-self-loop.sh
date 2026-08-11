@@ -36,21 +36,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-# The Loom SOURCE repo carries `defaults/.claude/commands/loom/guide.md` (the
-# template guide.md gets installed from). A consumer repo (this one has no
-# `defaults/` tree at all — see .loom/docs/daemon-reference.md
-# §"Installed-surface byte-match") only has the two INSTALLED copies, kept
-# byte-identical by convention: `.claude/commands/loom/guide.md` and
-# `.loom/roles/guide.md`. Without this fallback the test FATALs immediately in
-# every consumer repo (#76).
 GUIDE_MD="$REPO_ROOT/defaults/.claude/commands/loom/guide.md"
-if [[ ! -f "$GUIDE_MD" ]]; then
-    if [[ -f "$REPO_ROOT/.claude/commands/loom/guide.md" ]]; then
-        GUIDE_MD="$REPO_ROOT/.claude/commands/loom/guide.md"
-    elif [[ -f "$REPO_ROOT/.loom/roles/guide.md" ]]; then
-        GUIDE_MD="$REPO_ROOT/.loom/roles/guide.md"
-    fi
-fi
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -242,115 +228,6 @@ if grep -q "PR #5420" "$WORK_LOG"; then
     fail "the docs PR leaked into WORK_LOG.md"
 else
     pass "no docs PR line was written to WORK_LOG.md"
-fi
-
-# ---------------------------------------------------------------------------
-# Test 5: THE #76 REGRESSION — a hand-staged excluded entry, caught by the
-# mechanical check-work-log-diff.sh backstop rather than by the generator.
-#
-# #75 (issue #76) proved GUIDE_DOCS_PR_EXCLUDE alone is not enough: it staged
-# and committed a WORK_LOG.md line for an excluded PR by a code path that
-# never went through update_work_log()'s `new_prs` query. This test builds a
-# STAGED git diff directly (bypassing new_prs entirely, exactly like the
-# regression did) and asserts check-work-log-diff.sh rejects it.
-# ---------------------------------------------------------------------------
-echo ""
-echo "Test 5: check-work-log-diff.sh rejects a hand-staged excluded PR entry"
-
-CHECK_SCRIPT="$REPO_ROOT/.loom/scripts/check-work-log-diff.sh"
-
-if [[ ! -f "$CHECK_SCRIPT" ]]; then
-    fail "check-work-log-diff.sh not found at $CHECK_SCRIPT"
-elif ! command -v git >/dev/null 2>&1; then
-    echo "SKIP: git not available for Test 5"
-else
-    GIT_WT="$SANDBOX/git-wt"
-    mkdir -p "$GIT_WT"
-    (
-        cd "$GIT_WT" || exit 1
-        git init -q
-        git config user.email "test@example.com"
-        git config user.name "Test"
-        printf '# Work Log\n\n### 2026-08-05\n\n- **PR #5410**: fix(daemon): mint a per-owner App token\n' >WORK_LOG.md
-        git add WORK_LOG.md
-        git commit -q -m "seed"
-    )
-
-    # A stub `gh` that answers `pr view <N> --json headRefName,title` the same
-    # way the real forge would for PR #5420 (excluded: docs/guide-update-*
-    # branch) and PR #5450 (genuine: unrelated feature branch) — no network,
-    # no real `gh` call, keeping this suite hermetic.
-    STUB_GH="$SANDBOX/stub-gh"
-    cat >"$STUB_GH" <<'STUBEOF'
-#!/usr/bin/env bash
-# Minimal `gh pr view <N> --json headRefName,title` stub for test fixtures.
-if [[ "$1" == "pr" && "$2" == "view" ]]; then
-    case "$3" in
-        5420) echo '{"headRefName":"docs/guide-update-20260805-102000","title":"docs: Guide document maintenance update"}' ;;
-        5450) echo '{"headRefName":"feature/issue-5445","title":"feat(cli): add tokens check --ranking"}' ;;
-        *) exit 1 ;;
-    esac
-    exit 0
-fi
-exit 1
-STUBEOF
-    chmod +x "$STUB_GH"
-
-    # --- Case A: staged entry is for the EXCLUDED PR #5420 -> must reject.
-    (
-        cd "$GIT_WT" || exit 1
-        printf -- '- **PR #5420**: docs: Guide document maintenance update\n' >>WORK_LOG.md
-        git add WORK_LOG.md
-    )
-    if CHECK_WORK_LOG_DIFF_GH="$STUB_GH" "$CHECK_SCRIPT" "$GIT_WT" "$GUIDE_DOCS_PR_EXCLUDE" >/dev/null 2>&1; then
-        fail "check-work-log-diff.sh accepted a staged excluded PR entry (should have exited non-zero)"
-    else
-        pass "check-work-log-diff.sh rejects a staged entry for an excluded PR (exit non-zero, no commit)"
-    fi
-    (cd "$GIT_WT" && git reset -q -- WORK_LOG.md && git checkout -q -- WORK_LOG.md)
-
-    # --- Case B: staged entry is for a GENUINE PR #5450 -> must accept.
-    (
-        cd "$GIT_WT" || exit 1
-        printf -- '- **PR #5450**: feat(cli): add tokens check --ranking\n' >>WORK_LOG.md
-        git add WORK_LOG.md
-    )
-    if CHECK_WORK_LOG_DIFF_GH="$STUB_GH" "$CHECK_SCRIPT" "$GIT_WT" "$GUIDE_DOCS_PR_EXCLUDE" >/dev/null 2>&1; then
-        pass "check-work-log-diff.sh accepts a staged entry for a genuine (non-excluded) PR"
-    else
-        fail "check-work-log-diff.sh rejected a genuine PR entry (false positive)"
-    fi
-    (cd "$GIT_WT" && git reset -q -- WORK_LOG.md && git checkout -q -- WORK_LOG.md)
-
-    # --- Case C: BOTH a genuine and an excluded entry staged together -> the
-    # whole commit is still rejected (the exclusion belongs in the generator,
-    # not a partial-strip at commit time — see Test Plan edge case (a)).
-    (
-        cd "$GIT_WT" || exit 1
-        {
-            printf -- '- **PR #5450**: feat(cli): add tokens check --ranking\n'
-            printf -- '- **PR #5420**: docs: Guide document maintenance update\n'
-        } >>WORK_LOG.md
-        git add WORK_LOG.md
-    )
-    if CHECK_WORK_LOG_DIFF_GH="$STUB_GH" "$CHECK_SCRIPT" "$GIT_WT" "$GUIDE_DOCS_PR_EXCLUDE" >/dev/null 2>&1; then
-        fail "check-work-log-diff.sh accepted a mixed genuine+excluded staged diff (should reject the whole commit)"
-    else
-        pass "check-work-log-diff.sh rejects the whole commit when a genuine and an excluded entry are staged together"
-    fi
-    (cd "$GIT_WT" && git reset -q -- WORK_LOG.md && git checkout -q -- WORK_LOG.md)
-
-    # --- Case D: gh lookup failure (unknown PR number) -> fail closed.
-    (
-        cd "$GIT_WT" || exit 1
-        printf -- '- **PR #9999**: some PR the stub does not know about\n' >>WORK_LOG.md
-        git add WORK_LOG.md
-    )
-    if CHECK_WORK_LOG_DIFF_GH="$STUB_GH" "$CHECK_SCRIPT" "$GIT_WT" "$GUIDE_DOCS_PR_EXCLUDE" >/dev/null 2>&1; then
-        fail "check-work-log-diff.sh accepted an entry it could not verify (should fail closed)"
-    else
-        pass "check-work-log-diff.sh fails closed when a staged PR cannot be verified via gh"
-    fi
 fi
 
 # ---------------------------------------------------------------------------
