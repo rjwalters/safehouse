@@ -3,6 +3,11 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-08-10
+
+- **Issue #95** (closed): loom emits a "digest" envelope type that no safehoused version knows — and unknown types are rejected rather than degraded to chat
+- **PR #96**: feat(envelope): accept `digest` and degrade unknown types to chat
+
 ### 2026-08-07
 
 - **Issue #91** (closed): PreToolUse wiring bypasses the guard-destructive.sh dispatcher, contradicting its own design doc
