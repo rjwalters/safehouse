@@ -14,7 +14,6 @@ _None._
 
 Issues flagged as highest priority (`loom:urgent`).
 
-- **#94**: Host onboarding needs a human on the homeserver, which caps the fleet at the rate an operator can mint Matrix accounts — blocks dynamic scale-out to hundreds of hosts
 - **#22**: Upgrade tuwunel to v1.8.3 for MSC4108 QR login (Element X onboarding)
 
 ## Ready
@@ -62,7 +61,7 @@ _None._
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 0 |
-| Urgent | 2 |
+| Urgent | 1 |
 | Ready (`loom:issue`) | 1 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
