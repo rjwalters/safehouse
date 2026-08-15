@@ -45,6 +45,7 @@ PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
 Issues carrying `loom:curated`.
 
+- **#101**: Unencrypted claims room + client-side provisioning parity — E2EE black-holed the fleet's peer-claim channel *(curated)*
 - **#94**: Host onboarding needs a human on the homeserver, which caps the fleet at the rate an operator can mint Matrix accounts — blocks dynamic scale-out to hundreds of hosts *(curated)*
 - **#24**: Retire the Studio rollback backup once the EC2 homeserver is proven stable *(curated)*
 - **#22**: Upgrade tuwunel to v1.8.3 for MSC4108 QR login (Element X onboarding) *(curated)*
@@ -67,7 +68,7 @@ _None._
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
-| Curated | 3 |
+| Curated | 4 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
