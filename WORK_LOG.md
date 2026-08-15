@@ -5,6 +5,10 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **PR #132**: docs: drop stale spikes/ workspace reference from CLAUDE.md
+- **Issue #129** (closed): Fix stale spikes/ reference in CLAUDE.md after #127 removed it
+- **Issue #131** (closed): Guard friction: worktree-write-confinement-unresolved-var repeatedly blocks mktemp-based scratch config files for safehoused smoke tests
+- **Issue #130** (closed): Guard false positive: write-confinement misparses Python comparison operators in heredocs as shell redirects
 - **PR #127**: chore: remove spikes/qj-coldstart, drop it from workspace members
 - **Issue #125** (closed): Remove spikes/qj-coldstart: throwaway spike whose validation work is done and archived
 - **Issue #123** (closed): Auditor: guard false-positive on read-only python3 heredoc (worktree-write-confinement)
