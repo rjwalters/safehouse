@@ -3,6 +3,10 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-08-15
+
+- **PR #103**: feat: add config schema-version drift check and daemon version in RPC status
+
 ### 2026-08-10
 
 - **Issue #95** (closed): loom emits a "digest" envelope type that no safehoused version knows — and unknown types are rejected rather than degraded to chat
