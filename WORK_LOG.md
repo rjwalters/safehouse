@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **Issue #134** (closed): Guard false-positive: worktree-write-confinement denies python3 heredocs that write nothing
+- **Issue #133** (closed): Guard false-positive: worktree-write-confinement-unresolved-var denies mktemp -d smoke-test idiom
 - **PR #132**: docs: drop stale spikes/ workspace reference from CLAUDE.md
 - **Issue #129** (closed): Fix stale spikes/ reference in CLAUDE.md after #127 removed it
 - **Issue #131** (closed): Guard friction: worktree-write-confinement-unresolved-var repeatedly blocks mktemp-based scratch config files for safehoused smoke tests
