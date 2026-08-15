@@ -1876,7 +1876,7 @@ create_docs_pr() {
   # recheck below can bail out without ever pushing a branch or opening a PR
   # (nothing to clean up on the remote if it does; docs-worktree.sh resets
   # this worktree's branch on the next tick regardless).
-  git -C "$DOCS_WT" commit -m "docs: update WORK_LOG, WORK_PLAN, and README
+  git -C "$DOCS_WT" commit --signoff -m "docs: update WORK_LOG, WORK_PLAN, and README
 
 Automated document maintenance by Guide triage agent."
 
