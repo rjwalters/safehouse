@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **Issue #120** (closed): Guard false positive: worktree-write-confinement blocks read-only python heredocs
+- **Issue #119** (closed): Guard false positive: worktree-write-confinement-unresolved-var blocks mktemp+rm -rf idiom
 - **Issue #117** (closed): Guard false-positive: read-only python3 heredoc denied as catastrophic worktree-write-confinement
 - **Issue #116** (closed): Guard false-positive: mktemp -d smoke-test tmpdirs denied as worktree-write-confinement-unresolved-var
 - **Issue #114** (closed): Guard-decision review: worktree-write-confinement-unresolved-var on mktemp-based scratch dirs — confirm keep-flagged
