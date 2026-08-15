@@ -139,6 +139,12 @@ case ":$PATH:" in
 *) warn "$BIN_DIR is not on your PATH — add it so 'safehoused' is runnable directly." ;;
 esac
 
+# Single source of truth for the config schema version (issue #101,
+# provisioning parity): read from the binary we just built rather than
+# hand-duplicating the number here, so this script can never drift from
+# safehoused/src/main.rs::CONFIG_SCHEMA_VERSION.
+CURRENT_SCHEMA_VERSION=$("$BIN" --schema-version)
+
 # ---------------------------------------------------------------------------
 # 2. Config
 # ---------------------------------------------------------------------------
@@ -167,6 +173,24 @@ gen_passphrase() {
 
 if [ -f "$CONFIG" ]; then
 	step "Config already present — keeping it (idempotent re-run)"
+
+	# Provisioning-parity check (issue #101): warn — never rewrite — when an
+	# existing config predates the binary's current schema. This is the
+	# no-clobber block, so the only allowed action here is a warning; a
+	# stale config keeps booting exactly as before until an operator
+	# chooses to hand-edit it (see safehoused/example-config.toml).
+	CONFIG_SCHEMA_VERSION=$(grep -E '^schema_version[[:space:]]*=' "$CONFIG" | head -1 | grep -oE '[0-9]+' || true)
+	CONFIG_SCHEMA_VERSION=${CONFIG_SCHEMA_VERSION:-0}
+	if [ "$CONFIG_SCHEMA_VERSION" -lt "$CURRENT_SCHEMA_VERSION" ]; then
+		warn "$CONFIG has schema_version=$CONFIG_SCHEMA_VERSION, behind the current"
+		warn "schema_version=$CURRENT_SCHEMA_VERSION. A newer optional field may exist that this"
+		warn "config predates (e.g. [egress], #30) and will never appear on its own —"
+		warn "compare against safehoused/example-config.toml and hand-edit $CONFIG"
+		warn "if you want it. This installer never rewrites an existing config."
+	else
+		ok "$CONFIG schema_version=$CONFIG_SCHEMA_VERSION is current"
+	fi
+
 	ok "$CONFIG left untouched"
 else
 	step "Writing config ($CONFIG)"
@@ -227,6 +251,10 @@ else
 		printf '# integration attaches as "loom_daemon". The allowlist is read once at\n'
 		printf '# boot (not hot-reloaded), so it is baked in here before first start.\n'
 		printf 'personas = ["loom_daemon"]\n'
+		printf '\n'
+		printf '# Config schema this file was written against (issue #101) — lets a\n'
+		printf '# future re-run of this installer warn if this config falls behind.\n'
+		printf 'schema_version = %s\n' "$CURRENT_SCHEMA_VERSION"
 	} >>"$CONFIG"
 
 	# Scrub secrets from the shell as soon as they are on disk.
