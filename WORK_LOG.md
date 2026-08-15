@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **Issue #114** (closed): Guard-decision review: worktree-write-confinement-unresolved-var on mktemp-based scratch dirs — confirm keep-flagged
+- **Issue #113** (closed): Guard: worktree-write-confinement misfires on quoted heredocs containing Python comparison operators (>)
 - **Issue #109** (closed): Recurring DCO sign-off failures: commit.signoff knob unset + Guide's --signoff regressed
 - **PR #110**: fix: set commit.signoff knob, restore Guide --signoff, wire regression test
 - **Issue #105** (closed): Deduplicate the test-only tempdir() helper in mailbox.rs and egress.rs
