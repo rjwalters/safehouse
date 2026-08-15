@@ -27,7 +27,7 @@ Human-approved issues ready for implementation (`loom:issue`).
 
 Issues currently being built (`loom:building`).
 
-- **#125**: Remove spikes/qj-coldstart: throwaway spike whose validation work is done and archived
+_None._
 
 ## PRs Awaiting Review
 
@@ -65,7 +65,7 @@ _None._
 | Operator merge-risk holds | 0 |
 | Urgent | 2 |
 | Ready (`loom:issue`) | 1 |
-| In Progress (`loom:building`) | 1 |
+| In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 1 |
 | Curated | 4 |
