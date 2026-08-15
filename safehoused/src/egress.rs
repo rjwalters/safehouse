@@ -725,39 +725,6 @@ mod tests {
         }
     }
 
-    /// A unique scratch directory under the OS temp dir. Mirrors `mailbox.rs`'s
-    /// test helper to avoid pulling in a `tempfile` dependency.
-    ///
-    /// pid + wall-clock nanos alone are not sufficient uniqueness under
-    /// parallel test execution: macOS/APFS's `SystemTime::now()` granularity
-    /// is coarser than 1ns, so two tests starting in the same burst can
-    /// observe identical nanos and collide on the same directory name.
-    /// `create_dir_all` succeeds silently on an existing dir, so the tests
-    /// then share one `egress.sqlite3` — and whichever test finishes (and
-    /// runs its trailing `remove_dir_all`) first deletes the file out from
-    /// under the other test's still-open connection, which SQLite reports as
-    /// `SQLITE_READONLY_DBMOVED` (#55). A process-wide atomic counter makes
-    /// each call unique regardless of clock resolution.
-    fn tempdir() -> PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "safehoused-egress-test-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            seq
-        ));
-        assert!(
-            !dir.exists(),
-            "tempdir collision: {dir:?} already exists (uniqueness invariant violated)"
-        );
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// A minimal single-purpose HTTP/1.1 server for tests — deliberately not a
     /// crate dependency (`wiremock`/`httpmock`): a bare `TcpListener` plus a
     /// hand-rolled request line/header/body reader is enough to assert what
@@ -985,7 +952,7 @@ mod tests {
 
     #[tokio::test]
     async fn consider_ignores_rooms_not_in_the_allowlist() {
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let egress = Egress::open_in_memory(config(
             &["!allowed:x"],
             &["secret"],
@@ -1007,7 +974,7 @@ mod tests {
 
     #[tokio::test]
     async fn consider_ignores_non_feed_eligible_envelopes() {
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["secret"], 0, dir.join("sink.jsonl")))
                 .unwrap();
@@ -1024,7 +991,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_only_after_delay_elapses() {
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let sink = dir.join("sink.jsonl");
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["nothing"], 0, sink.clone())).unwrap();
@@ -1057,7 +1024,7 @@ mod tests {
 
     #[tokio::test]
     async fn retraction_inside_the_window_suppresses_publish() {
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let sink = dir.join("sink.jsonl");
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["nothing"], 0, sink.clone())).unwrap();
@@ -1078,7 +1045,7 @@ mod tests {
 
     #[tokio::test]
     async fn retraction_of_unrelated_event_does_not_suppress() {
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let sink = dir.join("sink.jsonl");
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["nothing"], 0, sink.clone())).unwrap();
@@ -1098,7 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn consider_redacts_before_queuing() {
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let sink = dir.join("sink.jsonl");
         // Deny the repo owner substring; it must be gone from the queued payload.
         let egress =
@@ -1121,7 +1088,7 @@ mod tests {
     async fn buffer_is_durable_across_reopen() {
         // Mirrors mailbox.rs's restart test: a completion queued before a
         // "restart" (fresh handle over the same file) still publishes after.
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let db = dir.join("egress.sqlite3");
         let sink = dir.join("sink.jsonl");
         {
@@ -1138,7 +1105,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_enqueue_is_ignored() {
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["nothing"], 0, dir.join("sink.jsonl")))
                 .unwrap();
@@ -1158,7 +1125,7 @@ mod tests {
 
     #[tokio::test]
     async fn opening_a_pre_31_store_adds_attempts_and_failed_columns() {
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
         let db = dir.join("egress.sqlite3");
         {
             // Simulate a #30-vintage store: the base table, no attempts/failed.

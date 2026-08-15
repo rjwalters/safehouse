@@ -10,6 +10,8 @@ mod egress;
 mod envelope;
 mod mailbox;
 mod rpc;
+#[cfg(test)]
+mod test_support;
 
 use std::{
     env, fs,
