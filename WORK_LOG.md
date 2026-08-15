@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **PR #127**: chore: remove spikes/qj-coldstart, drop it from workspace members
+- **Issue #125** (closed): Remove spikes/qj-coldstart: throwaway spike whose validation work is done and archived
 - **Issue #123** (closed): Auditor: guard false-positive on read-only python3 heredoc (worktree-write-confinement)
 - **Issue #122** (closed): Auditor: guard false-positive on mktemp -d + heredoc write (worktree-write-confinement-unresolved-var)
 - **Issue #120** (closed): Guard false positive: worktree-write-confinement blocks read-only python heredocs
