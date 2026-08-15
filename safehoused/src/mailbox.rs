@@ -623,7 +623,7 @@ mod tests {
         // handle is dropped and a fresh one opens the same on-disk file), and
         // a persona that only checks in after the restart still gets exactly
         // what it missed.
-        let dir = tempdir();
+        let dir = crate::test_support::tempdir("safehoused-mailbox-test");
         let db_path = dir.join("mailbox.sqlite3");
         {
             let mailbox = Mailbox::open(&db_path).unwrap();
@@ -652,32 +652,5 @@ mod tests {
         assert!(second.is_empty());
 
         std::fs::remove_dir_all(dir).ok();
-    }
-
-    /// A unique scratch directory under the OS temp dir, cleaned up by the
-    /// caller. Avoids pulling in a `tempfile` dependency for one test.
-    ///
-    /// pid + wall-clock nanos alone are not sufficient uniqueness under
-    /// parallel test execution — see the sibling helper in `egress.rs` for
-    /// the full collision analysis (#55). A process-wide atomic counter
-    /// makes each call unique regardless of clock resolution.
-    fn tempdir() -> std::path::PathBuf {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "safehoused-mailbox-test-{}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            seq
-        ));
-        assert!(
-            !dir.exists(),
-            "tempdir collision: {dir:?} already exists (uniqueness invariant violated)"
-        );
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 }
