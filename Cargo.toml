@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["safehoused", "safehouse-mcp", "spikes/qj-coldstart"]
+members = ["safehoused", "safehouse-mcp"]
 
 [workspace.dependencies]
 # "bundled-sqlite" (not "sqlite") vendors sqlite via libsqlite3-sys/bundled instead of

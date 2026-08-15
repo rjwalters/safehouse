@@ -85,8 +85,8 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
   (keyless stdio MCP shim: `safehouse_send` / `safehouse_read` / `safehouse_check` /
   `safehouse_create_room` / `safehouse_add_to_space` / `safehouse_list_rooms` — also runnable as a
   one-shot operator CLI,
-  see "Scripting the socket"), and [`spikes/qj-coldstart/`](spikes/qj-coldstart/) (Q-J
-  provenance).
+  see "Scripting the socket"). Q-J provenance is archived in
+  [`docs/research/2026-07-26-qj-integration-test.md`](docs/research/2026-07-26-qj-integration-test.md).
 - **Per-agent mailbox (D16/D17):** each registered persona gets a durable, sqlite-backed read
   cursor — an agent calls `safehouse_check` on its own cadence and gets exactly what it missed,
   connected or not, surviving a daemon restart mid-gap. `safehoused` never spawns, wakes, or
