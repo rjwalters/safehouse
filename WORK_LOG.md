@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **Issue #117** (closed): Guard false-positive: read-only python3 heredoc denied as catastrophic worktree-write-confinement
+- **Issue #116** (closed): Guard false-positive: mktemp -d smoke-test tmpdirs denied as worktree-write-confinement-unresolved-var
 - **Issue #114** (closed): Guard-decision review: worktree-write-confinement-unresolved-var on mktemp-based scratch dirs — confirm keep-flagged
 - **Issue #113** (closed): Guard: worktree-write-confinement misfires on quoted heredocs containing Python comparison operators (>)
 - **Issue #109** (closed): Recurring DCO sign-off failures: commit.signoff knob unset + Guide's --signoff regressed
