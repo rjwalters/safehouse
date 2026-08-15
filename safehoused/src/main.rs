@@ -49,6 +49,20 @@ use crate::{
 /// optionality through to `on_message`/`on_redaction`.
 type EgressHandle = Option<Arc<Egress>>;
 
+/// The current config schema version (issue #101, provisioning parity).
+/// Bump this whenever a new field is added to [`Config`] that would
+/// otherwise silently no-op on an already-provisioned host until an
+/// operator hand-edits `config.toml` — exactly what happened with `egress`
+/// (#30): `scripts/install.sh` is deliberately no-clobber on an existing
+/// config, so a host provisioned before a field's addition never gets it
+/// automatically. `0` (`u32::default()`, what [`Config::schema_version`]
+/// deserializes to when the key is absent) means "predates this
+/// versioning scheme entirely" — every config written before this change.
+/// `scripts/install.sh` reads this via `safehoused --schema-version` (see
+/// `main()`) so the check has one source of truth instead of a
+/// hand-duplicated number in the shell script.
+const CONFIG_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -90,6 +104,15 @@ struct Config {
     /// non-empty or the daemon refuses to boot (fail-safe, per #28).
     #[serde(default)]
     egress: Option<EgressConfig>,
+    /// Config schema version this file was written against (issue #101,
+    /// provisioning parity). Absent defaults to `0` — "predates this
+    /// versioning scheme" — and the daemon boots identically either way;
+    /// this field exists purely so `scripts/install.sh` can warn an
+    /// operator when re-running against a config that predates the
+    /// current schema, without silently rewriting it (`install.sh` stays
+    /// no-clobber by design). See [`CONFIG_SCHEMA_VERSION`].
+    #[serde(default)]
+    schema_version: u32,
 }
 
 fn load_config() -> Result<Config> {
@@ -103,6 +126,14 @@ fn load_config() -> Result<Config> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Handled before any config/homeserver I/O, so `scripts/install.sh` can
+    // query it from a freshly-built binary with no config.toml required yet
+    // (issue #101). Single source of truth for CONFIG_SCHEMA_VERSION — the
+    // shell script never hand-duplicates the number.
+    if env::args().nth(1).as_deref() == Some("--schema-version") {
+        println!("{CONFIG_SCHEMA_VERSION}");
+        return ExitCode::SUCCESS;
+    }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -114,6 +145,18 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let config = load_config()?;
+    // Advisory only — boot continues either way. A stale schema means a
+    // field like `egress` (#30) may exist that this config predates and
+    // never picked up automatically, since `scripts/install.sh` is
+    // deliberately no-clobber on an existing config.toml.
+    if config.schema_version < CONFIG_SCHEMA_VERSION {
+        eprintln!(
+            "safehoused: warning: config schema_version={} is behind current {} — \
+             re-run scripts/install.sh to see what may be missing (this config is NOT \
+             modified automatically)",
+            config.schema_version, CONFIG_SCHEMA_VERSION
+        );
+    }
     let client = boot(&config).await?;
 
     for persona in &config.personas {
@@ -1010,6 +1053,21 @@ mod config_tests {
     fn unknown_config_key_is_rejected() {
         // `deny_unknown_fields` still holds with the new optional field present.
         assert!(toml::from_str::<Config>(&config_toml("bogus_key = true\n")).is_err());
+    }
+
+    #[test]
+    fn config_without_schema_version_defaults_to_zero() {
+        // Regression: every config written before issue #101 has no
+        // `schema_version` key at all and must keep parsing — `0` is the
+        // "predates this versioning scheme" sentinel, not a parse failure.
+        let config: Config = toml::from_str(&config_toml("")).unwrap();
+        assert_eq!(config.schema_version, 0);
+    }
+
+    #[test]
+    fn config_parses_an_explicit_schema_version() {
+        let config: Config = toml::from_str(&config_toml("schema_version = 1\n")).unwrap();
+        assert_eq!(config.schema_version, 1);
     }
 }
 

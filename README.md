@@ -118,12 +118,23 @@ scripts/install.sh
 ```
 
 It builds `safehoused` into `~/.local/bin`, prompts for the homeserver + bot credentials + recovery
-passphrase (generating the store passphrase for you), writes a `0600` config, verifies the first boot
-(headless login, cross-signing, recovery), registers a supervised service (launchd LaunchAgent on
-macOS / `systemd --user` unit on Linux), and prints the loom-daemon handoff block. Re-running is safe:
+passphrase (generating the store passphrase for you), writes a `0600` config (stamped with the
+current config schema version — see "Provisioning parity" below), verifies the first boot (headless
+login, cross-signing, recovery), registers a supervised service (launchd LaunchAgent on macOS /
+`systemd --user` unit on Linux), and prints the loom-daemon handoff block. Re-running is safe:
 existing config/state is left untouched, the daemon warm-starts, and the service definition is
 refreshed. The installer does **not** create the bot's Matrix account — that is the one admin step
 below (step 1). The manual walkthrough that follows is the reference for what the installer automates.
+
+**Provisioning parity (issue #101).** `scripts/install.sh` is deliberately **no-clobber**: it never
+rewrites an existing `config.toml`, so a host provisioned before a new optional field was added (e.g.
+`[egress]`, #30) never picks it up on its own. Every re-run now compares the config's `schema_version`
+(see [`safehoused/example-config.toml`](safehoused/example-config.toml)) against the binary's current
+one (`safehoused --schema-version`) and **warns** — never rewrites — when the config is behind, so
+drift is visible instead of silent. `safehouse-mcp status` (and `hello`) also surface the running
+daemon's own build version (`version`, alongside `known_types` from #95) for the same reason spelled
+out below in "Diagnosing envelope-type skew": a fleet host quietly running a weeks-old binary is the
+same class of invisible-until-it-bites-you problem, just for the binary instead of the config.
 
 1. **Create the bot's Matrix account** on your homeserver ahead of time — `safehoused` logs in with
    a username/password, it never registers itself. On tuwunel (registration off by default):
@@ -221,6 +232,12 @@ is detectable in band rather than only from the daemon's log. That degrade is al
 unknown type per session, so `journalctl -u safehoused | grep 'unknown envelope type'` names the
 skew without flooding — bounded at 64 distinct types per process, each clamped to 64 bytes, since
 `type` is remote input with no length limit of its own.
+
+**Diagnosing a stale build (#101):** `status` and `hello` also carry `version` — the running
+daemon's own `CARGO_PKG_VERSION`, the provisioning-parity counterpart to `known_types` above. Compare
+it across a fleet (`safehouse-mcp status` on each host) to spot a host still running a weeks-old
+binary, the same class of silent skew that let one host drift onto a config predating the current
+schema (see "Provisioning parity" above) go undiagnosed.
 
 Run `safehouse-mcp --help` for the full flag list. With no subcommand (or on a bare TTY), the
 binary keeps its original behavior unchanged: a stdio MCP server for an MCP client to launch.

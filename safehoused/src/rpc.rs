@@ -38,6 +38,14 @@ use tokio::{
     sync::{mpsc, Mutex},
 };
 
+/// The running binary's own version, advertised in the `hello` and `status`
+/// RPC replies (issue #101, provisioning parity) — same category of silent
+/// skew #95's `known_types` advertisement solved for envelope types, but for
+/// "is this host on a stale build" instead of "does this build know this
+/// envelope type". A local socket affordance only; nothing on the Matrix
+/// wire changes.
+const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use crate::{
     envelope::{self, Envelope},
     mailbox::{Mailbox, MailboxEntry},
@@ -234,6 +242,11 @@ impl Registry {
             // is answerable by a healthcheck, not only by an agent that has
             // already handshaked.
             "known_types": envelope::KNOWN_TYPES,
+            // #101: same rationale as `known_types` above, but for the
+            // running binary's own version rather than its envelope-type
+            // vocabulary — lets a healthcheck answer "is this host on a
+            // stale build" without needing `hello` first.
+            "version": DAEMON_VERSION,
         })
     }
 
@@ -397,6 +410,9 @@ async fn handle_conn(stream: UnixStream, client: Client, registry: Arc<Registry>
                                 // ignores this field behaves exactly as
                                 // before.
                                 "known_types": envelope::KNOWN_TYPES,
+                                // #101: the running binary's own version —
+                                // see `DAEMON_VERSION`'s doc comment.
+                                "version": DAEMON_VERSION,
                             })
                         }
                         Some(p) => json!({
@@ -1148,6 +1164,22 @@ mod tests {
             .contains(&json!("digest")));
     }
 
+    /// #101: the handshake also advertises the running binary's own
+    /// version, mirroring `known_types` above — provisioning-parity
+    /// counterpart to #95's envelope-type skew signal.
+    #[tokio::test]
+    async fn hello_advertises_daemon_version() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["version"], json!(DAEMON_VERSION));
+        assert_eq!(DAEMON_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
     // ---- `status` op (#85) — liveness/staleness observability -------------
 
     /// #95: same advertisement on the one op that needs no persona, so a
@@ -1158,6 +1190,17 @@ mod tests {
         send(&mut write, json!({"op": "status"})).await;
         let reply = recv(&mut read).await;
         assert_eq!(reply["known_types"], json!(envelope::KNOWN_TYPES));
+    }
+
+    /// #101: same rationale as `status_advertises_known_types_before_hello`
+    /// — `status` needs no persona, so it's the healthcheck-friendly place
+    /// to answer "is this host on a stale build".
+    #[tokio::test]
+    async fn status_advertises_daemon_version_before_hello() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(&mut write, json!({"op": "status"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["version"], json!(DAEMON_VERSION));
     }
 
     #[tokio::test]

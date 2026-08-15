@@ -145,3 +145,21 @@ recovery_passphrase = "change-me-as-well"
 # existing configs; a config written from scratch should prefer sink_url.
 # Ignored when sink_url is set.
 # sink_path = "/var/lib/safehoused/completions.jsonl"
+
+# --- Config schema version (issue #101, provisioning parity) ------------
+
+# Which config schema this file was written against. Purely advisory: the
+# daemon boots identically whether this is present, absent, or behind the
+# binary's current schema (safehoused/src/main.rs::CONFIG_SCHEMA_VERSION;
+# query it from a built binary with `safehoused --schema-version`) — it
+# logs a one-line warning at boot if the config predates it, and
+# `scripts/install.sh` checks the same thing on every re-run and WARNS
+# (never rewrites — the installer stays no-clobber on an existing config)
+# when a host's config.toml is behind. This exists because a new optional
+# field (e.g. [egress] above, #30) otherwise silently no-ops on a host
+# whose config predates it, since install.sh never touches an existing
+# config.toml. Absent defaults to 0 ("predates this versioning scheme
+# entirely") — every config that existed before this field was introduced.
+# scripts/install.sh writes this automatically for every config it
+# generates; hand-written configs may set it explicitly or leave it out.
+# schema_version = 1
