@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **Issue #109** (closed): Recurring DCO sign-off failures: commit.signoff knob unset + Guide's --signoff regressed
+- **PR #110**: fix: set commit.signoff knob, restore Guide --signoff, wire regression test
 - **Issue #105** (closed): Deduplicate the test-only tempdir() helper in mailbox.rs and egress.rs
 - **PR #106**: refactor: dedupe test-only tempdir() helper into shared test_support module
 - **PR #103**: feat: add config schema-version drift check and daemon version in RPC status
