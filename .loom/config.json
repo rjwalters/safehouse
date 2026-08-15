@@ -1,6 +1,9 @@
 {
   "version": "2",
   "offlineMode": false,
+  "commit": {
+    "signoff": true
+  },
   "forge": {
     "type": "auto",
     "gitea": {
