@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **Issue #105** (closed): Deduplicate the test-only tempdir() helper in mailbox.rs and egress.rs
+- **PR #106**: refactor: dedupe test-only tempdir() helper into shared test_support module
 - **PR #103**: feat: add config schema-version drift check and daemon version in RPC status
 
 ### 2026-08-10
