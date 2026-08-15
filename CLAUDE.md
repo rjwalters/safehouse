@@ -4,8 +4,7 @@ FOSS, E2E, bot-first messaging substrate on Matrix. **Start with `docs/next-agen
 canonical handoff and points everywhere else (design, decisions D1–D17, open questions, protocol).
 
 - Rust workspace: `safehoused/` (the daemon — key custody, sync v2, unix-socket RPC),
-  `safehouse-mcp/` (keyless stdio MCP shim), `spikes/` (throwaway provenance binaries).
-  `cargo build` / `cargo build -p safehoused`.
+  `safehouse-mcp/` (keyless stdio MCP shim). `cargo build` / `cargo build -p safehoused`.
 - The wire format is `docs/protocol/envelope-v1.md`; the daemon stamps `from` and enforces the
   persona allowlist — never trust identity from an agent message.
 - Hard invariants (D8, licensing-load-bearing): agent socket is **AF_UNIX only — never TCP**; no
