@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-15
 
+- **Issue #123** (closed): Auditor: guard false-positive on read-only python3 heredoc (worktree-write-confinement)
+- **Issue #122** (closed): Auditor: guard false-positive on mktemp -d + heredoc write (worktree-write-confinement-unresolved-var)
 - **Issue #120** (closed): Guard false positive: worktree-write-confinement blocks read-only python heredocs
 - **Issue #119** (closed): Guard false positive: worktree-write-confinement-unresolved-var blocks mktemp+rm -rf idiom
 - **Issue #117** (closed): Guard false-positive: read-only python3 heredoc denied as catastrophic worktree-write-confinement
