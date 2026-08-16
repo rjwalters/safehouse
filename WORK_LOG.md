@@ -5,6 +5,10 @@ triage agent. Newest first.
 
 ### 2026-08-16
 
+- **Issue #144** (closed): Guard false positive: worktree-write-confinement denies a read-only python3 heredoc with no file writes
+- **Issue #143** (closed): Guard false positive: worktree-write-confinement-unresolved-var denies mktemp-scoped scratch dirs
+- **PR #142**: refactor: consolidate test-only Envelope builders into test_support::envelope
+- **Issue #140** (closed): Deduplicate five test-only Envelope-builder helpers scattered across rpc.rs, egress.rs, envelope.rs, mailbox.rs
 - **Issue #138** (closed): Guard false-positive: worktree-write-confinement-unresolved-var blocks the standard mktemp-scoped-cleanup smoke-test idiom
 - **Issue #137** (closed): Guard false-positive: worktree-write-confinement denies read/no-op Python heredocs
 
