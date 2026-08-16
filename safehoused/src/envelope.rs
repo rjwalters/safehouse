@@ -609,6 +609,7 @@ fn html_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::envelope as env;
 
     fn personas() -> Vec<String> {
         vec!["research_agent".to_owned(), "writer_agent".to_owned()]
@@ -739,19 +740,6 @@ mod tests {
     }
 
     // ---- render ----------------------------------------------------------
-
-    fn env(from: &str, to: &str, kind: &str, body: &str) -> Envelope {
-        Envelope {
-            v: 1,
-            from: from.to_owned(),
-            to: to.to_owned(),
-            kind: kind.to_owned(),
-            task_id: None,
-            body: body.to_owned(),
-            wake: None,
-            meta: None,
-        }
-    }
 
     #[test]
     fn render_chat_omits_type_suffix() {

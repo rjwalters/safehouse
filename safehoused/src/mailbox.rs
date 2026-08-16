@@ -300,16 +300,7 @@ mod tests {
     use super::*;
 
     fn env(from: &str, to: &str, body: &str) -> Envelope {
-        Envelope {
-            v: 1,
-            from: from.to_owned(),
-            to: to.to_owned(),
-            kind: "chat".to_owned(),
-            task_id: None,
-            body: body.to_owned(),
-            wake: None,
-            meta: None,
-        }
+        crate::test_support::envelope(from, to, "chat", body)
     }
 
     #[tokio::test]

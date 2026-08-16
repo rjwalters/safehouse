@@ -694,14 +694,8 @@ mod tests {
 
     fn env(kind: &str, meta: Option<Value>) -> Envelope {
         Envelope {
-            v: 1,
-            from: "writer_agent".to_owned(),
-            to: "*".to_owned(),
-            kind: kind.to_owned(),
-            task_id: None,
-            body: "done".to_owned(),
-            wake: None,
             meta,
+            ..crate::test_support::envelope("writer_agent", "*", kind, "done")
         }
     }
 
