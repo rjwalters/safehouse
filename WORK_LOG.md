@@ -5,6 +5,8 @@ triage agent. Newest first.
 
 ### 2026-08-16
 
+- **PR #147**: refactor: consolidate exponential-backoff formula into shared backoff module
+- **Issue #146** (closed): Consolidate duplicated exponential-backoff formula (egress.rs + main.rs)
 - **Issue #144** (closed): Guard false positive: worktree-write-confinement denies a read-only python3 heredoc with no file writes
 - **Issue #143** (closed): Guard false positive: worktree-write-confinement-unresolved-var denies mktemp-scoped scratch dirs
 - **PR #142**: refactor: consolidate test-only Envelope builders into test_support::envelope
