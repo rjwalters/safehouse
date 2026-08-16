@@ -1768,30 +1768,15 @@ mod tests {
 
     fn thread_env(to: &str, task_id: Option<&str>) -> Envelope {
         Envelope {
-            v: 1,
-            from: "writer_agent".to_owned(),
-            to: to.to_owned(),
-            kind: "task".to_owned(),
             task_id: task_id.map(str::to_owned),
-            body: "go".to_owned(),
-            wake: None,
-            meta: None,
+            ..crate::test_support::envelope("writer_agent", to, "task", "go")
         }
     }
 
     // ---- mailbox routing (D16/D17 §7 addressing) --------------------------
 
     fn env_to(from: &str, to: &str) -> Envelope {
-        Envelope {
-            v: 1,
-            from: from.to_owned(),
-            to: to.to_owned(),
-            kind: "chat".to_owned(),
-            task_id: None,
-            body: "hi".to_owned(),
-            wake: None,
-            meta: None,
-        }
+        crate::test_support::envelope(from, to, "chat", "hi")
     }
 
     #[tokio::test]

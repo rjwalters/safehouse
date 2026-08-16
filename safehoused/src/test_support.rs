@@ -8,6 +8,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::envelope::Envelope;
+
 /// A unique scratch directory under the OS temp dir, cleaned up by the
 /// caller. Avoids pulling in a `tempfile` dependency for a handful of tests.
 ///
@@ -43,4 +45,29 @@ pub(crate) fn tempdir(prefix: &str) -> PathBuf {
     );
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+/// A test-fixture `Envelope` with the four fields every caller varies
+/// (`from`/`to`/`kind`/`body`) parameterized and the rest defaulted —
+/// `v: 1`, `task_id: None`, `wake: None`, `meta: None`. This is the shape
+/// shared by `egress.rs`, `envelope.rs`, `mailbox.rs`, and `rpc.rs`'s
+/// `#[cfg(test)]`-only `Envelope` builders, consolidated here (#140) so a
+/// future change to `Envelope`'s shape needs updating in one place instead
+/// of five.
+///
+/// Callers needing a non-default `task_id` or `meta` should use
+/// struct-update syntax against this constructor (e.g.
+/// `Envelope { meta, ..envelope(...) }`) rather than this function growing
+/// more parameters.
+pub(crate) fn envelope(from: &str, to: &str, kind: &str, body: &str) -> Envelope {
+    Envelope {
+        v: 1,
+        from: from.to_owned(),
+        to: to.to_owned(),
+        kind: kind.to_owned(),
+        task_id: None,
+        body: body.to_owned(),
+        wake: None,
+        meta: None,
+    }
 }
