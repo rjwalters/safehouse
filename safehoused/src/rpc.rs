@@ -1596,25 +1596,13 @@ mod tests {
 
     // ---- build_send_envelope — completion meta wiring (#30) ----------------
 
-    fn completion_meta() -> Value {
-        json!({
-            "schema": "completion-v1",
-            "agent": "writer_agent",
-            "repo": "rjwalters/safehouse",
-            "ref": "https://github.com/rjwalters/safehouse/pull/99",
-            "result": "success",
-            "started_at": "2026-07-29T10:00:00Z",
-            "completed_at": "2026-07-29T10:05:00Z",
-        })
-    }
-
     #[test]
     fn build_send_envelope_carries_valid_completion_meta_intact() {
         let req = json!({
             "to": "*",
             "body": "shipped it",
             "type": "completion",
-            "meta": completion_meta(),
+            "meta": crate::test_support::completion_meta(),
         });
         let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert_eq!(env.kind, "completion");
@@ -1631,7 +1619,7 @@ mod tests {
 
     #[test]
     fn build_send_envelope_rejects_completion_with_invalid_meta() {
-        let mut meta = completion_meta();
+        let mut meta = crate::test_support::completion_meta();
         meta["schema"] = json!("wrong-schema");
         let req = json!({"to": "*", "body": "shipped it", "type": "completion", "meta": meta});
         let err = build_send_envelope("writer_agent", &req).unwrap_err();
@@ -1644,7 +1632,7 @@ mod tests {
             "to": "research_agent",
             "body": "hi",
             "type": "chat",
-            "meta": completion_meta(),
+            "meta": crate::test_support::completion_meta(),
         });
         let err = build_send_envelope("writer_agent", &req).unwrap_err();
         assert!(err.to_string().contains("only valid for type"));
