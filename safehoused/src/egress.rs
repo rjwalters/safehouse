@@ -86,16 +86,6 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// sink is back (out of scope here; see the design-doc note on `failed`).
 const MAX_PUBLISH_ATTEMPTS: i64 = 5;
 
-/// Exponential backoff (seconds) after `attempts` failed tries, capped so a
-/// long outage doesn't push `publish_after` absurdly far out.
-fn retry_backoff_secs(attempts: i64) -> i64 {
-    const BASE_SECS: i64 = 2;
-    const CAP_SECS: i64 = 60;
-    BASE_SECS
-        .saturating_pow(attempts.clamp(1, 6) as u32)
-        .min(CAP_SECS)
-}
-
 /// The optional egress block on the daemon [`Config`](crate::Config). Absent =
 /// the whole egress subsystem is disabled (zero behavior change). Matches the
 /// repo's flat, explicit-config style (`#[serde(deny_unknown_fields)]`).
@@ -522,7 +512,8 @@ impl Egress {
                         )
                         .context("marking pending_publish row failed after max attempts")?;
                     } else {
-                        let backoff = retry_backoff_secs(next_attempts);
+                        let backoff =
+                            crate::backoff::exponential_backoff_secs(next_attempts as u32) as i64;
                         eprintln!(
                             "safehoused: egress publish for {event_id} in {room_id} failed \
                              (attempt {next_attempts}/{MAX_PUBLISH_ATTEMPTS}), retrying in \
