@@ -6,6 +6,7 @@
 //! sync v2 loop (D13), decrypt inbound room messages and print them to
 //! stdout. No agents, no unix socket yet — that's the next step.
 
+mod backoff;
 mod egress;
 mod envelope;
 mod mailbox;
@@ -289,15 +290,6 @@ enum SyncDisposition {
 /// daemon's life after one early blip.
 const SYNC_STREAK_RESET: Duration = Duration::from_secs(300);
 
-/// Exponential backoff (seconds) before the `attempt`-th consecutive sync retry,
-/// capped so a long outage doesn't push the delay absurdly far out. Deliberately
-/// the same shape (2s base, 60s cap) as `egress::retry_backoff_secs`.
-fn sync_retry_backoff_secs(attempt: u32) -> u64 {
-    const BASE_SECS: u64 = 2;
-    const CAP_SECS: u64 = 60;
-    BASE_SECS.saturating_pow(attempt.clamp(1, 6)).min(CAP_SECS)
-}
-
 /// Decide whether a sync error is a transient network condition to retry or a
 /// genuine failure to surface fatally. Delegates the actual policy to
 /// [`disposition_for_http_status`] so it is unit-testable without a live
@@ -383,7 +375,7 @@ where
                     }
                     consecutive = consecutive.saturating_add(1);
                     last_failure = Some(now);
-                    let backoff = sync_retry_backoff_secs(consecutive);
+                    let backoff = crate::backoff::exponential_backoff_secs(consecutive);
                     eprintln!(
                         "safehoused: sync error (attempt {consecutive}), retrying in {backoff}s: {}",
                         describe(&err)
@@ -1242,20 +1234,6 @@ mod sync_retry_tests {
     use std::cell::RefCell;
 
     use super::*;
-
-    #[test]
-    fn backoff_is_monotonic_and_capped() {
-        // Increasing, then pinned at the 60s cap — never unbounded.
-        let seq: Vec<u64> = (1..=8).map(sync_retry_backoff_secs).collect();
-        assert_eq!(seq, vec![2, 4, 8, 16, 32, 60, 60, 60]);
-        for w in seq.windows(2) {
-            assert!(w[1] >= w[0], "backoff must be non-decreasing");
-        }
-        assert!(
-            seq.iter().all(|&s| s <= 60),
-            "backoff must be capped so a long outage can't push it out unboundedly"
-        );
-    }
 
     #[test]
     fn transport_and_transient_statuses_are_recoverable() {
