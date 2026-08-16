@@ -3,6 +3,11 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-08-16
+
+- **Issue #138** (closed): Guard false-positive: worktree-write-confinement-unresolved-var blocks the standard mktemp-scoped-cleanup smoke-test idiom
+- **Issue #137** (closed): Guard false-positive: worktree-write-confinement denies read/no-op Python heredocs
+
 ### 2026-08-15
 
 - **Issue #134** (closed): Guard false-positive: worktree-write-confinement denies python3 heredocs that write nothing
