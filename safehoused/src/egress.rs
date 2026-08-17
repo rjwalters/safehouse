@@ -671,18 +671,6 @@ mod tests {
         sync::Mutex as TokioMutex,
     };
 
-    fn completion_meta() -> Value {
-        json!({
-            "schema": "completion-v1",
-            "agent": "writer_agent",
-            "repo": "rjwalters/safehouse",
-            "ref": "https://github.com/rjwalters/safehouse/pull/99",
-            "result": "success",
-            "started_at": "2026-07-29T10:00:00Z",
-            "completed_at": "2026-07-29T10:05:00Z",
-        })
-    }
-
     fn env(kind: &str, meta: Option<Value>) -> Envelope {
         Envelope {
             meta,
@@ -797,7 +785,10 @@ mod tests {
 
     #[test]
     fn is_allowlisted_accepts_well_formed_completion() {
-        assert!(is_allowlisted(&env("completion", Some(completion_meta()))));
+        assert!(is_allowlisted(&env(
+            "completion",
+            Some(crate::test_support::completion_meta())
+        )));
     }
 
     #[test]
@@ -807,15 +798,15 @@ mod tests {
 
     #[test]
     fn is_allowlisted_rejects_completion_with_malformed_meta() {
-        let mut meta = completion_meta();
+        let mut meta = crate::test_support::completion_meta();
         meta["schema"] = json!("something-else");
         assert!(!is_allowlisted(&env("completion", Some(meta))));
 
-        let mut missing = completion_meta();
+        let mut missing = crate::test_support::completion_meta();
         missing.as_object_mut().unwrap().remove("repo");
         assert!(!is_allowlisted(&env("completion", Some(missing))));
 
-        let mut bad_ts = completion_meta();
+        let mut bad_ts = crate::test_support::completion_meta();
         bad_ts["started_at"] = json!("last tuesday");
         assert!(!is_allowlisted(&env("completion", Some(bad_ts))));
     }
@@ -826,7 +817,7 @@ mod tests {
         // never feed-eligible — the type is the gate, not the payload.
         for kind in ["chat", "task", "handoff", "ack"] {
             assert!(
-                !is_allowlisted(&env(kind, Some(completion_meta()))),
+                !is_allowlisted(&env(kind, Some(crate::test_support::completion_meta()))),
                 "type {kind:?} must never be allowlisted"
             );
             assert!(!is_allowlisted(&env(kind, None)));
@@ -858,7 +849,7 @@ mod tests {
 
     #[test]
     fn redact_with_no_patterns_is_identity() {
-        let meta = completion_meta();
+        let meta = crate::test_support::completion_meta();
         assert_eq!(redact(&meta, &[]), meta);
     }
 
@@ -949,7 +940,7 @@ mod tests {
             .consider(
                 "!other:x",
                 "$1",
-                &env("completion", Some(completion_meta())),
+                &env("completion", Some(crate::test_support::completion_meta())),
             )
             .await
             .unwrap();
@@ -981,7 +972,10 @@ mod tests {
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["nothing"], 0, sink.clone())).unwrap();
         // Enqueue with an explicit future publish_after so timing is deterministic.
-        let payload = redact(&completion_meta(), &egress.deny_patterns);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &egress.deny_patterns,
+        );
         egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
 
         // Before the delay elapses: nothing publishes, sink stays absent.
@@ -1013,7 +1007,10 @@ mod tests {
         let sink = dir.join("sink.jsonl");
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["nothing"], 0, sink.clone())).unwrap();
-        let payload = redact(&completion_meta(), &egress.deny_patterns);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &egress.deny_patterns,
+        );
         egress
             .enqueue("!r:x", "$src", 1_000, &payload)
             .await
@@ -1034,7 +1031,10 @@ mod tests {
         let sink = dir.join("sink.jsonl");
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["nothing"], 0, sink.clone())).unwrap();
-        let payload = redact(&completion_meta(), &egress.deny_patterns);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &egress.deny_patterns,
+        );
         egress
             .enqueue("!r:x", "$src", 1_000, &payload)
             .await
@@ -1056,7 +1056,11 @@ mod tests {
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["rjwalters"], 0, sink.clone())).unwrap();
         assert!(egress
-            .consider("!r:x", "$1", &env("completion", Some(completion_meta())))
+            .consider(
+                "!r:x",
+                "$1",
+                &env("completion", Some(crate::test_support::completion_meta()))
+            )
             .await
             .unwrap());
         let due = egress.publish_due(unix_now() + 10).await.unwrap();
@@ -1079,7 +1083,10 @@ mod tests {
         {
             let egress =
                 Egress::open(config(&["!r:x"], &["nothing"], 0, sink.clone()), &db).unwrap();
-            let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+            let payload = redact(
+                &crate::test_support::completion_meta(),
+                &["nothing".to_owned()],
+            );
             egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
         }
         let reopened = Egress::open(config(&["!r:x"], &["nothing"], 0, sink.clone()), &db).unwrap();
@@ -1094,7 +1101,10 @@ mod tests {
         let egress =
             Egress::open_in_memory(config(&["!r:x"], &["nothing"], 0, dir.join("sink.jsonl")))
                 .unwrap();
-        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &["nothing".to_owned()],
+        );
         egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
         egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
         let due = egress.publish_due(2_000).await.unwrap();
@@ -1151,7 +1161,10 @@ mod tests {
     async fn http_sink_posts_expected_payload_only_after_delay() {
         let (url, received) = spawn_mock_sink(vec![200]).await;
         let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
-        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &["nothing".to_owned()],
+        );
         egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
 
         // Before the delay elapses: no request at all.
@@ -1174,7 +1187,10 @@ mod tests {
     async fn http_sink_5xx_triggers_bounded_retry_then_succeeds() {
         let (url, received) = spawn_mock_sink(vec![500, 500, 200]).await;
         let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
-        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &["nothing".to_owned()],
+        );
         egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
 
         // Attempt 1: 500 -> retryable, row rescheduled (not published, not failed).
@@ -1194,7 +1210,10 @@ mod tests {
     async fn http_sink_4xx_does_not_retry() {
         let (url, received) = spawn_mock_sink(vec![400]).await;
         let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
-        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &["nothing".to_owned()],
+        );
         egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
 
         let due = egress.publish_due(1_000).await.unwrap();
@@ -1215,7 +1234,10 @@ mod tests {
     async fn http_sink_gives_up_after_max_attempts_on_repeated_5xx() {
         let (url, received) = spawn_mock_sink(vec![500]).await;
         let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
-        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &["nothing".to_owned()],
+        );
         egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
 
         let mut now = 1_000i64;
@@ -1245,7 +1267,10 @@ mod tests {
         let egress =
             Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, unreachable_addr()))
                 .unwrap();
-        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &["nothing".to_owned()],
+        );
         egress.enqueue("!r:x", "$1", 1_000, &payload).await.unwrap();
 
         // Bounded by the test harness itself: if this hangs, the test times
@@ -1268,7 +1293,10 @@ mod tests {
         // path, sharing the same connection) keep working.
         let (url, _received) = spawn_mock_sink(vec![500]).await;
         let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
-        let payload = redact(&completion_meta(), &["nothing".to_owned()]);
+        let payload = redact(
+            &crate::test_support::completion_meta(),
+            &["nothing".to_owned()],
+        );
         egress
             .enqueue("!r:x", "$stuck", 1_000, &payload)
             .await
@@ -1277,7 +1305,11 @@ mod tests {
 
         // consider() must still work immediately after a publish attempt.
         let queued = egress
-            .consider("!r:x", "$new", &env("completion", Some(completion_meta())))
+            .consider(
+                "!r:x",
+                "$new",
+                &env("completion", Some(crate::test_support::completion_meta())),
+            )
             .await
             .unwrap();
         assert!(queued);

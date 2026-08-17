@@ -8,6 +8,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use serde_json::{json, Value};
+
 use crate::envelope::Envelope;
 
 /// A unique scratch directory under the OS temp dir, cleaned up by the
@@ -70,4 +72,19 @@ pub(crate) fn envelope(from: &str, to: &str, kind: &str, body: &str) -> Envelope
         wake: None,
         meta: None,
     }
+}
+
+/// A fixture `completion-v1` payload shared by `egress.rs`'s and `rpc.rs`'s
+/// `#[cfg(test)]`-only completion-metadata tests, consolidated here (#149) so
+/// the two byte-identical private copies don't drift.
+pub(crate) fn completion_meta() -> Value {
+    json!({
+        "schema": "completion-v1",
+        "agent": "writer_agent",
+        "repo": "rjwalters/safehouse",
+        "ref": "https://github.com/rjwalters/safehouse/pull/99",
+        "result": "success",
+        "started_at": "2026-07-29T10:00:00Z",
+        "completed_at": "2026-07-29T10:05:00Z",
+    })
 }
