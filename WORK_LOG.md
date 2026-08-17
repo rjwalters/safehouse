@@ -3,6 +3,11 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-08-17
+
+- **PR #151**: refactor: deduplicate completion_meta() test helper into test_support
+- **Issue #149** (closed): Deduplicate identical completion_meta() test helper (egress.rs + rpc.rs)
+
 ### 2026-08-16
 
 - **PR #147**: refactor: consolidate exponential-backoff formula into shared backoff module
