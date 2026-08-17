@@ -350,6 +350,8 @@ install_launchd() {
 		    <true/>
 		    <key>KeepAlive</key>
 		    <true/>
+		    <key>ThrottleInterval</key>
+		    <integer>5</integer>
 		    <key>ProcessType</key>
 		    <string>Background</string>
 		    <key>StandardOutPath</key>
