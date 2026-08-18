@@ -1,8 +1,8 @@
 # Claude Code Settings
 
 This directory contains the Claude Code configuration Loom installs into this
-project (`settings.json`, `agents/`, `commands/loom/`, and this `README.md`
-itself), refreshed on `loom update` / reinstall and by
+project (`settings.json`, `agents/`, `commands/loom/`, `biome.jsonc`, and this
+`README.md` itself), refreshed on `loom update` / reinstall and by
 `./.loom/scripts/resync-installed.sh`. See `../.github/CONFIGURATION.md` for
 the companion GitHub issue/label workflow configuration Loom installs
 alongside it.
@@ -13,6 +13,7 @@ alongside it.
 - **`settings.local.json`**: Personal preferences (gitignored, create if needed)
 - **`agents/`**: Custom subagent definitions for Loom roles (see below)
 - **`commands/loom/`**: Slash command definitions for each Loom role (see "Slash Commands" below)
+- **`biome.jsonc`**: Nested [Biome](https://biomejs.dev) config (`"root": false`) that keeps the Loom-owned paths above — `settings.json`, `agents/`, `commands/loom/` — out of your repo-wide `biome check .`. Loom writes those files with its own machine formatting, which will not match your Biome config. The exclusion is deliberately narrow: your own files under `.claude/` are still linted. (`.loom/biome.jsonc` is the companion blanket carve-out for `.loom/`; see `../.loom/README.md`.)
 
 ## Pre-approved Commands
 
@@ -67,8 +68,11 @@ Loom provides a single **unified `mcp-loom` MCP server** that consolidates log
 monitoring, terminal management, and UI/state control. It replaces the
 historical trio of separate `loom-logs` / `loom-terminals` / `loom-ui`
 servers. The server is registered once per machine at **user scope** by the
-Loom installer (`scripts/install-loom.sh`, refreshed by `loom update`) — there
-is no per-project `.mcp.json` in this repo to configure or approve.
+Loom installer (`scripts/install-loom.sh`, refreshed by `loom update`) — Loom
+itself never writes or requires a per-project `.mcp.json` in this repo. If a
+`.mcp.json` file exists here, some *other* tool created it to register its own
+MCP server(s); it is unrelated to Loom's user-scope registration and this
+README's Loom-specific guidance below is unaffected either way.
 Representative tools by category:
 
 **Log tools**:
