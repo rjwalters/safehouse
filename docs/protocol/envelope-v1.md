@@ -149,6 +149,29 @@ JSON. `meta` is the *machine* view, exactly as the envelope `body` is the machin
 All seven fields are required and their names are `[A-Za-z0-9_]`-safe (§1.3). `ref` is a JSON key
 only — it is not a reserved word on the wire.
 
+**`visibility` (optional).** A producer MAY additionally set `meta.visibility` to the exact string
+`"public"` or `"private"`, reflecting whether the `repo` the completion refers to is public or
+private:
+
+```jsonc
+"meta": {
+  "schema": "completion-v1",
+  // ...the seven required fields above...
+  "visibility": "public"               // "public" | "private" — OMITTED when unknown
+}
+```
+
+The key MUST be omitted (not sent as `null` or any other placeholder) when the producer cannot
+determine visibility — e.g. an older producer that predates this field, or one whose repo lookup
+does not return it. Per §9, this is an additive field carried as opaque `meta` like the rest of
+`completion-v1`; it is **not schema-enforced** here — `completion-v1` validation (the malformed-`meta`
+rule below) does not require or inspect it. It is instead **egress-consumer-enforced**: an egress
+publisher gates the public feed on `meta.visibility == "public"` and fails closed on anything else
+(absent key, `null`, a non-string value, or any other string, including `"private"`) — see the egress
+publisher's own docs/design for the authoritative rule. This keeps the private-repo disclosure
+decision in the one place that actually copies content out of the room, rather than in envelope
+validation, which only governs wire shape.
+
 **Validation and the malformed-`meta` rule.** `meta` is carried on the wire as an opaque object so a
 malformed `completion` never breaks envelope parsing (§9 forward-compat). Validation against
 `completion-v1` is a separate, strict gate. **A `completion` envelope whose `meta` is absent or fails

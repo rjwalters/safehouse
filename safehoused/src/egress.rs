@@ -167,6 +167,25 @@ pub fn is_allowlisted(env: &Envelope) -> bool {
             .is_some_and(|m| validate_completion_meta(m).is_ok())
 }
 
+/// Whether a feed-eligible `meta` is also **publish**-eligible: the second,
+/// independent gate this issue adds on top of [`is_allowlisted`].
+///
+/// Fails closed: only the exact JSON string `"public"` for `meta.visibility`
+/// returns `true`. Every other shape — the key absent, `null`, a non-string
+/// value, or any other string (including `"private"`) — returns `false`.
+/// Absence must never be treated as public: an older producer that predates
+/// this field, or one that could not determine visibility, must never leak a
+/// private repo's completion onto the public feed by omission.
+///
+/// This is deliberately a separate check from `is_allowlisted` rather than
+/// folded into it, so the two failure modes stay distinguishable at the
+/// [`Egress::consider`] call site: "not feed-eligible at all" (wrong room,
+/// wrong type, malformed `completion-v1` meta — silent today) vs. "eligible
+/// but withheld for visibility" (worth its own log line — see `consider`).
+pub fn is_public_visibility(meta: &Value) -> bool {
+    meta.get("visibility") == Some(&Value::String("public".to_owned()))
+}
+
 /// Apply the deny-pattern list to every string value in `meta`, recursively.
 ///
 /// **Matching is literal substring** (not regex): a deny pattern matches
@@ -368,12 +387,19 @@ impl Egress {
 
     /// Consider one observed envelope for the feed. Returns `Ok(true)` when the
     /// envelope was redacted and enqueued into the delay buffer, `Ok(false)`
-    /// when it was ignored (wrong room, wrong type, or not feed-eligible).
+    /// when it was ignored (wrong room, wrong type, not feed-eligible, or
+    /// withheld for visibility).
     ///
-    /// This is where allowlist and redaction compose: the room must be opted in
-    /// **and** [`is_allowlisted`] must pass; only then is the payload redacted
-    /// and buffered. Duplicate `(room_id, event_id)` enqueues are ignored, so a
-    /// re-observed event never double-publishes.
+    /// This is where allowlist, visibility, and redaction compose: the room
+    /// must be opted in, [`is_allowlisted`] must pass, **and**
+    /// [`is_public_visibility`] must pass; only then is the payload redacted
+    /// and buffered. The room/type/meta checks fail silently (as before); a
+    /// visibility withholding gets its own log line, since — unlike the
+    /// others — it is not a malformed/unexpected input, but an
+    /// otherwise-valid completion that this repo's owner has asked not to
+    /// leave the private signal room (fail-closed: this is the security
+    /// boundary this whole gate exists for). Duplicate `(room_id, event_id)`
+    /// enqueues are ignored, so a re-observed event never double-publishes.
     pub async fn consider(&self, room_id: &str, event_id: &str, env: &Envelope) -> Result<bool> {
         if !self.is_egress_room(room_id) || !is_allowlisted(env) {
             return Ok(false);
@@ -383,6 +409,17 @@ impl Egress {
             .meta
             .as_ref()
             .expect("is_allowlisted guarantees meta is present");
+        if !is_public_visibility(meta) {
+            // Withheld for visibility, not ignored outright: the envelope is
+            // still delivered to / stored in the (private) signal room
+            // exactly as today (this function only governs the public-feed
+            // sink) — only the egress publish is suppressed.
+            eprintln!(
+                "safehoused: egress withheld completion {event_id} in {room_id} \
+                 (meta.visibility is not \"public\")"
+            );
+            return Ok(false);
+        }
         let redacted = redact(meta, &self.deny_patterns);
         let publish_after = unix_now() + self.delay_seconds as i64;
         self.enqueue(room_id, event_id, publish_after, &redacted)
@@ -671,6 +708,17 @@ mod tests {
         sync::Mutex as TokioMutex,
     };
 
+    /// [`crate::test_support::completion_meta`] plus `visibility: "public"` —
+    /// the shape needed to clear both `is_allowlisted` and the new
+    /// [`is_public_visibility`] gate, for tests that only care about
+    /// exercising the rest of `consider`/`publish_due` and would otherwise be
+    /// withheld by the visibility gate this issue adds.
+    fn public_completion_meta() -> Value {
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("public");
+        meta
+    }
+
     fn env(kind: &str, meta: Option<Value>) -> Envelope {
         Envelope {
             meta,
@@ -824,6 +872,49 @@ mod tests {
         }
     }
 
+    // ---- is_public_visibility — the fail-closed visibility gate ------------
+
+    #[test]
+    fn is_public_visibility_accepts_exact_public_string() {
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("public");
+        assert!(is_public_visibility(&meta));
+    }
+
+    #[test]
+    fn is_public_visibility_rejects_private_string() {
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("private");
+        assert!(!is_public_visibility(&meta));
+    }
+
+    #[test]
+    fn is_public_visibility_rejects_absent_key() {
+        // No `visibility` key at all (the fixture's default shape) must fail
+        // closed — absence must never be treated as public.
+        let meta = crate::test_support::completion_meta();
+        assert!(!is_public_visibility(&meta));
+    }
+
+    #[test]
+    fn is_public_visibility_rejects_non_string_values() {
+        for value in [json!(null), json!(123), json!(true), json!(["public"])] {
+            let mut meta = crate::test_support::completion_meta();
+            meta["visibility"] = value.clone();
+            assert!(
+                !is_public_visibility(&meta),
+                "non-string visibility {value:?} must be withheld"
+            );
+        }
+    }
+
+    #[test]
+    fn is_public_visibility_rejects_unrecognized_strings() {
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("internal");
+        assert!(!is_public_visibility(&meta));
+    }
+
     // ---- redact ------------------------------------------------------------
 
     #[test]
@@ -965,6 +1056,121 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// How many rows (of any state) exist in the delay buffer — used to
+    /// assert a withheld/ignored `consider` left nothing queued at all,
+    /// not merely nothing *due*.
+    async fn pending_publish_row_count(egress: &Egress) -> i64 {
+        let conn = egress.conn.lock().await;
+        conn.query_row("SELECT COUNT(*) FROM pending_publish", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn consider_publishes_when_visibility_is_public() {
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
+        let egress =
+            Egress::open_in_memory(config(&["!r:x"], &["secret"], 0, dir.join("sink.jsonl")))
+                .unwrap();
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("public");
+        let queued = egress
+            .consider("!r:x", "$1", &env("completion", Some(meta)))
+            .await
+            .unwrap();
+        assert!(queued, "visibility: \"public\" must be publish-eligible");
+        assert_eq!(pending_publish_row_count(&egress).await, 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn consider_withholds_when_visibility_is_private() {
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
+        let egress =
+            Egress::open_in_memory(config(&["!r:x"], &["secret"], 0, dir.join("sink.jsonl")))
+                .unwrap();
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("private");
+        let queued = egress
+            .consider("!r:x", "$1", &env("completion", Some(meta)))
+            .await
+            .unwrap();
+        assert!(!queued, "visibility: \"private\" must never publish");
+        assert_eq!(
+            pending_publish_row_count(&egress).await,
+            0,
+            "a withheld completion must leave nothing queued, not merely nothing due"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn consider_withholds_when_visibility_is_absent() {
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
+        let egress =
+            Egress::open_in_memory(config(&["!r:x"], &["secret"], 0, dir.join("sink.jsonl")))
+                .unwrap();
+        // The default fixture carries no `visibility` key at all — absence
+        // must fail closed, matching an older producer that predates the
+        // field, not be treated as implicitly public.
+        let meta = crate::test_support::completion_meta();
+        let queued = egress
+            .consider("!r:x", "$1", &env("completion", Some(meta)))
+            .await
+            .unwrap();
+        assert!(!queued, "an absent visibility key must never publish");
+        assert_eq!(pending_publish_row_count(&egress).await, 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn consider_withholds_when_visibility_is_non_string() {
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
+        let egress =
+            Egress::open_in_memory(config(&["!r:x"], &["secret"], 0, dir.join("sink.jsonl")))
+                .unwrap();
+        for (idx, value) in [json!(123), json!(true), json!(null)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut meta = crate::test_support::completion_meta();
+            meta["visibility"] = value.clone();
+            let queued = egress
+                .consider(
+                    "!r:x",
+                    &format!("$non-string-{idx}"),
+                    &env("completion", Some(meta)),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !queued,
+                "non-string visibility {value:?} must never publish"
+            );
+        }
+        assert_eq!(pending_publish_row_count(&egress).await, 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn consider_withholds_unrecognized_visibility_strings() {
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
+        let egress =
+            Egress::open_in_memory(config(&["!r:x"], &["secret"], 0, dir.join("sink.jsonl")))
+                .unwrap();
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("internal");
+        let queued = egress
+            .consider("!r:x", "$1", &env("completion", Some(meta)))
+            .await
+            .unwrap();
+        assert!(
+            !queued,
+            "an unrecognized visibility string must never publish"
+        );
+        assert_eq!(pending_publish_row_count(&egress).await, 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[tokio::test]
     async fn publish_only_after_delay_elapses() {
         let dir = crate::test_support::tempdir("safehoused-egress-test");
@@ -1059,7 +1265,7 @@ mod tests {
             .consider(
                 "!r:x",
                 "$1",
-                &env("completion", Some(crate::test_support::completion_meta()))
+                &env("completion", Some(public_completion_meta()))
             )
             .await
             .unwrap());
@@ -1308,7 +1514,7 @@ mod tests {
             .consider(
                 "!r:x",
                 "$new",
-                &env("completion", Some(crate::test_support::completion_meta())),
+                &env("completion", Some(public_completion_meta())),
             )
             .await
             .unwrap();
