@@ -3715,6 +3715,10 @@ concurrency ceiling 5" and share it with the team:
         "enabled": true,
         "baseSecs": 60,
         "maxSecs": 900
+      },
+      "noopCooldown": {
+        "enabled": true,
+        "cooldownSecs": 3600
       }
     },
     "hostBreaker": {
@@ -3795,6 +3799,8 @@ knobs not yet audited here.
 | `autonomous.workFinder.dispatchBackoff.enabled` | `LOOM_DISPATCH_BACKOFF` | `true` | Per-issue dispatch backoff on/off (#4485). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config |
 | `autonomous.workFinder.dispatchBackoff.baseSecs` | `LOOM_DISPATCH_BACKOFF_BASE_SECS` | `60` | Backoff applied after the **first** failed dispatch of an issue; doubles per consecutive failure. Zero/invalid → default |
 | `autonomous.workFinder.dispatchBackoff.maxSecs` | `LOOM_DISPATCH_BACKOFF_MAX_SECS` | `900` | Ceiling on the doubling — also the idle window after which an issue's consecutive-failure tally restarts at zero. Zero/invalid → default; clamped up to `baseSecs` |
+| `autonomous.workFinder.noopCooldown.enabled` | `LOOM_WORK_FINDER_NOOP_COOLDOWN` | `true` | No-op re-dispatch cooldown on/off (#6670). A safety backstop — defaults on. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config |
+| `autonomous.workFinder.noopCooldown.cooldownSecs` | `LOOM_WORK_FINDER_NOOP_COOLDOWN_SECS` | `3600` | How long a self-reported no-op release (`loom-daemon noop-cooldown record` / `RecordNoopRelease`) holds an issue out of dispatch. Flat, non-exponential — every record re-arms the same window. Zero/invalid → default |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_THRESHOLD` | `3` | How many **distinct** issues must die in `spawn-claude.sh`'s token-selection step (exit 78) inside the window below before new dispatch to that workspace is paused (#6614). Distinct *issues*, not raw failures: one issue cycling through its own `dispatchBackoff` can never trip it. Crossing it trips the existing pre-flight advisory (#4386) + half-open dispatch gate (#5030) — one loud `ERROR` plus a `daemon.preflight.advisory` event — and the first dispatch that gets past token selection clears it. Zero/invalid → default |
 | *(env only)* | `LOOM_EMPTY_POOL_BREAKER_WINDOW_SECS` | `1800` | Trailing window over which those distinct token-selection deaths are counted (#6614) — twice the `dispatchBackoff.maxSecs` plateau, so a systemic fault always accumulates while isolated failures spaced further apart never do. Zero/invalid → default |
 | `autonomous.hostBreaker.enabled` | `LOOM_HOST_BREAKER` | `true` | Host-distress circuit breaker on/off (#4235). A safety backstop — **defaults on**. Env truthy (`1`/`true`/`yes`/`on`) enables, any other value disables; wins over config. **Restart required** — resolved once at startup and registered as a process-global handle (#5963). See [Host-distress circuit breaker](#host-distress-circuit-breaker-4235) below |
@@ -4134,6 +4140,42 @@ per issue and logs a loud `LABEL FLAPPING` warning at 6 writes in 5 minutes
 (a healthy dispatch writes exactly 2), so the pattern shows up in `daemon.log`
 instead of only in the forge timeline. Disable with `LOOM_DISPATCH_BACKOFF=0` or
 `autonomous.workFinder.dispatchBackoff.enabled = false`.
+
+**No-op re-dispatch cooldown (#6670).** Both brakes above bound a *failing*
+issue's retry rate; neither covers a sweep that runs to a clean, successful
+conclusion and finds nothing to do — a phase checkpoint was written, the
+`loom:building` claim was released cleanly back to `loom:issue`, and zero
+forge/issue mutation happened. A standing/tracking issue with no pending
+content change is the canonical shape: the observed incident was ~20
+claim/release cycles on one issue in ~4 hours, including two dispatches an
+hour apart that reached the *identical* "no actionable delta, releasing the
+claim" conclusion with zero content change in between — each one burning a
+full dispatch slot and agent session purely to re-confirm "still nothing to
+do." Neither the quarantine nor the dispatch backoff trips on this shape: the
+sweep made real lifecycle progress (it reached a genuine conclusion, not a
+crash), so it looks identical to a normal healthy completion from the
+reaper's point of view.
+
+This mechanism is deliberately **call-through only** — unlike quarantine and
+dispatch backoff, nothing in `reap_once`'s own terminal-outcome
+classification infers it automatically. A sweep (or the `/loom:sweep`
+orchestrator driving it) that reaches "no actionable delta this pass" reports
+that back explicitly: `loom-daemon noop-cooldown record --issue <N> --reason
+"..."` (or the underlying `RecordNoopRelease` IPC request), mirroring how
+`build-gate.sh` calls `loom-daemon dispatch-backoff record` on a step timeout
+(#6192). Each call arms (or refreshes) a flat `cooldownSecs` window — unlike
+the backoff's exponential doubling, repeated no-op reports never grow the
+window, they just re-arm the same one. The work finder drops a
+cooling-down candidate before the capacity gate exactly like quarantine and
+backoff (reported as `noop-cooldown-skip` on the per-tick summary line), and
+the three mechanisms are fully independent: an issue can be quarantined,
+backed off, and cooling down all at once, and clearing one never touches the
+others. `loom-daemon quarantine clear <issue>` releases a no-op cooldown too,
+the same "let this run now" operator lever it already applies to the dispatch
+backoff. Any dispatch that goes on to make real checkpoint progress on the
+issue clears its cooldown automatically. Defaults **on**; disable with
+`LOOM_WORK_FINDER_NOOP_COOLDOWN=0` or
+`autonomous.workFinder.noopCooldown.enabled = false`.
 
 ### Host-distress circuit breaker (#4235)
 
@@ -6828,6 +6870,9 @@ automation — nothing fires it on its own.
 
 ```bash
 loom-daemon restart          # send RestartDaemon over the IPC socket
+loom-daemon restart --reload-supervisor   # launchd only: bootout+bootstrap the job so
+                                           # a hand-edited plist's env takes effect (#6682,
+                                           # see "Changing daemon environment variables" below)
 ```
 
 - **Mechanism (macOS):** the plist uses `KeepAlive:{SuccessfulExit:true}` and the
@@ -6966,18 +7011,69 @@ is deliberately silent; this is macOS/launchd-specific (systemd re-reads
 `Environment=` fresh via `daemon-reload` on every unit reload, so there is
 nothing to detect on that path).
 
-**The actual env-change path** is either of:
+**The actual env-change path** is one of:
 
 ```bash
-# Option A: re-render + re-bootstrap in one step (the normal path)
+# Option A (preferred): the supervised reload primitive (#6682)
+loom-daemon restart --reload-supervisor
+
+# Option B: re-render + re-bootstrap in one step (also picks up plist/label/domain changes)
 ./.loom/scripts/cli/loom-daemon-start.sh
 
-# Option B: bootout the stale bootstrapped job, then bootstrap the edited plist
+# Option C: bootout the stale bootstrapped job, then bootstrap the edited plist, by hand
 launchctl bootout gui/$(id -u)/com.rjwalters.loom-daemon
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rjwalters.loom-daemon.plist
 ```
 
-Both make launchd re-read the plist file, which a plain `restart` never does.
+All three make launchd re-read the plist file, which a plain `restart` never does.
+
+**Option A — `loom-daemon restart --reload-supervisor` (#6682)** is the
+supervised version of Option C: a local `launchctl bootout` immediately
+followed by `launchctl bootstrap` against the *already-installed* plist (it
+does not re-render anything — pair it with a prior `loom-daemon-start.sh` run,
+or Option B directly, if the plist itself also needs regenerating). It exists
+because doing Option C by hand is racy: `launchctl bootout` is
+**asynchronous** — it returns before the kernel has actually finished tearing
+the old job down — so an immediate `bootstrap` can fail with `Bootstrap
+failed: 5: Input/output error` even though the plist is perfectly valid,
+leaving the job **unloaded with nothing to restart it**. `--reload-supervisor`
+settles after the bootout (polling `launchctl print` until the job is
+actually gone, bounded by `LOOM_DAEMON_BOOTOUT_SETTLE_SECS`, default 5s) and
+retries the bootstrap specifically on that EIO shape (bounded by
+`LOOM_DAEMON_BOOTSTRAP_RETRY_ATTEMPTS`, default 4, `LOOM_DAEMON_BOOTSTRAP_RETRY_SECS`
+apart, default 2s) — the same retry shape `loom-daemon-start.sh` already
+proved in production for this exact race (#5081), now available against an
+**already-running** daemon rather than only at start-script invocation time.
+`already bootstrapped` (launchd error 37) is treated as a success, not a
+failure. If every retry is exhausted, it fails loudly (non-zero exit) and
+prints the exact `launchctl bootstrap <domain> <plist>` command to run by
+hand — never leaving the job unloaded silently.
+
+`--reload-supervisor` is a **local, launchctl-shelling CLI operation** — it
+never talks to the running daemon over its Unix socket at all (the whole
+point is bootstrapping a fresh process from a fresh plist read, independent
+of anything the currently-running daemon could report), and it refuses
+outright — no `launchctl` invocation at all — on a host that is not
+launchd-supervised: on systemd, a unit drop-in edit plus a plain `systemctl
+--user daemon-reload` already picks up new `Environment=` lines on the next
+restart (it re-reads the unit file fresh every time), so there is no
+equivalent gap to close there — see "Env keys carried forward across a
+re-render" below for how to trigger that restart.
+
+**No drain required first on launchd — but the reverse holds on systemd.**
+A launchd bootout tears the job down before bootstrapping it back, but an
+in-flight sweep is not killed by it: every sweep gets its own process group
+(#3800) and reparents to `launchd` (`ppid=1`) rather than dying with the job
+that spawned it — confirmed directly in the incident `--reload-supervisor`
+was built to fix. So `--reload-supervisor` needs no `--drain` first, and
+never accepts `--drain`/`--abort-drain`/`--then-exit` (it refuses the
+combination outright — those flags only make sense against the socket-based
+restart request this primitive deliberately bypasses). **This is specifically
+NOT true on systemd**: there, `restart` (with or without `--drain`) runs the
+unit's stop job over the whole cgroup, which reaps every sweep/role-run child
+that has not already reparented out of it (#5119) — so the systemd env-change
+path above should always be followed by `loom-daemon restart --drain`, not a
+plain `restart`, to finish in-flight work first.
 
 #### Env keys carried forward across a re-render (#4522, #5344)
 
