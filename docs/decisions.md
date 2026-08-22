@@ -56,6 +56,28 @@ agent-to-agent; dispatch is driven by the room event stream, not local sends.
 **Why:** gives the human phone client a complete live view + remote control for free, one code path,
 no dual-delivery consistency problems. At ≤20 participants the round-trip cost is negligible.
 
+**⚠️ Amended 2026-08-15 (#101) — narrow, documented carve-out for the fleet's peer-claim room.**
+The fleet's claims room (loom-daemon's peer-claim coordination channel — issue numbers, hostnames,
+claim TTLs) is created **without** `m.room.encryption`, via a standalone client-side script
+(`scripts/create-claims-room.sh` / `spikes/create-claims-room`) that bypasses `safehoused`'s own
+`create_room` RPC op entirely rather than adding an encryption opt-out to it. The decision is
+otherwise unchanged: `create_room` (`rpc.rs`) still unconditionally calls `room.enable_encryption()`
+for every ordinary message room, and every other room a persona creates over the socket stays
+encrypted by default.
+
+**Why this carve-out, and why it's narrow:** an E2E room is only as available as its crypto store —
+after a crypto-store loss on one fleet host, the claims room went fleet-wide dark (`advertised>0,
+received=0` on every host, symmetric, with healthy homeserver connectivity and correct room
+membership) with no diagnostic signal pointing at *why*. Claim payloads are coordination metadata,
+not secrets: names, numbers, and timestamps an operator would happily read over an unencrypted
+channel. Weighed against that: D6's actual rationale (one code path, a live phone view, no
+dual-delivery consistency problem) does not depend on encryption specifically — it depends on
+*the room* being the source of truth, which an unencrypted room still is. This carve-out applies to
+**exactly one room** (the peer-claim channel) and does not generalize — every other room, including
+same-host agent-to-agent chat, keeps D6's encrypted default, and the daemon's own `create_room` RPC
+op is intentionally left unchanged (no opt-out flag) so that default cannot be silently weakened by
+any allowlisted persona calling the general-purpose RPC surface.
+
 ## D7 — Name: safehouse
 Daemon binary: `safehoused`. Chosen for "a secure place where agents and their handlers meet."
 

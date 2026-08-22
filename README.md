@@ -192,6 +192,41 @@ same class of invisible-until-it-bites-you problem, just for the binary instead 
    new host's daemon auto-joins on its next sync (even if it's still cold-starting when the
    invite is sent).
 
+## Claims room (unencrypted, D6 carve-out)
+
+Loom-daemon's fleet-wide peer-claim coordination channel (issue numbers, hostnames, claim TTLs) is
+a special case: it is created **without** `m.room.encryption`, on the narrow, documented rationale
+in [`docs/decisions.md`](docs/decisions.md) D6's amendment — claim payloads are coordination
+metadata, not secrets, and an E2E room is only as available as its crypto store (a lost store on
+one host black-holes the whole room, fleet-wide, with no diagnostic signal). Every other room stays
+encrypted by D6's normal default; `safehoused`'s own `create_room` RPC op is unchanged and still
+always enables encryption.
+
+Create (or recreate, e.g. after a crypto-store loss took the old claims room dark) the claims room
+with:
+
+```bash
+scripts/create-claims-room.sh
+```
+
+It prompts for the hosting bot account's credentials, a room name (default `safehouse-claims`), and
+a space-separated list of fleet bot user IDs to invite — then logs that account in fresh (no state
+written to disk; this is a one-shot admin operation, not a daemon), creates the room with no
+`m.room.encryption` state, invites each bot, verifies the room really did come back unencrypted, and
+prints the resulting room ID. This bypasses the daemon's RPC entirely rather than adding an
+encryption opt-out to its general-purpose `create_room` op — see
+[`spikes/create-claims-room`](spikes/create-claims-room) for the implementation.
+
+Paste the printed room ID **explicitly** into every fleet host's config — no alias-resolution magic:
+
+```bash
+export LOOM_SAFEHOUSE_ROOM_CLAIMS='!the-printed-room-id:your-server'
+```
+
+Each invited bot's own `safehoused` auto-joins the invite on its next sync (same accept-any/
+`invite_allowlist` policy as any other invite — see step 4 above). Restart each daemon after wiring
+the room ID in so it starts using the new room.
+
 ## Scripting the socket
 
 For a human or a script that just needs to read or send into a room — not run an MCP client —
