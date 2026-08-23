@@ -226,11 +226,11 @@ GH_STDERR="$(mktemp)"
 trap 'rm -f "$GH_STDERR" 2>/dev/null || true' EXIT
 
 # --- Step 1: current head SHA + current labels + open/closed state ----------
-# `state` and `merged` are fetched in the SAME call as the head SHA, not a
+# `state` and `mergedAt` are fetched in the SAME call as the head SHA, not a
 # second round trip: the whole point is that the PR may finish between any two
 # reads, so the state must come from the same snapshot the SHA came from.
-PR_JSON="$(gh pr view "$PR" --json headRefOid,labels,state,merged 2>"$GH_STDERR")" || {
-  echo "ERROR: 'gh pr view $PR --json headRefOid,labels,state,merged' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
+PR_JSON="$(gh pr view "$PR" --json headRefOid,labels,state,mergedAt 2>"$GH_STDERR")" || {
+  echo "ERROR: 'gh pr view $PR --json headRefOid,labels,state,mergedAt' failed: $(cat "$GH_STDERR" 2>/dev/null)" >&2
   exit 1
 }
 
@@ -285,9 +285,9 @@ current_verdict_label() {
 # against mislabeling PRs that are already finished. The former is far worse.
 PR_STATE="$(jq -r '.state // empty' <<<"$PR_JSON" 2>/dev/null || true)"
 PR_STATE_UC="$(printf '%s' "$PR_STATE" | tr '[:lower:]' '[:upper:]')"
-# `.merged // false` (not `// empty`): jq's `//` also swallows a literal
-# `false`, so the alternative supplies the default for BOTH null and false.
-PR_MERGED="$(jq -r 'if (.merged // false) then "true" else "false" end' <<<"$PR_JSON" 2>/dev/null || true)"
+# `gh pr view` no longer exposes a boolean `merged` field (as of gh 2.98.0);
+# the replacement is `mergedAt`, a nullable timestamp — non-null means merged.
+PR_MERGED="$(jq -r 'if (.mergedAt // null) != null then "true" else "false" end' <<<"$PR_JSON" 2>/dev/null || true)"
 
 if [[ "$PR_MERGED" == "true" || ( -n "$PR_STATE_UC" && "$PR_STATE_UC" != "OPEN" ) ]]; then
   NOT_OPEN_WHAT="merged"
