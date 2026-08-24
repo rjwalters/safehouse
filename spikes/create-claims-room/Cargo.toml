@@ -1,0 +1,11 @@
+[package]
+name = "create-claims-room"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "One-shot client-side creator for an UNENCRYPTED fleet claims room (issue #101, D6 carve-out)"
+
+[dependencies]
+matrix-sdk = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
