@@ -489,6 +489,59 @@ run_sut --issue 405
 assert_eq "1" "$RC" "(r) gh api timeline failure -> exit 1"
 assert_contains "$ERR" "timeline" "(r) stderr names the failing gh api call"
 
+# --- #164: champion-issue-promo.md Step 3b (fixed for #6862) writes the
+# loom:issue label FIRST, verifies it with a read-back, and only THEN posts
+# the APPROVED comment -- so a correctly-landed promotion's `labeled
+# loom:issue` timeline event predates the comment by a second or two, NOT the
+# other way around. The pre-#164 comparison required strictly-after ordering,
+# so it never fired for correctly-landed promotions and every such issue that
+# had since legitimately progressed off loom:issue (e.g. parked on
+# loom:operator-only) was misdiagnosed as MISMATCH/COMPLETED on every Pass 0c
+# run, silently undoing the operator's parking decision.
+
+# (s) Issue #101's actual shape and timeline: loom:issue labeled at
+#     02:34:06Z, APPROVED comment posted 1s LATER at 02:34:07Z (label BEFORE
+#     comment), and the issue has since been correctly parked on
+#     loom:operator-only. Must be DECISION=OK, not MISMATCH/COMPLETED -- must
+#     NOT re-add loom:issue on top of a deliberate operator-park.
+reset_state
+issue_json "OPEN" "$(labels_json "loom:operator-only" "loom:operator-blocked")" \
+  "[$(approved_comment "2026-08-15T02:34:07Z" "**Goal Alignment**: Tier 1 (goal-advancing)")]" \
+  > "$STUB_DIR/issue-101.json"
+stage_timeline 101 "[$(labeled_event "2026-08-15T02:34:06Z")]"
+run_sut --issue 101
+assert_eq "0" "$RC" "(s) #101 shape: label 1s BEFORE the APPROVED comment -> exit 0, not MISMATCH"
+assert_eq "OK" "$(get_field "$OUT" DECISION)" "(s) DECISION=OK (near-simultaneous label-then-comment ordering, #164)"
+assert_eq "" "$EDITS" "(s) no label edit issued -- must not re-add loom:issue on top of loom:operator-only"
+assert_eq "" "$COMMENTS_POSTED" "(s) no comment posted"
+run_sut --issue 101 --apply
+assert_eq "0" "$RC" "(s) same result even with --apply (nothing to reconcile)"
+assert_eq "OK" "$(get_field "$OUT" DECISION)" "(s) DECISION=OK under --apply too"
+assert_eq "" "$EDITS" "(s) --apply still issues no label edit"
+
+# (t) Boundary: label event exactly LANDED_WINDOW_SECONDS (30s) before the
+#     comment is still within tolerance -> OK.
+reset_state
+issue_json "OPEN" "$(labels_json "loom:blocked")" \
+  "[$(approved_comment "2026-08-18T00:00:30Z" "**Goal Alignment**: Tier 2")]" \
+  > "$STUB_DIR/issue-406.json"
+stage_timeline 406 "[$(labeled_event "2026-08-18T00:00:00Z")]"
+run_sut --issue 406
+assert_eq "0" "$RC" "(t) label event exactly 30s before the comment -> still within tolerance, exit 0"
+assert_eq "OK" "$(get_field "$OUT" DECISION)" "(t) DECISION=OK at the boundary"
+
+# (u) Just outside the boundary: label event 31s before the comment is NOT
+#     near-simultaneous -> still MISMATCH, direction/window sensitivity
+#     preserved.
+reset_state
+issue_json "OPEN" "$(labels_json "loom:auditor")" \
+  "[$(approved_comment "2026-08-18T00:00:31Z" "**Goal Alignment**: Tier 2")]" \
+  > "$STUB_DIR/issue-407.json"
+stage_timeline 407 "[$(labeled_event "2026-08-18T00:00:00Z")]"
+run_sut --issue 407
+assert_eq "11" "$RC" "(u) label event 31s before the comment -> outside tolerance, still exit 11"
+assert_eq "MISMATCH" "$(get_field "$OUT" DECISION)" "(u) DECISION=MISMATCH just outside the window"
+
 echo
 echo "--- Doc pins: champion-issue-promo.md ships the reordered write-then-verify Step 3b and the Pass 0c reconciliation loop (#6862) ---"
 
