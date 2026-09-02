@@ -144,6 +144,27 @@ emit() {
   echo "TIER=$tier"
 }
 
+# --- portable ISO-8601 -> epoch seconds (GNU date, then BSD/macOS date) ------
+# Same shape as claim-staleness.sh's _iso_to_epoch() (and the equivalents in
+# judge-fallback-guard.sh, sweep-lease-fence.sh, urgent-flip-guard.sh,
+# check-evaluating-staleness.sh, sweep-run-registry.sh): try GNU's `-d` first,
+# then Darwin/BSD's `-j -f <format>`. Without the second form, the tolerance
+# window below silently degrades to the lexical-ordering-only fallback on
+# macOS — i.e. back to the exact pre-#164 comparison the window replaces
+# (#166). Prints nothing and returns 1 when neither form parses the input.
+_iso_to_epoch() {
+  local out
+  out="$(date -u -d "$1" +%s 2>/dev/null)" && [[ "$out" =~ ^[0-9]+$ ]] && {
+    printf '%s' "$out"
+    return 0
+  }
+  out="$(date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null)" && [[ "$out" =~ ^[0-9]+$ ]] && {
+    printf '%s' "$out"
+    return 0
+  }
+  return 1
+}
+
 # Keep `gh`'s stdout (the JSON we parse) and stderr SEPARATE — `gh` writes
 # incidental content to stderr even on success (update-notifier banners,
 # rate-limit hints), and merging streams can corrupt the payload before jq
@@ -222,8 +243,8 @@ LATEST_LABELED_AT="$(jq -r '
 # lost-write shape this script exists to catch).
 LANDED_WINDOW_SECONDS=30
 if [[ -n "$LATEST_LABELED_AT" && -n "$APPROVED_AT" ]]; then
-  LABELED_EPOCH="$(date -u -d "$LATEST_LABELED_AT" +%s 2>/dev/null || true)"
-  APPROVED_EPOCH="$(date -u -d "$APPROVED_AT" +%s 2>/dev/null || true)"
+  LABELED_EPOCH="$(_iso_to_epoch "$LATEST_LABELED_AT" || true)"
+  APPROVED_EPOCH="$(_iso_to_epoch "$APPROVED_AT" || true)"
 
   if [[ -n "$LABELED_EPOCH" && -n "$APPROVED_EPOCH" ]]; then
     DIFF_SECONDS=$(( LABELED_EPOCH - APPROVED_EPOCH ))
@@ -232,10 +253,12 @@ if [[ -n "$LATEST_LABELED_AT" && -n "$APPROVED_AT" ]]; then
       exit 0
     fi
   elif [[ "$LATEST_LABELED_AT" > "$APPROVED_AT" ]]; then
-    # Epoch conversion failed (unexpected timestamp format) — fall back to
-    # the original lexical-ordering check rather than losing the signal
-    # entirely. RFC3339 UTC timestamps still compare correctly as strings
-    # for the strictly-after case.
+    # Epoch conversion failed under BOTH the GNU and BSD date forms
+    # (genuinely unexpected timestamp format, not merely a non-GNU host —
+    # see _iso_to_epoch above, #166) — fall back to the original
+    # lexical-ordering check rather than losing the signal entirely. RFC3339
+    # UTC timestamps still compare correctly as strings for the
+    # strictly-after case.
     emit "OK" "loom:issue was applied after the APPROVED comment and the issue has since progressed — nothing to reconcile"
     exit 0
   fi
