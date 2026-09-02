@@ -57,13 +57,36 @@
 #
 # Exit codes:
 #   0  = OK (no APPROVED verdict comment; loom:issue already present; or
-#        loom:issue is currently absent but the label timeline shows it WAS
-#        applied after the newest APPROVED comment and the issue has since
-#        legitimately progressed further, e.g. loom:issue -> loom:building or
-#        -> loom:blocked — nothing to reconcile in any of these cases, #6933).
+#        loom:issue is currently absent but the label timeline shows a
+#        `labeled loom:issue` event landing at (or after) the newest APPROVED
+#        comment — within a small tolerance window BEFORE it too, see #164
+#        below — and the issue has since legitimately progressed further,
+#        e.g. loom:issue -> loom:building or -> loom:blocked — nothing to
+#        reconcile in any of these cases, #6933).
 #        ALSO used for DECISION=ALREADY_ESCALATED (tier unrecoverable, but the
 #        issue already carries loom:operator-only from a prior run — a human
 #        already owns it, nothing further to do, #6942).
+#
+#        #164 NOTE on the timeline comparison's tolerance window: since the
+#        #6862 fix, champion-issue-promo.md's Step 3b writes the `loom:issue`
+#        label FIRST, verifies it with a read-back, and only THEN posts the
+#        APPROVED comment — so for every promotion that lands correctly, the
+#        `labeled loom:issue` timeline event actually PREDATES the comment by
+#        a second or two, not the other way around. A strict "labeled AFTER
+#        the comment" check (the pre-#164 comparison) therefore never fires
+#        for correctly-landed promotions, and any such issue that has since
+#        legitimately moved off `loom:issue` (e.g. escalated to
+#        `loom:operator-only`) gets misdiagnosed as MISMATCH/COMPLETED on
+#        every subsequent Pass 0c run, silently undoing the operator's
+#        parking decision. Observed live on issue #101 (labeled loom:issue at
+#        02:34:06Z, APPROVED comment posted at 02:34:07Z — label 1s BEFORE
+#        the comment). The fix: treat a `labeled loom:issue` event as
+#        confirming the promotion landed if it is no more than
+#        LANDED_WINDOW_SECONDS before the APPROVED comment (near-simultaneous
+#        write-then-verify-then-comment ordering) OR any amount of time after
+#        it (the issue was labeled loom:issue later, e.g. the pre-#6862
+#        comment-then-label ordering, or a later re-promotion) — anything
+#        further in the past than the window is still MISMATCH, unchanged.
 #   1  = usage or environment error (bad args, `gh`/`jq` missing, a required
 #        `gh` read failed)
 #   10 = NOT_OPEN (issue is closed — nothing left to reconcile)
@@ -165,9 +188,9 @@ fi
 # issue has SINCE legitimately progressed further (loom:issue -> loom:building,
 # or -> loom:blocked), which looks identical to a lost write from labels alone
 # when judged from the current label set only. Before concluding MISMATCH,
-# check the label timeline for a `labeled loom:issue` event that happened
-# AFTER the newest APPROVED comment: if one exists, the promotion landed and
-# this is not #6862's failure mode at all (#6933).
+# check the label timeline for a `labeled loom:issue` event that confirms the
+# promotion landed: if one exists at (or near) the newest APPROVED comment,
+# the promotion landed and this is not #6862's failure mode at all (#6933).
 APPROVED_AT="$(jq -r '.createdAt // empty' <<<"$APPROVED_COMMENT")"
 
 TIMELINE_JSON="$(gh api "repos/{owner}/{repo}/issues/$ISSUE/timeline" --paginate 2>"$GH_STDERR")" || {
@@ -185,9 +208,37 @@ LATEST_LABELED_AT="$(jq -r '
   | last // empty
 ' <<<"$TIMELINE_JSON" 2>/dev/null || true)"
 
-if [[ -n "$LATEST_LABELED_AT" && -n "$APPROVED_AT" && "$LATEST_LABELED_AT" > "$APPROVED_AT" ]]; then
-  emit "OK" "loom:issue was applied after the APPROVED comment and the issue has since progressed — nothing to reconcile"
-  exit 0
+# #164: don't require LATEST_LABELED_AT to be strictly AFTER APPROVED_AT.
+# champion-issue-promo.md Step 3b (fixed for #6862) writes the loom:issue
+# label FIRST, verifies it, and only THEN posts the APPROVED comment — so a
+# correctly-landed promotion's label event predates the comment by a second
+# or two, not the other way around (see the #164 note in the header comment
+# above; issue #101 is the concrete example: labeled 02:34:06Z, commented
+# 02:34:07Z). Convert both timestamps to epoch seconds and treat the label
+# event as confirming the promotion landed if it is no more than
+# LANDED_WINDOW_SECONDS before the comment (near-simultaneous ordering) or
+# any amount of time after it — anything further in the past than the window
+# is still MISMATCH, direction-sensitive as before (unchanged for the #6862
+# lost-write shape this script exists to catch).
+LANDED_WINDOW_SECONDS=30
+if [[ -n "$LATEST_LABELED_AT" && -n "$APPROVED_AT" ]]; then
+  LABELED_EPOCH="$(date -u -d "$LATEST_LABELED_AT" +%s 2>/dev/null || true)"
+  APPROVED_EPOCH="$(date -u -d "$APPROVED_AT" +%s 2>/dev/null || true)"
+
+  if [[ -n "$LABELED_EPOCH" && -n "$APPROVED_EPOCH" ]]; then
+    DIFF_SECONDS=$(( LABELED_EPOCH - APPROVED_EPOCH ))
+    if (( DIFF_SECONDS >= -LANDED_WINDOW_SECONDS )); then
+      emit "OK" "loom:issue timeline event is within ${LANDED_WINDOW_SECONDS}s before (or any time after) the APPROVED comment — the promotion landed and the issue has since progressed"
+      exit 0
+    fi
+  elif [[ "$LATEST_LABELED_AT" > "$APPROVED_AT" ]]; then
+    # Epoch conversion failed (unexpected timestamp format) — fall back to
+    # the original lexical-ordering check rather than losing the signal
+    # entirely. RFC3339 UTC timestamps still compare correctly as strings
+    # for the strictly-after case.
+    emit "OK" "loom:issue was applied after the APPROVED comment and the issue has since progressed — nothing to reconcile"
+    exit 0
+  fi
 fi
 
 # --- MISMATCH: an APPROVED verdict exists but loom:issue never landed --------
