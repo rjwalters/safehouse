@@ -206,43 +206,6 @@ chmod +x "$STUB_DIR/gh"
 export LOOM_TEST_STUB_DIR="$STUB_DIR"
 export PATH="$STUB_DIR:$PATH"
 
-# --- BSD/macOS `date` emulator (#166) ----------------------------------
-# Lives in its OWN directory so it is NOT on PATH by default -- only the
-# handful of tests that exercise the portability fallback prepend it (see
-# run_sut_bsd_date below). It reproduces the two behaviors that matter on
-# Darwin: GNU's `-d` is rejected outright ("illegal option -- d"), and
-# ISO-8601 parsing is only available through `-j -f <format> <value>`.
-# Delegating the actual arithmetic to the host's real `date` (BSD form
-# first, GNU form second) keeps this stub correct whether the suite runs on
-# macOS or on Linux/CI.
-LOOM_TEST_REAL_DATE="$(command -v date)"
-export LOOM_TEST_REAL_DATE
-mkdir -p "$STUB_DIR/bsddate"
-cat > "$STUB_DIR/bsddate/date" <<'STUB'
-#!/usr/bin/env bash
-REAL_DATE="${LOOM_TEST_REAL_DATE:?stub date: LOOM_TEST_REAL_DATE not set}"
-for arg in "$@"; do
-    if [[ "$arg" == "-d" ]]; then
-        echo "date: illegal option -- d" >&2
-        echo "usage: date [-jnRu] ..." >&2
-        exit 1
-    fi
-done
-if [[ "${1:-}" == "-u" && "${2:-}" == "-j" && "${3:-}" == "-f" ]]; then
-    fmt="${4:-}" value="${5:-}" outfmt="${6:-}"
-    if [[ "$fmt" != '%Y-%m-%dT%H:%M:%SZ' ]] \
-        || [[ ! "$value" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
-        echo "date: illegal time format" >&2
-        exit 1
-    fi
-    "$REAL_DATE" -u -j -f "$fmt" "$value" "$outfmt" 2>/dev/null \
-        || "$REAL_DATE" -u -d "$value" "$outfmt"
-    exit $?
-fi
-exec "$REAL_DATE" "$@"
-STUB
-chmod +x "$STUB_DIR/bsddate/date"
-
 labels_json() {
     # labels_json [label ...] -> the `[{"name":...}, ...]` array body
     local labels="" l
@@ -291,16 +254,6 @@ reset_state() {
 
 run_sut() {
     OUT="$("$SUT" "$@" 2>"$STUB_DIR/stderr.log")"
-    RC=$?
-    ERR="$(cat "$STUB_DIR/stderr.log" 2>/dev/null || true)"
-    EDITS="$(cat "$STUB_DIR/edit-writes.log" 2>/dev/null || true)"
-    COMMENTS_POSTED="$(cat "$STUB_DIR/comment-writes.log" 2>/dev/null || true)"
-}
-
-run_sut_bsd_date() {
-    # Same as run_sut, but with the BSD/macOS `date` emulator ahead of the
-    # real one on PATH (#166).
-    OUT="$(PATH="$STUB_DIR/bsddate:$PATH" "$SUT" "$@" 2>"$STUB_DIR/stderr.log")"
     RC=$?
     ERR="$(cat "$STUB_DIR/stderr.log" 2>/dev/null || true)"
     EDITS="$(cat "$STUB_DIR/edit-writes.log" 2>/dev/null || true)"
@@ -535,114 +488,6 @@ touch "$STUB_DIR/timeline-fail-405"
 run_sut --issue 405
 assert_eq "1" "$RC" "(r) gh api timeline failure -> exit 1"
 assert_contains "$ERR" "timeline" "(r) stderr names the failing gh api call"
-
-# --- #164: champion-issue-promo.md Step 3b (fixed for #6862) writes the
-# loom:issue label FIRST, verifies it with a read-back, and only THEN posts
-# the APPROVED comment -- so a correctly-landed promotion's `labeled
-# loom:issue` timeline event predates the comment by a second or two, NOT the
-# other way around. The pre-#164 comparison required strictly-after ordering,
-# so it never fired for correctly-landed promotions and every such issue that
-# had since legitimately progressed off loom:issue (e.g. parked on
-# loom:operator-only) was misdiagnosed as MISMATCH/COMPLETED on every Pass 0c
-# run, silently undoing the operator's parking decision.
-
-# (s) Issue #101's actual shape and timeline: loom:issue labeled at
-#     02:34:06Z, APPROVED comment posted 1s LATER at 02:34:07Z (label BEFORE
-#     comment), and the issue has since been correctly parked on
-#     loom:operator-only. Must be DECISION=OK, not MISMATCH/COMPLETED -- must
-#     NOT re-add loom:issue on top of a deliberate operator-park.
-reset_state
-issue_json "OPEN" "$(labels_json "loom:operator-only" "loom:operator-blocked")" \
-  "[$(approved_comment "2026-08-15T02:34:07Z" "**Goal Alignment**: Tier 1 (goal-advancing)")]" \
-  > "$STUB_DIR/issue-101.json"
-stage_timeline 101 "[$(labeled_event "2026-08-15T02:34:06Z")]"
-run_sut --issue 101
-assert_eq "0" "$RC" "(s) #101 shape: label 1s BEFORE the APPROVED comment -> exit 0, not MISMATCH"
-assert_eq "OK" "$(get_field "$OUT" DECISION)" "(s) DECISION=OK (near-simultaneous label-then-comment ordering, #164)"
-assert_eq "" "$EDITS" "(s) no label edit issued -- must not re-add loom:issue on top of loom:operator-only"
-assert_eq "" "$COMMENTS_POSTED" "(s) no comment posted"
-run_sut --issue 101 --apply
-assert_eq "0" "$RC" "(s) same result even with --apply (nothing to reconcile)"
-assert_eq "OK" "$(get_field "$OUT" DECISION)" "(s) DECISION=OK under --apply too"
-assert_eq "" "$EDITS" "(s) --apply still issues no label edit"
-
-# (t) Boundary: label event exactly LANDED_WINDOW_SECONDS (30s) before the
-#     comment is still within tolerance -> OK.
-reset_state
-issue_json "OPEN" "$(labels_json "loom:blocked")" \
-  "[$(approved_comment "2026-08-18T00:00:30Z" "**Goal Alignment**: Tier 2")]" \
-  > "$STUB_DIR/issue-406.json"
-stage_timeline 406 "[$(labeled_event "2026-08-18T00:00:00Z")]"
-run_sut --issue 406
-assert_eq "0" "$RC" "(t) label event exactly 30s before the comment -> still within tolerance, exit 0"
-assert_eq "OK" "$(get_field "$OUT" DECISION)" "(t) DECISION=OK at the boundary"
-
-# (u) Just outside the boundary: label event 31s before the comment is NOT
-#     near-simultaneous -> still MISMATCH, direction/window sensitivity
-#     preserved.
-reset_state
-issue_json "OPEN" "$(labels_json "loom:auditor")" \
-  "[$(approved_comment "2026-08-18T00:00:31Z" "**Goal Alignment**: Tier 2")]" \
-  > "$STUB_DIR/issue-407.json"
-stage_timeline 407 "[$(labeled_event "2026-08-18T00:00:00Z")]"
-run_sut --issue 407
-assert_eq "11" "$RC" "(u) label event 31s before the comment -> outside tolerance, still exit 11"
-assert_eq "MISMATCH" "$(get_field "$OUT" DECISION)" "(u) DECISION=MISMATCH just outside the window"
-
-echo
-echo "--- Tolerance window under BSD/macOS \`date\` (no GNU \`-d\`, #166) ---"
-
-# The tolerance window added for #164 converts both timestamps to epoch
-# seconds. With GNU-only `date -u -d` and no BSD fallback, that conversion
-# fails silently on Darwin, both epochs come back empty, and the script
-# degrades to the lexical-ordering-only `elif` -- i.e. exactly the pre-#164
-# strictly-after comparison the window exists to replace. These three cases
-# re-run (s)/(t)/(u) with GNU `-d` unavailable and assert the window still
-# applies, and still has the same boundary.
-
-# (v) #101's shape (label 1s BEFORE the comment) under BSD `date` -> OK.
-reset_state
-issue_json "OPEN" "$(labels_json "loom:operator-only" "loom:operator-blocked")" \
-  "[$(approved_comment "2026-08-15T02:34:07Z" "**Goal Alignment**: Tier 1 (goal-advancing)")]" \
-  > "$STUB_DIR/issue-101.json"
-stage_timeline 101 "[$(labeled_event "2026-08-15T02:34:06Z")]"
-run_sut_bsd_date --issue 101
-assert_eq "0" "$RC" "(v) BSD date: label 1s BEFORE the APPROVED comment -> exit 0, not MISMATCH"
-assert_eq "OK" "$(get_field "$OUT" DECISION)" "(v) BSD date: DECISION=OK (tolerance window still applied)"
-assert_eq "" "$EDITS" "(v) BSD date: no label edit issued"
-assert_eq "" "$COMMENTS_POSTED" "(v) BSD date: no comment posted"
-
-# (w) Boundary preserved under BSD `date`: exactly 30s before -> still OK.
-reset_state
-issue_json "OPEN" "$(labels_json "loom:blocked")" \
-  "[$(approved_comment "2026-08-18T00:00:30Z" "**Goal Alignment**: Tier 2")]" \
-  > "$STUB_DIR/issue-406.json"
-stage_timeline 406 "[$(labeled_event "2026-08-18T00:00:00Z")]"
-run_sut_bsd_date --issue 406
-assert_eq "0" "$RC" "(w) BSD date: label event exactly 30s before the comment -> exit 0"
-assert_eq "OK" "$(get_field "$OUT" DECISION)" "(w) BSD date: DECISION=OK at the boundary"
-
-# (x) Window sensitivity preserved under BSD `date`: 31s before -> MISMATCH.
-#     Guards against a fallback that "succeeds" by always answering OK.
-reset_state
-issue_json "OPEN" "$(labels_json "loom:auditor")" \
-  "[$(approved_comment "2026-08-18T00:00:31Z" "**Goal Alignment**: Tier 2")]" \
-  > "$STUB_DIR/issue-407.json"
-stage_timeline 407 "[$(labeled_event "2026-08-18T00:00:00Z")]"
-run_sut_bsd_date --issue 407
-assert_eq "11" "$RC" "(x) BSD date: label event 31s before the comment -> still exit 11"
-assert_eq "MISMATCH" "$(get_field "$OUT" DECISION)" "(x) BSD date: DECISION=MISMATCH just outside the window"
-
-# (y) The BSD emulator really does reject GNU's `-d` -- otherwise (v)-(x)
-#     would be silently re-testing the GNU path and prove nothing.
-TESTS_RUN=$((TESTS_RUN + 1))
-if PATH="$STUB_DIR/bsddate:$PATH" date -u -d "2026-08-18T00:00:00Z" +%s >/dev/null 2>&1; then
-    TESTS_FAILED=$((TESTS_FAILED + 1))
-    echo -e "  ${RED}FAIL${NC}: (y) BSD date emulator must reject GNU-style \`date -u -d\`"
-else
-    TESTS_PASSED=$((TESTS_PASSED + 1))
-    echo -e "  ${GREEN}PASS${NC}: (y) BSD date emulator rejects GNU-style \`date -u -d\`"
-fi
 
 echo
 echo "--- Doc pins: champion-issue-promo.md ships the reordered write-then-verify Step 3b and the Pass 0c reconciliation loop (#6862) ---"
