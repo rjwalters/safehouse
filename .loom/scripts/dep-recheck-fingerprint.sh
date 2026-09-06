@@ -334,8 +334,17 @@ _fetch_operator_premise_json() {
     jq -n --argjson refs "$refs_json" '{refs: $refs}'
 }
 
+# One "<ref#>:<state>" line per reference, sorted. The state is normalized to
+# a single canonical non-open marker ("CLOSED") for anything that isn't
+# "OPEN" before it is folded into the hash — a merged PR resolves to "CLOSED"
+# here (matching how `gh issue view` reports it) rather than "MERGED" (how
+# `gh pr view` reports it), so the identical real-world fact hashes the same
+# way regardless of which lookup path `_fetch_operator_premise_json` happened
+# to take (#170: CLOSED-vs-MERGED spurious hash churn). This loses no
+# information the caller uses for its decision: `_run_operator_premise`
+# already only distinguishes OPEN from not-OPEN.
 _operator_premise_refs() {
-    jq -r '.refs | sort_by(.number) | .[] | "\(.number):\(.state)"' <<<"$1" | sort
+    jq -r '.refs | sort_by(.number) | .[] | "\(.number):\(if .state == "OPEN" then "OPEN" else "CLOSED" end)"' <<<"$1" | sort
 }
 
 _run_operator_premise() {

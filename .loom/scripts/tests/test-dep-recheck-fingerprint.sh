@@ -298,6 +298,30 @@ jq -n '{number: 22, state: "CLOSED"}' >"$STUB_DIR/issue-22.json"
 p="$("$TARGET_SCRIPT" operator-premise --refs "20 22" --repo owner/repo)"
 assert_eq "stale-premise" "$(field "$p" VERDICT)" "T13c: live operator-premise mode checks each --refs number's state"
 
+# --- T14: THE #170 REGRESSION - the identical reference (#102, mirroring the
+# issue's own repro) must produce the same CONCLUSION_HASH whether
+# `_fetch_operator_premise_json` resolved it via the `gh issue view` path
+# (which reports a merged PR's generic state as CLOSED) or fell back to
+# `gh pr view` (which reports MERGED for the identical PR). Same real-world
+# fact ("ref is done"), two different lookup paths must not produce two
+# different hashes.
+jq -n '{number: 102, state: "CLOSED"}' >"$STUB_DIR/issue-102.json"
+p_via_issue_view="$("$TARGET_SCRIPT" operator-premise --refs "102" --repo owner/repo)"
+
+# Remove the issue-102 fixture so the stub's `gh issue view 102` fails/empties
+# out, forcing the fallback to `gh pr view 102`, which reports MERGED for the
+# same reference.
+rm -f "$STUB_DIR/issue-102.json"
+jq -n '{number: 102, state: "MERGED"}' >"$STUB_DIR/pr-102.json"
+p_via_pr_view="$("$TARGET_SCRIPT" operator-premise --refs "102" --repo owner/repo)"
+
+assert_eq "stale-premise" "$(field "$p_via_issue_view" VERDICT)" \
+    "T14a: a CLOSED reference (resolved via gh issue view) is VERDICT=stale-premise"
+assert_eq "stale-premise" "$(field "$p_via_pr_view" VERDICT)" \
+    "T14b: a MERGED reference (resolved via gh pr view fallback) is VERDICT=stale-premise"
+assert_eq "$(field "$p_via_issue_view" CONCLUSION_HASH)" "$(field "$p_via_pr_view" CONCLUSION_HASH)" \
+    "T14c: CLOSED (issue-view path) and MERGED (pr-view fallback path) for the identical merged reference #102 hash identically (#170)"
+
 # --- Summary ---
 echo ""
 echo "────────────────────────────────"
