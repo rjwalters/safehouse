@@ -21,9 +21,13 @@
 # It contains ZERO Matrix logic and stores no secret in any file looser than
 # 0600, echoes none to the terminal, and leaves none in shell history.
 #
-# NON-GOAL: creating the bot's Matrix account on the homeserver. That is an
-# admin action on the server — see the pointer printed near the top of a run,
-# or docs/research/2026-07-26-homeserver.md#creating-a-user-on-an-already-running-server
+# Account creation (issue #94): if SAFEHOUSE_ADMIN_HOMESERVER/SAFEHOUSE_ADMIN_USERNAME/
+# SAFEHOUSE_ADMIN_PASSWORD/SAFEHOUSE_ADMIN_ROOM are set when writing a FRESH config, this
+# script calls scripts/provision-host.sh to mint the bot account via Matrix admin-room
+# automation instead of prompting for one — no human action on the homeserver, and
+# allow_registration stays false throughout. Without that env, account creation is still
+# a manual admin action on the server — see the pointer printed near the top of a run, or
+# docs/research/2026-07-26-homeserver.md#creating-a-user-on-an-already-running-server
 #
 # Idempotent: re-running on an already-set-up host leaves the config/state
 # untouched, warm-starts to re-verify, and refreshes the service definition.
@@ -118,10 +122,18 @@ Linux)
 esac
 
 printf '\n'
-info "Reminder: this installer does NOT create the bot's Matrix account."
-info "That is a homeserver-admin action. If the bot user does not exist yet,"
-info "create it first — see:"
-info "  docs/research/2026-07-26-homeserver.md#creating-a-user-on-an-already-running-server"
+if [ -n "${SAFEHOUSE_ADMIN_HOMESERVER:-}" ] && [ -n "${SAFEHOUSE_ADMIN_USERNAME:-}" ] &&
+	[ -n "${SAFEHOUSE_ADMIN_PASSWORD:-}" ] && [ -n "${SAFEHOUSE_ADMIN_ROOM:-}" ]; then
+	ok "SAFEHOUSE_ADMIN_* env present — will mint the bot account via admin-room automation"
+	info "(scripts/provision-host.sh, issue #94) if this is a fresh config, no admin step needed."
+else
+	info "Reminder: this installer does NOT create the bot's Matrix account unless"
+	info "SAFEHOUSE_ADMIN_HOMESERVER/SAFEHOUSE_ADMIN_USERNAME/SAFEHOUSE_ADMIN_PASSWORD/"
+	info "SAFEHOUSE_ADMIN_ROOM are set (see scripts/provision-host.sh, issue #94). Without"
+	info "those, it is a homeserver-admin action — if the bot user does not exist yet,"
+	info "create it first — see:"
+	info "  docs/research/2026-07-26-homeserver.md#creating-a-user-on-an-already-running-server"
+fi
 printf '\n'
 
 # ---------------------------------------------------------------------------
@@ -195,18 +207,40 @@ if [ -f "$CONFIG" ]; then
 else
 	step "Writing config ($CONFIG)"
 
-	printf 'Homeserver base URL [https://matrix.example.com]: '
+	HOMESERVER_DEFAULT=${SAFEHOUSE_ADMIN_HOMESERVER:-https://matrix.example.com}
+	printf 'Homeserver base URL [%s]: ' "$HOMESERVER_DEFAULT"
 	read -r HOMESERVER
-	HOMESERVER=${HOMESERVER:-https://matrix.example.com}
+	HOMESERVER=${HOMESERVER:-$HOMESERVER_DEFAULT}
 
-	printf 'Bot username (login only — no @, no :server) [safehouse-bot]: '
-	read -r USERNAME
-	USERNAME=${USERNAME:-safehouse-bot}
+	if [ -n "${SAFEHOUSE_ADMIN_HOMESERVER:-}" ] && [ -n "${SAFEHOUSE_ADMIN_USERNAME:-}" ] &&
+		[ -n "${SAFEHOUSE_ADMIN_PASSWORD:-}" ] && [ -n "${SAFEHOUSE_ADMIN_ROOM:-}" ]; then
+		step "Minting the bot account via admin-room automation (scripts/provision-host.sh, #94)"
+		HOST_LABEL=${SAFEHOUSE_HOST_LABEL:-$(hostname -s 2>/dev/null || hostname)}
+		PROV_OUT=$(mktemp "${TMPDIR:-/tmp}/safehoused-provision.XXXXXX")
+		if "$SCRIPT_DIR/provision-host.sh" --host "$HOST_LABEL" >"$PROV_OUT" 2>&1; then
+			cat "$PROV_OUT"
+			USERNAME=$(grep -E '^USERNAME=' "$PROV_OUT" | tail -1 | cut -d= -f2-)
+			PASSWORD=$(grep -E '^PASSWORD=' "$PROV_OUT" | tail -1 | cut -d= -f2-)
+			rm -f "$PROV_OUT"
+			[ -n "$USERNAME" ] && [ -n "$PASSWORD" ] ||
+				die "provision-host.sh did not print USERNAME/PASSWORD — see output above."
+			ok "minted bot account $USERNAME via admin-room automation"
+		else
+			cat "$PROV_OUT" >&2
+			rm -f "$PROV_OUT"
+			die "admin-room account creation failed — see output above, or unset SAFEHOUSE_ADMIN_*
+     to fall back to manual entry."
+		fi
+	else
+		printf 'Bot username (login only — no @, no :server) [safehouse-bot]: '
+		read -r USERNAME
+		USERNAME=${USERNAME:-safehouse-bot}
 
-	printf 'Bot password: '
-	read -r -s PASSWORD
-	printf '\n'
-	[ -n "$PASSWORD" ] || die "password must not be empty."
+		printf 'Bot password: '
+		read -r -s PASSWORD
+		printf '\n'
+		[ -n "$PASSWORD" ] || die "password must not be empty."
+	fi
 
 	info "The recovery passphrase is the ONLY headless way back after a crypto-"
 	info "store loss (decisions.md D10). Store it OFF this host. On first-ever"

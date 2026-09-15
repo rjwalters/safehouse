@@ -123,8 +123,16 @@ current config schema version — see "Provisioning parity" below), verifies the
 login, cross-signing, recovery), registers a supervised service (launchd LaunchAgent on macOS /
 `systemd --user` unit on Linux), and prints the loom-daemon handoff block. Re-running is safe:
 existing config/state is left untouched, the daemon warm-starts, and the service definition is
-refreshed. The installer does **not** create the bot's Matrix account — that is the one admin step
-below (step 1). The manual walkthrough that follows is the reference for what the installer automates.
+refreshed.
+
+**Unattended account creation (issue #94).** Account creation used to be the one step the installer
+deliberately did not automate. If `SAFEHOUSE_ADMIN_HOMESERVER` / `SAFEHOUSE_ADMIN_USERNAME` /
+`SAFEHOUSE_ADMIN_PASSWORD` / `SAFEHOUSE_ADMIN_ROOM` are set when `scripts/install.sh` writes a
+*fresh* config, it calls [`scripts/provision-host.sh`](scripts/provision-host.sh) to mint the bot
+account via admin-room automation — no human on the homeserver, `allow_registration` stays `false`
+— instead of prompting for username/password. See "Unattended host onboarding" below for the full
+mechanism (including the room-join half) and its manual fallback, which is the walkthrough that
+follows this note and remains the documented, always-available path.
 
 **Provisioning parity (issue #101).** `scripts/install.sh` is deliberately **no-clobber**: it never
 rewrites an existing `config.toml`, so a host provisioned before a new optional field was added (e.g.
@@ -188,9 +196,53 @@ same class of invisible-until-it-bites-you problem, just for the binary instead 
    **Onboarding a new fleet host into an existing room** (e.g. adding a second daemon to a
    room the first one already occupies) no longer needs raw CS-API calls or temporary devices:
    from the already-onboarded host's socket, send an `invite` op —
-   `{"op": "invite", "room": "<id|name|alias>", "user": "@new-host-bot:<your-server>"}` — and the
-   new host's daemon auto-joins on its next sync (even if it's still cold-starting when the
+   `{"op": "invite", "room": "<id|name|alias>", "user": "@new-host-bot:<your-server>"}` — or from
+   a shell, `safehouse-mcp invite --room <id|name|alias> --user @new-host-bot:<your-server>` — and
+   the new host's daemon auto-joins on its next sync (even if it's still cold-starting when the
    invite is sent).
+
+## Unattended host onboarding (issue #94)
+
+Dynamic scale-out to many hosts caps out at the rate a human can create Matrix accounts by hand.
+`scripts/provision-host.sh` mints a new fleet host's bot account **with no human action on the
+homeserver and no interactive prompt**, using admin-room automation instead: it sends
+`users create_user <bot> <generated-password>` as the `@safehouse-admin` server-admin bot into the
+Matrix admin room (`docs/research/2026-07-26-homeserver.md`'s "Zero-downtime alternative (admin
+room)" path — the live server executes it in-process, no `systemctl stop`/`--execute`/`start`), then
+sends the `invite` op above from an already-onboarded host's socket so the new bot auto-joins the
+fleet room on its next sync. `allow_registration = false` is never touched — this drives the same
+command an operator would otherwise type by hand, it just does not need a human to type it.
+
+```bash
+export SAFEHOUSE_ADMIN_HOMESERVER=https://matrix.example.com
+export SAFEHOUSE_ADMIN_USERNAME=safehouse-admin
+export SAFEHOUSE_ADMIN_PASSWORD='...'                 # never committed, never baked in
+export SAFEHOUSE_ADMIN_ROOM='#admins:example.com'
+
+# Optional — completes the room-join half in the same pass. Omit these and
+# the account is still minted; the script prints the manual `safehouse-mcp
+# invite` command to finish the job instead.
+export SAFEHOUSE_INVITE_SOCKET=/var/lib/safehoused/safehoused.sock   # an already-onboarded host
+export SAFEHOUSE_FLEET_ROOM='!fleet-room-id:example.com'
+
+scripts/provision-host.sh --host studio
+```
+
+`scripts/install.sh` calls this automatically when `SAFEHOUSE_ADMIN_*` is present in the
+environment and it is writing a fresh config — see "Running it" above. The manual walkthrough in
+steps 1–4 below remains the documented fallback: it always works, requires no admin-room setup, and
+is what `provision-host.sh` itself is automating.
+
+**Decommissioning a host** (ephemeral/spot hosts should not leave dead accounts and stale room
+members behind): `scripts/deprovision-host.sh --host studio` sends `users deactivate` for that
+host's bot account the same way. Tuwunel mirrors Synapse's admin-API deactivate semantics, which
+force-leave every room the account was a member of as part of deactivation — so this also retires
+the account's fleet-room membership without a separate kick/leave step; verify against your
+server's actual behavior if you rely on that for more than tidiness.
+
+Both scripts read admin credentials from the environment at runtime only — never committed, never
+baked into a binary, never ambient on a worker host. See
+[`spikes/provision-host`](spikes/provision-host) for the implementation.
 
 ## Claims room (unencrypted, D6 carve-out)
 
