@@ -40,3 +40,66 @@ jobs:
         run: cargo build --workspace --verbose
       - name: cargo test
         run: cargo test --workspace --verbose
+
+  room-cutover-dry-run:
+    name: room-cutover.sh --dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/room-cutover.sh
+      - name: dry run with no arguments (sample data)
+        run: scripts/room-cutover.sh --dry-run
+      - name: dry run never opens the daemon socket
+        run: |
+          # No SAFEHOUSED_SOCKET/SAFEHOUSE_PERSONA in the environment at all —
+          # a dry run must render the full plan without needing them.
+          env -u SAFEHOUSED_SOCKET -u SAFEHOUSE_PERSONA \
+            scripts/room-cutover.sh --dry-run \
+              --room-name loom-fleet-vN \
+              --invite "@safehouse-bot:example.com @safehoused-worker1:example.com"
+      - name: dry-run output covers the required plan sections
+        run: |
+          out="$(scripts/room-cutover.sh --dry-run --room-name loom-fleet-vN \
+            --invite '@safehouse-bot:example.com @safehoused-worker1:example.com')"
+          for marker in \
+            'safehouse_create_room' \
+            'LOOM_SAFEHOUSE_ROOM' \
+            'launchd' \
+            'systemd' \
+            'Egress allowlist' \
+            'LOOM_SAFEHOUSE_RECONCILE_MAX_AGE_SECS' \
+            '!FZ8oYmGnszTpYdXUGz' \
+            '!MQP2aSTA5uDu7czxYZ' \
+            'Traps'; do
+            echo "$out" | grep -qF -- "$marker" || { echo "missing expected marker: $marker" >&2; exit 1; }
+          done
+      - name: missing required flags fails outside --dry-run
+        run: |
+          if scripts/room-cutover.sh --invite "@a:b.com"; then
+            echo "expected failure: --room-name is required outside --dry-run" >&2
+            exit 1
+          fi
+      - name: omitted --invite fails, but explicitly empty --invite is accepted, outside --dry-run
+        run: |
+          # Omitting --invite entirely must still fail (forces a deliberate choice).
+          out="$(scripts/room-cutover.sh --room-name x 2>&1)" && {
+            echo "expected failure: --invite is required outside --dry-run" >&2
+            exit 1
+          }
+          echo "$out" | grep -qF -- "--invite is required" || {
+            echo "expected the missing-invite error, got: $out" >&2
+            exit 1
+          }
+          # A scratch room with zero invitees (--invite "") is a documented,
+          # legitimate live-run test (docs/runbooks/room-cutover.md) — it must
+          # pass the flag-validation gate and fail later, on the missing daemon
+          # socket, not on --invite.
+          out="$(env -u SAFEHOUSED_SOCKET -u SAFEHOUSE_PERSONA scripts/room-cutover.sh --room-name x --invite "" 2>&1)" && {
+            echo "expected failure: SAFEHOUSED_SOCKET must be set" >&2
+            exit 1
+          }
+          echo "$out" | grep -qF -- "SAFEHOUSED_SOCKET must be set" || {
+            echo "empty --invite should pass validation and fail on missing SAFEHOUSED_SOCKET, got: $out" >&2
+            exit 1
+          }

@@ -279,6 +279,19 @@ Each invited bot's own `safehoused` auto-joins the invite on its next sync (same
 `invite_allowlist` policy as any other invite — see step 4 above). Restart each daemon after wiring
 the room ID in so it starts using the new room.
 
+## Room-DAG death cutover
+
+A homeserver-side room-DAG corruption — every send failing
+`500 M_UNKNOWN "cannot create a non-create event in a room with no forward extremities"` — has no
+client-side fix; the room is permanently wedged. `scripts/room-cutover.sh` scripts the recovery: it
+creates a replacement room and invites every publisher/consumer identity you pass, over an
+already-running daemon's socket (the normal, always-encrypted `create_room` RPC — no bypass, unlike
+the claims room above), then prints the new room ID plus the full per-host rollout plan (launchd vs
+systemd env-layer rollout, the egress-allowlist step, and the `LOOM_SAFEHOUSE_RECONCILE_MAX_AGE_SECS`
+duplicate-burst mitigation). Run it with `--dry-run` first to render the exact plan without touching
+the socket. Full runbook, including the dead-room registry and the traps from the incident this was
+built from: [`docs/runbooks/room-cutover.md`](docs/runbooks/room-cutover.md).
+
 ## Scripting the socket
 
 For a human or a script that just needs to read or send into a room — not run an MCP client —
