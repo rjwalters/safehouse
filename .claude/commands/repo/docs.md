@@ -82,6 +82,16 @@ the mapping table too and keep the "resolved via install mapping" annotation on
 individual links. A consolidated report that drops it turns a wrong mapping into
 a silent zero.
 
+The same applies to [[links]]' sibling-repo base: where the repo declares
+`.repo/link-siblings.json`, fold in its table and keep the
+"resolved via sibling repo `<name>`" annotation and the
+"sibling repo not present — unverifiable" annotation on individual links,
+distinguishable at a glance from `MISSING`. Collapsing
+either sibling-repo status back into `MISSING` in the consolidated report
+reintroduces the machine-dependent false positive [[links]]' fourth base
+exists to remove — a link that is merely unverifiable on this machine would
+read as broken here even though [[links]] itself never calls it that.
+
 ## Output Format
 
 One consolidated report, grouped by layer so it's clear which are mechanical

@@ -60,22 +60,31 @@ Check and report both:
 ```bash
 git ls-files '.github/dependabot.yml' '.github/dependabot.yaml'   # version updates
 
-# Security updates — repo-level flag, needs admin (see the UNKNOWN note below)
-gh api repos/OWNER/REPO --jq '.security_and_analysis'
-gh api repos/OWNER/REPO --jq '.security_and_analysis.dependabot_security_updates.status'
+# Security updates — a dedicated endpoint, NOT a security_and_analysis key:
+# returns a definitive {"enabled": bool}; 403 → needs admin (see UNKNOWN note below)
+gh api repos/OWNER/REPO/automated-security-fixes --jq '.enabled'
 
-# Alerts — a dedicated endpoint, NOT a security_and_analysis key:
+# Alerts — likewise a dedicated endpoint, NOT a security_and_analysis key:
 #   204 → enabled, 404 → disabled
 gh api repos/OWNER/REPO/vulnerability-alerts -i 2>/dev/null | head -1
 ```
 
-Read the alerts flag from `/vulnerability-alerts`, not from
-`security_and_analysis.dependabot_alerts` — that key is simply **absent** on
-many repos even when the object is otherwise fully populated, so a
-`// "UNKNOWN"` fallback on it reports "can't tell" for a repo you can read
-perfectly well. (Verified against `rjwalters/repo`: `security_and_analysis`
-returns `dependabot_security_updates` and the `secret_scanning*` keys with no
-`dependabot_alerts` among them.)
+Read both flags from their dedicated endpoints, never from `security_and_analysis`.
+That object is an unreliable source for either one, for two different reasons:
+
+- `security_and_analysis.dependabot_alerts` is simply **absent** on many repos
+  even when the object is otherwise fully populated, so a `// "UNKNOWN"`
+  fallback on it reports "can't tell" for a repo you can read perfectly well.
+  (Verified against `rjwalters/repo`: `security_and_analysis` returns
+  `dependabot_security_updates` and the `secret_scanning*` keys with no
+  `dependabot_alerts` among them.)
+- On a **private repo without GitHub Advanced Security**, GitHub omits the
+  **whole `security_and_analysis` object** regardless of token permissions —
+  even a token with full admin sees it absent. So "object absent" and "no
+  permission to see it" are different states, and only `automated-security-fixes`
+  returning `403` is evidence of the latter; treating an absent
+  `security_and_analysis` object itself as proof of missing admin is not
+  reliable and misreports a plan/visibility limitation as a permission gap.
 
 Report them on separate rows, never collapsed into one "Dependabot: on":
 
@@ -86,21 +95,26 @@ DEPENDABOT
 |---------------------------------|-----------------------------------------|
 | .github/dependabot.yml          | absent — no version updates configured  |
 | vulnerability alerts (repo flag)| disabled (404)                          |
-| dependabot_security_updates     | disabled — no automatic CVE fix PRs     |
+| security updates (repo flag)    | disabled — no automatic CVE fix PRs     |
 | Open Dependabot PRs             | 0                                       |
 ```
 
-If the whole `security_and_analysis` object is null or absent, the token lacks
-admin on the repo — report that flag as **UNKNOWN (needs admin)**. Do **not**
-report it as `disabled`; "can't see it" and "it's off" are different answers
-and only one of them justifies a write. A `403` from `/vulnerability-alerts` is
-the same UNKNOWN case; only a `404` means genuinely disabled.
+Reserve **UNKNOWN (needs admin)** for an actual permission failure — a `403`
+from `/automated-security-fixes` (security updates) or `/vulnerability-alerts`
+(alerts). Do **not** report a flag as `disabled` when the endpoint returned
+`403`; "can't see it" and "it's off" are different answers and only one of
+them justifies a write. Conversely, do **not** infer UNKNOWN from an absent
+`security_and_analysis` object — as noted above, private repos without GitHub
+Advanced Security omit that object even for a fully-admin token, so its
+absence alone proves nothing about permissions; the dedicated endpoints are
+the authoritative source either way.
 
 ### 2. Detect the ecosystems actually present
 
 Scaffold from what the repo really contains, never from a fixed template. Look
-for manifests at the root **and** in subdirectories (each distinct directory
-needs its own `updates:` entry with the right `directory:` value):
+for manifests at the root **and** in subdirectories (every distinct directory
+needs coverage — either its own `updates:` entry with the right `directory:`
+value, or a slot in one entry's plural `directories:` list, see below):
 
 | Ecosystem | Detect via |
 |---|---|
@@ -130,6 +144,17 @@ not save you — zsh fails before `ls` ever runs.
 
 If **nothing** is detected, say there is nothing to scaffold and stop — do not
 guess an ecosystem the repo doesn't have.
+
+**One ecosystem in many directories**: when the same ecosystem appears in
+several places (say, four independent crates, each with its own `Cargo.toml`
+and `Cargo.lock`, under one directory tree), Dependabot's plural `directories:`
+key collapses them into a **single** `updates:` entry instead of N
+near-identical ones. Scans still open one PR per directory — the key changes
+how the config is written, not how many PRs arrive. The trade-off is that one
+entry means **one shared policy**: the same schedule, grouping, `labels:`, and
+`exclude-patterns` apply to every listed directory. Keep separate
+per-directory entries whenever two manifests genuinely need different grouping
+or cadence. Syntax in step 4.
 
 #### 2a. Classify each manifest as repo-owned or installer-owned
 
@@ -294,6 +319,30 @@ updates:
     # majors are deliberately ungrouped: one reviewable PR each
 ```
 
+For an ecosystem step 2 found in several directories, use the plural
+`directories:` key **in place of** `directory:` — a list of paths (globs
+allowed) sharing one entry's schedule, grouping, and labels:
+
+```yaml
+  - package-ecosystem: "cargo"
+    directories:                       # plural — several manifests, one policy
+      - "/crates/alpha"
+      - "/crates/beta"
+      - "/crates/gamma"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+```
+
+Expect one PR per directory on the first scan even though there is only one
+entry — `directories:` shares the *policy*, not the PRs. Split it back into
+per-directory entries the moment two of those crates need different grouping,
+cadence, or labels: `directories:` buys brevity, and pays for it with a single
+shared policy across every path listed.
+
 Add `labels: ["<validated-label>"]` only if step 3 approved one. Write the file
 only on explicit approval; under `--check`, stop here and show it as a proposal.
 
@@ -442,6 +491,34 @@ decide whether each PR is **stale** (already satisfied by the manifest) or
    `^4.0.0` in `website`; had the PR targeted `4.1.10`, the `website` package
    would still have needed it — a single satisfied manifest is not enough.)
 
+5. **`github-actions`: each workflow file is its own manifest, and a matching
+   title is not enough to call a PR stale.** `github-actions` has no lockfile
+   and no package root — a single action name can appear verbatim across N
+   unrelated `.github/workflows/*.yml` files that were never conceptually
+   "packages," and each one drifts independently. The common source of that
+   drift is a **newly added** workflow file: it is authored against whatever
+   version was current when someone wrote it, not whatever version the rest
+   of the repo already bumped to. Never conclude "stale" from the PR title's
+   version pair alone — compare that PR's `pulls/<N>/files` against the pins
+   in **every** workflow file that declares the dependency before deciding.
+
+   Concrete case: PR #224 (the grouped `github-actions` PR) bumped
+   `actions/checkout` 4 → 7 in `.github/workflows/ci.yml` and merged first.
+   PR #236 also bumped `actions/checkout` 4 → 7 — but in
+   `.github/workflows/docker-build.yml`, a workflow file PR #235 had just
+   added, still pinned to `actions/checkout@v4`. Despite the identical
+   dependency, the identical version pair, and `ci.yml` on the base branch
+   already showing `@v7`, #236 was **not** stale: it fixed a workflow file
+   #224 never touched. Closing it as a duplicate would have left the new
+   Docker-build workflow pinned to a runtime GitHub had already deprecated —
+   the same class of deprecation #224 was merged to clear.
+
+**When in doubt, treat the PR as real, not stale.** The two failure modes are
+not symmetric: calling a real PR "stale" silently drops a pending upgrade —
+it vanishes from the report and never gets applied — while calling a stale PR
+"real" only re-merges a no-op, which is harmless. Given that asymmetry,
+resolve any ambiguity toward "real."
+
 A PR that is satisfied everywhere it is declared is **stale** — note it as
 `stale — already satisfied by manifest`. A stale PR is **excluded from the
 majors tally** even when its title/branch names a major-version bump: it
@@ -504,6 +581,27 @@ when the branch is linked to a worktree:
 ./.loom/scripts/merge-pr.sh <N>      # Loom repos
 gh pr merge <N> --squash             # otherwise
 ```
+
+**Re-poll mergeability between sequential merges.** Merging one bot PR that
+touches a shared lockfile invalidates its siblings: GitHub recomputes their
+mergeability asynchronously, and for ~20 s the remaining PRs report
+`mergeable: null` / `mergeable_state: "unknown"` (`mergeStateStatus: UNKNOWN`
+via `gh`) before settling back to `clean`. `merge-pr.sh` refuses inside that
+window, which reads as a spurious failure mid-loop. After each merge, re-read
+the next PR's state and wait for `clean` before merging it:
+
+```bash
+for _ in $(seq 1 12); do
+  state=$(gh pr view <N> --json mergeStateStatus -q .mergeStateStatus)
+  [ "$state" = "UNKNOWN" ] || break
+  sleep 5
+done
+echo "$state"   # CLEAN → merge; DIRTY/BLOCKED → real conflict or failing checks, re-triage
+```
+
+A state that settles on `DIRTY` (or `BLOCKED`) is **not** a timing artifact —
+the earlier merge produced a genuine lockfile conflict, so stop the loop and
+report it rather than retrying.
 
 Under `--check`, stop at the report and merge nothing.
 

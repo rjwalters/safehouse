@@ -194,6 +194,56 @@ or malformed config keeps the guard on; the opt-in toggles are the inverse.
 { "guards": { "sqlDdl": false, "cloudCli": true, "forceScope": "protected" } }
 ```
 
+**`rmScope`'s unresolved-shell-variable policy (#239).** `extract_rm_targets()`
+is a tokenizer, not a shell evaluator: an `rm` target of `"$p"` reaches the
+scope check with the `$p` reference unexpanded. The naive resolution — treat
+anything that doesn't start with `/` as CWD-relative — silently reinterprets
+an unresolvable target as repo-relative, which is the ONE interpretation
+guaranteed to pass the in-scope check regardless of what the variable actually
+expands to at runtime (`rm -rf "$p"` at a repo cwd, `$p` really pointing
+outside the repo, was wrongly allowed). Deleting is not recoverable, so
+`guards.rmScope=repo` fails **closed** on an unresolvable target rather than
+guessing, mirroring the Bash-tool write-confinement category's own posture on
+the same ambiguity (`#4921`/`#4927`).
+
+The guard takes the deliberate **middle option** between "deny every
+unresolvable target" (breaks every scripted `rm` loop, including ones fully
+inside the repo) and "keep guessing" (this issue): deny only when the
+variable is the **path root** — nothing literal precedes the first unexpanded
+`$` (`rm -rf "$p"`, `rm -rf "$(mktemp -d)"`, `rm -rf "/$X/evil"`). A variable
+in a *later* directory component, with a real literal root before it
+(`rm -rf "build-artifacts/$sub/tmp"`), is instead resolved as far as the
+literal text allows and only the **known prefix** — everything before the
+first unexpanded `$` — is scope-tested: in scope → allowed (the delete stays
+inside the area `rmScope=repo` already permits), not in scope or unusable →
+denied. A `$` that appears only in the trailing/final path component
+(`rm -rf build-artifacts/tmp/$stamp`) needs none of this, since the directory
+portion is fully literal either way, and keeps its existing (unaffected)
+treatment.
+
+This is the **opposite polarity** from write-confinement's equivalent
+known-prefix case, which *denies* an in-scope prefix (there, an unresolvable
+directory component inside the protected area could still let a **write**
+escape it). For `rm`-scope the risk runs the other way — a **delete** landing
+*outside* the repo — so a known-in-scope prefix is exactly the evidence that
+risk did not materialize, and the target is allowed. See
+`hooks/repo/guard-destructive.sh` (search `#239`) for the implementation and
+`hooks/repo/tests/test-guard-destructive.sh`'s "rm-scope unresolved shell
+variable in target (#239)" section for the pinned cases in both directions.
+This policy only applies while `guards.rmScope=repo` is active — with
+`rmScope:"off"`/`"permissive"` the legacy CWD-relative fallback is unchanged,
+so the opt-out stays byte-for-byte permissive.
+
+**Affected caller: `commands/repo/sudo.md` (#245).** All four `rm` calls in
+that command (`sudo rm -f "$DROPIN"` and `rm -f "$TMP"`, each root-unresolved
+— the variable is the entire target) are denied under the default
+`guards.rmScope=repo`. Unlike the write-confinement guard's own affected
+caller note in the same file, this trigger is **config-only and defaults to
+`repo`** — it has no "only when a managed worktree exists" carve-out, so it
+is not avoided by running outside a Loom-managed checkout the way the write
+denials are. See the "Guard note" in `commands/repo/sudo.md` for the
+per-call-site manual remedy.
+
 The full stable interface (input/output contract, exit semantics, every env
 name) is documented in the hook's own header — downstream tools (e.g. Loom's
 installer) gate on it via this repo's release version.

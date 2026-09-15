@@ -1,7 +1,7 @@
 {
-  "version": "0.10.0",
-  "commit": "2a710b8",
-  "layout_version": 1,
+  "version": "0.11.12",
+  "commit": "d1f09e8",
+  "layout_version": 2,
   "dev": false,
   "filtered": false,
   "commands": ["all","audit","branches","deps","docs","followups","gitignore","handoff","help","host-optimize","links","orphans","readme","release","remote","reset","scrub","sudo","tidy","update-tools"]

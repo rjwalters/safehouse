@@ -59,7 +59,7 @@
 # stale-tag-prone: a host provisioned once for an ephemeral dev session can
 # later become a persistent fleet worker while still carrying the repo-remote
 # tag, at which point this ephemeral tooling would happily reuse it
-# (2AMLogic/2am#52). `down` is the strictly worse case: it STOPS the resolved
+# (operator incident, private tracker). `down` is the strictly worse case: it STOPS the resolved
 # instance, or — with --delete — TERMINATES it, disk and all, unrecoverable.
 # So before `up` starts/aliases a REUSED instance, or `down` stops/terminates
 # any resolved instance, its tags (AWS) / labels (GCP) are checked for a fleet
@@ -102,7 +102,6 @@
 set -uo pipefail
 
 # ── output helpers ──────────────────────────────────────────────────────────
-_is_tty() { [[ -t 2 ]]; }
 log()  { printf '%s\n' "repo-remote: $*" >&2; }
 die()  { local code="$1"; shift; printf '%s\n' "repo-remote: ERROR: $*" >&2; exit "$code"; }
 
@@ -375,8 +374,8 @@ require_cost_config() {
 # the repo-remote=<name> tag/label, and neither of those handles expires: a box
 # provisioned once as an ephemeral dev session can since have become a
 # persistent, daemon-managed fleet worker while still carrying the old tag. That
-# is exactly how `repo-remote=anvil` tooling kept rediscovering `loom-worker-1`
-# after it became a fleet host (2AMLogic/2am#52).
+# is exactly how `repo-remote=anvil` tooling kept rediscovering a fleet host
+# after it became a fleet host (operator incident, private tracker).
 #
 # So: before a REUSED instance is started or aliased, look for a fleet marker
 # the fleet-management side already had to set deliberately elsewhere. This is a
@@ -408,7 +407,7 @@ fleet_marker_gate() {  # <resource-id> <marker-value> <"tag"|"label">
   # Same "repo-remote: ERROR:" shape as die(), but die() is a single line and
   # this refusal is only actionable with the remediation lines that follow it.
   printf '%s\n' "repo-remote: ERROR: refusing to reuse ${id}: it carries the fleet marker ${kind} ${FLEET_TAG_KEY}=${val}." >&2
-  log "  That marker means the host is managed as part of a fleet (e.g. a persistent loom-daemon worker), so starting or re-aliasing it from ephemeral dev-session tooling is almost certainly not what you want (2AMLogic/2am#52)."
+  log "  That marker means the host is managed as part of a fleet (e.g. a persistent loom-daemon worker), so starting or re-aliasing it from ephemeral dev-session tooling is almost certainly not what you want (operator incident, private tracker)."
   log "  If you really mean to target it, re-run with --force."
   log "  To use a different box instead, clear REPO_REMOTE_INSTANCE_ID from ${REPO_ENV:-<git-root>/.env} (and/or remove the repo-remote=${NAME} tag from the fleet host)."
   log "  To disable this check entirely, set REPO_REMOTE_FLEET_TAG_KEY= (empty)."
