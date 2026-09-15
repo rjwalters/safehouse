@@ -473,8 +473,8 @@ ephemeral dev session can since have been repurposed into a persistent,
 daemon-managed fleet worker while still carrying the old tag, at which point
 ephemeral dev-session tooling would silently start-and-re-alias it (`up`) or
 stop/terminate it (`down`) as if it were still just a throwaway dev box. That is
-the second finding of the 2AMLogic/2am#52 incident, where `repo-remote=anvil`
-tooling kept rediscovering the host that had become `loom-worker-1`; `down
+the second finding of an operator incident (private tracker), where `repo-remote=anvil`
+tooling kept rediscovering the host that had become a fleet host; `down
 --delete` against that same stale handle is the strictly worse outcome — the
 disk is gone, unrecoverable.
 

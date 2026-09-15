@@ -44,6 +44,14 @@ Run each of the following checks and compile results into a single report:
   into this report and say which mapping resolved a link — a mapping fails by
   hiding errors, so it has to show its work. With no declaration, resolution is
   unchanged.
+- A relative link that resolves **outside the repo root** (a citation into a
+  sibling repo in a multi-repo workspace) is checked against
+  `.repo/link-siblings.json` when the repo declares one. Report it distinctly:
+  `resolved via sibling repo` when the checkout is present and the target
+  exists, a normal `MISSING` finding when the checkout is present but the
+  target is gone, and `sibling repo not present — unverifiable` — never
+  `MISSING` — when the sibling isn't checked out on this machine at all. With
+  no declaration, out-of-repo links are handled exactly as they are today.
 
 ### 4. Gitignore Issues (see [[gitignore]])
 - Files that are ignored but probably shouldn't be

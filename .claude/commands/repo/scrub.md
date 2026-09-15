@@ -163,6 +163,33 @@ ip-10-0-1-5                ip-172-31-74-176                           (dashed-ho
 Plus tailnet `100.64.0.0/10` and elastic IPs. Low severity, high volume —
 `--deep` only, and summarized as a count in the default report.
 
+**`git grep` does not honor `\b`.** For the "tracked files at HEAD" scope,
+`git grep -E` silently matches nothing against a `\b`-bearing pattern like the
+ones above — no error, no warning, just a report of zero findings that is
+wrong, not clean. `git grep -cE '\b10\.\d+\.\d+\.\d+\b' -- wrangler.toml` and
+`git grep -cE '10\.\d+\.\d+\.\d+' -- wrangler.toml` differ only in the `\b`,
+and the first one is vacuous. Use one of:
+
+- `git grep -P` — PCRE mode honors `\b`, where the local `git` was built with
+  PCRE support (not guaranteed; check `git grep -P` doesn't error before
+  relying on it). On a host whose system `grep` is BSD grep, note that the
+  same failure mode can bite a second time: BSD grep has no `-P` at all (it
+  exits `2`, "invalid option"), so a caller that falls back from `git grep -P`
+  to a piped `grep -P` fails again — and if stderr is suppressed, that second
+  failure also reads as a clean zero.
+- `git ls-files -z | xargs -0 grep -nE` — keeps the tracked-files-at-HEAD scope
+  while using a grep that honors `\b` unconditionally.
+
+Don't trust a "0 findings" result from this scope on status alone. `git grep`'s
+own exit status is `1` on a silent `\b` failure — identical to the exit status
+of a genuine no-match, so the failure cannot be detected from `git grep`'s
+exit code by itself; only the *scrub run's* own reported exit is `0` here
+("0 findings"), and that clean-looking `0` is the confident-but-wrong signal
+this section warns about. The reliable check is a **positive control**: run
+the same pattern against a line you already know matches (e.g. a scratch file
+containing `10.0.1.5`) and confirm it is found before trusting an absence of
+findings on real input.
+
 ## Severity gates verbosity, not just ordering
 
 This runs inside `/repo:all`, which is routine and mostly clean. **A check that
