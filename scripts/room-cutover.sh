@@ -179,8 +179,9 @@ else
 		die "create_room failed: $(printf '%s' "$CREATE_REPLY" | jq -r '.result.content[0].text // .')"
 	CREATE_TEXT=$(printf '%s' "$CREATE_REPLY" | jq -r '.result.content[0].text')
 	ROOM_ID=$(printf '%s' "$CREATE_TEXT" | jq -r '.room_id')
-	[ -n "$ROOM_ID" ] && [ "$ROOM_ID" != "null" ] ||
+	if [ -z "$ROOM_ID" ] || [ "$ROOM_ID" = "null" ]; then
 		die "create_room reply carried no room_id: $CREATE_TEXT"
+	fi
 	ok "created $ROOM_ID"
 fi
 
