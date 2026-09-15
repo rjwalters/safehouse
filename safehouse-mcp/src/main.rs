@@ -14,7 +14,7 @@
 //!
 //! ## Operator CLI (see also README "Scripting the socket")
 //!
-//! `safehouse-mcp read|send|check|list-rooms|status` runs one op against the
+//! `safehouse-mcp read|send|check|list-rooms|status|invite` runs one op against the
 //! daemon and prints the JSON reply — no MCP client, no hand-rolled
 //! envelope-v1 socket client required. `check` defaults to **peek** (never
 //! advances a persona's mailbox cursor); pass `--consume` to advance it
@@ -177,6 +177,10 @@ fn print_usage(out: &mut impl Write) {
         out,
         "  safehouse-mcp status   # last_event_received/last_sync_completed/retry state — a one-line liveness check"
     );
+    let _ = writeln!(
+        out,
+        "  safehouse-mcp invite --room <id|name|alias> --user <@bot:server>   # onboard a new fleet host (#94)"
+    );
 }
 
 /// Builds the daemon op JSON for a CLI subcommand. Returns `Ok(None)` when
@@ -190,6 +194,7 @@ fn build_cli_op(sub: &str, args: &[String]) -> Result<Option<Value>> {
         "check" => build_check_op(args)?,
         "list-rooms" => build_list_rooms_op(args)?,
         "status" => build_status_op(args)?,
+        "invite" => build_invite_op(args)?,
         _ => return Ok(None),
     };
     Ok(Some(op))
@@ -292,6 +297,33 @@ fn build_list_rooms_op(args: &[String]) -> Result<Value> {
         bail!("list-rooms: unknown argument {other:?}");
     }
     Ok(json!({"op": "list_rooms"}))
+}
+
+/// Onboarding a new fleet host into an existing room (#94): sends the
+/// daemon's `invite` RPC op (`safehoused/src/rpc.rs`) from an
+/// already-onboarded host's socket — see README "Running it" step 4,
+/// "Onboarding a new fleet host into an existing room". The daemon on the
+/// *receiving* end auto-joins via `on_invite`; this CLI is only the sending
+/// half.
+fn build_invite_op(args: &[String]) -> Result<Value> {
+    let mut op = json!({"op": "invite"});
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--room" => {
+                let v = flag_value(args, &mut i, "--room")?;
+                op["room"] = json!(v);
+            }
+            "--user" => {
+                let v = flag_value(args, &mut i, "--user")?;
+                op["user"] = json!(v);
+            }
+            other => bail!("invite: unknown argument {other:?}"),
+        }
+    }
+    anyhow::ensure!(op.get("room").is_some(), "invite: --room is required");
+    anyhow::ensure!(op.get("user").is_some(), "invite: --user is required");
+    Ok(op)
 }
 
 /// #85 — the daemon's liveness/staleness one-liner: `last_event_received`
@@ -671,5 +703,20 @@ mod tests {
             build_cli_op("status", &[]).unwrap().unwrap(),
             json!({"op": "status"})
         );
+        assert_eq!(
+            build_cli_op(
+                "invite",
+                &args(&["--room", "x", "--user", "@bot:example.com"])
+            )
+            .unwrap()
+            .unwrap(),
+            json!({"op": "invite", "room": "x", "user": "@bot:example.com"})
+        );
+    }
+
+    #[test]
+    fn build_invite_op_requires_room_and_user() {
+        assert!(build_invite_op(&args(&["--user", "@bot:example.com"])).is_err());
+        assert!(build_invite_op(&args(&["--room", "x"])).is_err());
     }
 }

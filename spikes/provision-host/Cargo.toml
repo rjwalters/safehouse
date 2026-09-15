@@ -1,0 +1,15 @@
+[package]
+name = "provision-host"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "One-shot fleet-side host onboarding via Matrix admin-room automation (issue #94)"
+
+[dependencies]
+matrix-sdk = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+toml = "0.8"
