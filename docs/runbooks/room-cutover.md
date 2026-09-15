@@ -50,6 +50,15 @@ op every other room on the fleet uses) and invites every identity you passed
 in one call, then prints the new room ID plus the full rollout plan below.
 Every invited bot's own `safehoused` auto-joins on its next sync.
 
+**Live runs require confirmation.** Before calling `create_room` for real, the
+script prints the exact socket/persona/room name it is about to act against
+and requires you to type the room name back — this is irreversible (Matrix
+has no room-deletion RPC) and an already-exported `SAFEHOUSED_SOCKET` pointing
+at production is easy to miss in an otherwise-normal dev shell. Pass `--yes`
+to skip the prompt for scripted/non-interactive use; without a tty on stdin
+and without `--yes`, the script refuses to proceed rather than run
+unattended against a live socket.
+
 **Try it dry first.** `scripts/room-cutover.sh --dry-run` (with or without
 `--room-name`/`--invite`) renders the exact JSON-RPC frame that would be sent
 and the full rollout plan, without opening the daemon socket at all — this is

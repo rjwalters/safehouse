@@ -49,7 +49,19 @@
 #                       daemon socket. Missing --room-name/--invite fall back to
 #                       clearly-marked sample values so this is safe to run with
 #                       no arguments at all (this is what CI exercises).
+#   --yes               Skip the interactive live-run confirmation prompt (for
+#                       scripted/non-interactive use). Only affects a real,
+#                       non-dry-run invocation.
 #   -h, --help         Show this help.
+#
+# Safety gate on the live path: a non-dry-run invocation prints the exact
+# SAFEHOUSED_SOCKET / SAFEHOUSE_PERSONA / room name it is about to act
+# against and then requires you to type the room name back before
+# create_room is called — this is irreversible (Matrix has no room-deletion
+# RPC) and an already-exported env var pointing at production is easy to
+# miss. Pass --yes to skip the prompt for scripted use; a non-interactive
+# shell (no tty on stdin) without --yes aborts rather than silently
+# proceeding.
 #
 # Requires: jq (to build/parse the JSON-RPC frames — needed even for
 # --dry-run, since it renders the exact frame that would be sent) and, for a
@@ -87,12 +99,17 @@ usage() {
 DRY_RUN=0
 ROOM_NAME=""
 INVITE_LIST=""
+CONFIRMED=0
 
 while [ $# -gt 0 ]; do
 	case "$1" in
 	-h | --help) usage ;;
 	--dry-run)
 		DRY_RUN=1
+		shift
+		;;
+	--yes)
+		CONFIRMED=1
 		shift
 		;;
 	--room-name)
@@ -171,6 +188,22 @@ else
 		die "SAFEHOUSED_SOCKET must be set — the running daemon's socket path (see README \"Scripting the socket\")."
 	[ -n "${SAFEHOUSE_PERSONA:-}" ] ||
 		die "SAFEHOUSE_PERSONA must be set — the persona this script authenticates as."
+
+	warn "About to create a room FOR REAL — this cannot be undone (Matrix has no room-deletion RPC):"
+	printf '    socket:  %s\n' "$SAFEHOUSED_SOCKET"
+	printf '    persona: %s\n' "$SAFEHOUSE_PERSONA"
+	printf '    room:    %s\n' "$ROOM_NAME"
+	printf '    invite:  %s\n' "$INVITE_LIST"
+	if [ "$CONFIRMED" -eq 1 ]; then
+		ok "--yes given — skipping interactive confirmation."
+	elif [ -t 0 ]; then
+		printf 'Type the room name above to confirm: '
+		read -r CONFIRM_REPLY
+		[ "$CONFIRM_REPLY" = "$ROOM_NAME" ] ||
+			die "confirmation did not match room name '$ROOM_NAME' — aborting, nothing was created."
+	else
+		die "stdin is not a terminal and --yes was not given — refusing to create a live room without confirmation. Re-run with --yes if this is intentional."
+	fi
 
 	step "Creating replacement room '$ROOM_NAME' via $SAFEHOUSED_SOCKET as $SAFEHOUSE_PERSONA, inviting: $INVITE_LIST"
 	CREATE_REPLY=$(printf '%s' "$CREATE_FRAME" | (cd "$REPO_ROOT" && cargo run --quiet -p safehouse-mcp))
