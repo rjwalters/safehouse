@@ -44,7 +44,11 @@
 # Flags:
 #   --room-name NAME   Name for the replacement room (required unless --dry-run).
 #   --invite LIST      Space-separated Matrix user IDs to invite — the known
-#                       publisher/consumer identities (required unless --dry-run).
+#                       publisher/consumer identities. Required unless --dry-run,
+#                       but an explicitly empty value (--invite "") is accepted —
+#                       a scratch room with zero invitees is a legitimate live-run
+#                       test. Omitting the flag entirely still fails outside
+#                       --dry-run, so a live run always requires a deliberate choice.
 #   --dry-run          Render every command that would run, without opening the
 #                       daemon socket. Missing --room-name/--invite fall back to
 #                       clearly-marked sample values so this is safe to run with
@@ -99,6 +103,7 @@ usage() {
 DRY_RUN=0
 ROOM_NAME=""
 INVITE_LIST=""
+INVITE_GIVEN=0
 CONFIRMED=0
 
 while [ $# -gt 0 ]; do
@@ -120,6 +125,7 @@ while [ $# -gt 0 ]; do
 	--invite)
 		[ $# -ge 2 ] || die "--invite requires a value"
 		INVITE_LIST="$2"
+		INVITE_GIVEN=1
 		shift 2
 		;;
 	*) die "unknown argument: $1 (try --help)" ;;
@@ -137,7 +143,9 @@ if [ "$DRY_RUN" -eq 1 ]; then
 	fi
 else
 	[ -n "$ROOM_NAME" ] || die "--room-name is required (or pass --dry-run)"
-	[ -n "$INVITE_LIST" ] || die "--invite is required (or pass --dry-run)"
+	# An explicitly empty --invite "" is allowed (a scratch room with zero
+	# invitees is a legitimate live-run test) — only an omitted flag fails.
+	[ "$INVITE_GIVEN" -eq 1 ] || die "--invite is required (or pass --dry-run)"
 fi
 
 command -v jq >/dev/null 2>&1 ||

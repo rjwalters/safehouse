@@ -80,3 +80,26 @@ jobs:
             echo "expected failure: --room-name is required outside --dry-run" >&2
             exit 1
           fi
+      - name: omitted --invite fails, but explicitly empty --invite is accepted, outside --dry-run
+        run: |
+          # Omitting --invite entirely must still fail (forces a deliberate choice).
+          out="$(scripts/room-cutover.sh --room-name x 2>&1)" && {
+            echo "expected failure: --invite is required outside --dry-run" >&2
+            exit 1
+          }
+          echo "$out" | grep -qF -- "--invite is required" || {
+            echo "expected the missing-invite error, got: $out" >&2
+            exit 1
+          }
+          # A scratch room with zero invitees (--invite "") is a documented,
+          # legitimate live-run test (docs/runbooks/room-cutover.md) — it must
+          # pass the flag-validation gate and fail later, on the missing daemon
+          # socket, not on --invite.
+          out="$(env -u SAFEHOUSED_SOCKET -u SAFEHOUSE_PERSONA scripts/room-cutover.sh --room-name x --invite "" 2>&1)" && {
+            echo "expected failure: SAFEHOUSED_SOCKET must be set" >&2
+            exit 1
+          }
+          echo "$out" | grep -qF -- "SAFEHOUSED_SOCKET must be set" || {
+            echo "empty --invite should pass validation and fail on missing SAFEHOUSED_SOCKET, got: $out" >&2
+            exit 1
+          }
