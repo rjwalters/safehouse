@@ -303,7 +303,7 @@ set:
 | `CWD_DELETED` | worktree removed mid-run | abandon cleanly |
 | `TOKEN_EXPIRED` | 401 / OAuth expired | skip this token |
 | `TOKEN_EXHAUSTED` | quota / weekly / usage limit | rotate to another account, mark bad |
-| `MODEL_CREDITS_EXHAUSTED` | per-model-**tier** credits ran out ("out of usage credits") | in-session dispatch: re-dispatch one model rung down, same account. Subprocess dispatch: identical to `TOKEN_EXHAUSTED` |
+| `MODEL_CREDITS_EXHAUSTED` | per-model-**tier** credits ran out ("out of usage credits") | in-session dispatch: re-dispatch one model rung down, same account. Subprocess dispatch: rotate as for `TOKEN_EXHAUSTED`, but the Claude pool's `.bad_tokens` entry is scoped to the model class in flight (`[model-class:opus]`, #8058) so the account keeps serving other classes |
 | `SESSION_LIMIT` | concurrent-session cap (healthy account) | re-select, retry, do **not** mark bad |
 | `MODEL_REFUSAL` | safety classifier refused the turn | drop one ladder rung, no Doctor cycle consumed |
 | `RECOVERABLE` | rate limit / 5xx / network | retry with backoff |
@@ -876,6 +876,24 @@ instead of `claude` directly, so a Codex-hosted (or any non-Claude) operator can
 dispatch the canonical single-issue lifecycle. With nothing configured this stays
 byte-for-byte the old `claude -p ... --dangerously-skip-permissions` invocation
 (via `spawn-worker.sh` → `spawn-claude.sh`).
+
+### Test-isolation defaults the dispatcher exports (#8077)
+
+Before dispatching, `spawn-worker.sh` sets two variables — with `${VAR:-default}`
+semantics, so an explicit caller value always wins:
+
+| Variable | Default | Why |
+|---|---|---|
+| `LOOM_DAEMON_LOG` | `$TMPDIR/loom-worker-isolation-<pid>/daemon.log` | A worker inherits the daemon's environment, and the daemon's own systemd unit sets `LOOM_SOCKET_PATH=$HOME/.loom/loom-daemon.sock`. `resolve_loom_dir()` takes that variable's **parent** as the loom dir, so any `loom-daemon` a worker spawns without an override resolves the **live** `~/.loom/daemon.log` — omitting an override yields the production path, not a neutral one. `LOOM_DAEMON_LOG` is the daemon's highest-precedence log tier, so setting it here makes the safe thing the default. |
+| `LOOM_TEST_ALLOW_SYSTEMD` | `0` | Test blocks that drive the **live** `systemctl --user` manager are opt-in. Inside a sweep, that manager is the one supervising the production daemon. CI opts in explicitly (`.github/workflows/ci.yml`); a sweep never does. |
+
+`LOOM_SOCKET_PATH`, `LOOM_WORKSPACE` and `LOOM_SHARED_TOKENS_DIR` are
+deliberately **not** repointed: the worker itself has to reach the real daemon
+over the real socket and draw from the real token pool, so isolating them would
+break the sweep rather than isolate a test. Test-side isolation for those lives
+in `defaults/scripts/tests/lib/live-state-sandbox.sh`, whose
+`live_host_leak_snapshot` / `live_host_leak_assert_unchanged` pair
+`run-ci-suites.sh` wraps around every suite it runs.
 
 ### Adapter observability markers
 
