@@ -81,6 +81,7 @@ crypto-store/
 .loom/.resync-in-progress
 .loom/gh-config/
 .loom/gh-config-by-owner/
+.loom-local/
 # <<< loom-managed <<<
 
 # repo:handoff session notes (one-shot, never committed)
