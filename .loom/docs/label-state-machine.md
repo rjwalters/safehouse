@@ -49,7 +49,7 @@ each definition, for the terse version of this same table):
 | `loom:blocked` | Waiting on a dependency, but still automatable once that clears | No |
 | `loom:operator-only` | Requires human action or ruling *outside* automation entirely (credentials, infra, hardware, an owner-gated decision) | **Yes** — sweep/shepherd skip it, except the narrow capability-matched `loom:operator-mechanical` case (#6893, see "Dispatch path" below) |
 | `loom:needs-capability` | Blocked on a missing tool/agent capability — not an operator-by-right decision, but automation genuinely cannot proceed without the capability existing first (#5817) | **Yes** — sweep/shepherd skip it, identically to `loom:operator-only` today |
-| `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **No** — stays in the normal re-evaluation queue |
+| `loom:operator` | The engine has stopped on this specific artifact and a human must act, but the item stays live in its normal queue so the engine's own release conditions can still fire | **New-builder skip only** — the work finder does not *start* a fresh `--claim-owned` build on it (vibesql#6664); re-evaluation lanes (Champion/role ticks, watchdog re-dispatch, reaper resume, explicit `loom-daemon dispatch <N>`) still reach it |
 
 The distinguishing property of `loom:operator` is that it is **re-evaluable**:
 unlike `loom:operator-only`, applying it must never cause sweep/shepherd
@@ -57,6 +57,17 @@ dispatch to skip the item. That is what makes it safe to apply to a PR that
 still needs to pass through its normal Champion tick — the hold that put the
 label on can also be the mechanism that takes it back off, without a human
 having to remember to remove it.
+
+One lane is deliberately excluded from that guarantee (vibesql#6664): the
+work finder's *candidate* filter. A sweep that concludes "a human is needed"
+releases its claim (restoring `loom:issue`) and applies `loom:operator` in one
+motion — without the candidate skip, the finder immediately re-listed the
+issue and dispatched another builder onto the fresh hold (observed 3× in 13
+minutes on vibesql#6172). So the finder treats a held candidate like an
+already-claimed one (it will not *start* work), while every route that
+*re-evaluates* or explicitly targets the item still proceeds. The label never
+refuses dispatch by itself — it is not in the park set the dispatch-time
+guard consults.
 
 ## Entry points
 
@@ -554,6 +565,44 @@ sweep). The prompt-side convention is enforced mechanically by
 `defaults/scripts/tests/test-operator-only-subkind.sh`, which fails CI on any
 `--add-label` in a role prompt, doc, or script that applies `loom:operator-only`
 without a sub-kind in the same argument.
+
+### An issue's own autonomous filing is not operator approval (#7855, #8309)
+
+Filing an issue — by any role, including one footed "🤖 Generated with Claude
+Code" — is not itself an operator ruling, even when the issue's substance is
+a proposal to reverse a documented design decision, safety posture, or a
+test's asserted intent. That reversal still needs `loom:operator-only` +
+`loom:operator-decision`; the filing agent's own presence on the issue is
+never a substitute for that routing.
+
+**Named anti-pattern**: on #7855, a Curator pass reasoned "the operator
+filing it is the ruling that reverses it" about an issue — itself filed
+autonomously — proposing to drop the deliberate no-auto-restart posture for a
+wedged-but-alive daemon (`loom-daemon/src/watchdog/help.txt` and
+`loom-daemon/src/watchdog/mod.rs`'s "no automatic kill/restart" rationale,
+asserted by `defaults/scripts/tests/test-loom-daemon-watchdog.sh`'s Test 14).
+Champion caught the reversal at the promotion gate, one stage after Curator
+had already spent a pass enriching and scoping it on that premise. Do not
+restate this reasoning — an issue's own filing, autonomous or not, carries no
+approval weight over a documented decision.
+
+This is narrow: it flags proposed *reversals* of existing, documented/tested
+behaviour, not autonomously-filed issues in general (see CLAUDE.md § "Issues
+Are Suggestions").
+
+**Since #8396 this rule has a mechanism, not only a prose statement.**
+`./.loom/scripts/premise-check.sh --issue N` (`loom-daemon premise-check`)
+runs **before** Curator enrichment — from the sweep orchestrator's Curator
+phase, and from `curator.md` § "Before Starting Curation" on every other
+path. For a scoped population (`loom:architect`/`loom:hermit`/`loom:auditor`,
+an incident-report heading, or an issue whose own text claims a reversal) it
+requires a recorded premise check, and it **refuses** the one combination this
+section names as the anti-pattern: a record saying `deliberate=yes
+reversal=yes` is admissible only with `verdict=operator-decision`, which is
+this exact routing. It invents no label and relaxes nothing above — exit `11`
+means "apply `loom:operator-only` + `loom:operator-decision`, with the
+disagreement-axis comment rule 4 already requires". Contract and design
+rationale: [`premise-gate.md`](premise-gate.md).
 
 ## `loom:needs-capability` — a narrower claim than `loom:operator-only` (#5817)
 
