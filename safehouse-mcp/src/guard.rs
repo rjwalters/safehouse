@@ -28,8 +28,9 @@
 //! Everything in here is deliberately regex-free and dependency-free, matching
 //! the crate's "hand-rolled, no SDK contract" style in `main.rs`, and split so
 //! the decision logic is pure (string in, verdict out) and unit-testable with
-//! no daemon, no network, and — for everything but the two small filesystem
-//! walkers — no filesystem.
+//! no daemon, no network, and — for everything but the filesystem walkers and
+//! the path canonicalization the firewall needs to compare two spellings of
+//! the same directory — no filesystem.
 
 use std::{
     env, fs,
@@ -112,10 +113,25 @@ pub fn fenced(payload: &str) -> String {
 }
 
 fn fence_token(payload: &str) -> String {
+    fence_token_avoiding(payload, |token| payload.contains(token))
+}
+
+/// The re-salting loop, with the collision test injected.
+///
+/// `occupied` answers "is this candidate token already present in the text the
+/// fence has to stay distinct from?". [`fence_token`] passes
+/// `|t| payload.contains(t)`; tests pass a predicate that can force a real
+/// collision, which a fixed payload cannot do — finding a payload that contains
+/// its own hash is infeasible by construction, which is the whole point of the
+/// scheme, so the retry branch is otherwise untestable.
+///
+/// Terminates for any `occupied` that rejects only finitely many tokens (a
+/// finite payload contains finitely many 16-hex-char substrings).
+fn fence_token_avoiding(payload: &str, occupied: impl Fn(&str) -> bool) -> String {
     let mut salt: u64 = 0;
     loop {
         let token = format!("{:016x}", fnv1a64(payload.as_bytes(), salt));
-        if !payload.contains(&token) {
+        if !occupied(&token) {
             return token;
         }
         salt = salt.wrapping_add(1);
@@ -574,27 +590,69 @@ pub fn parse_firewall(text: &str) -> Result<Vec<Rule>> {
     Ok(rules)
 }
 
-/// Pure matcher: does this working directory / remote set hit a deny rule?
+/// Every spelling of `path` worth comparing on: the literal path, plus its
+/// canonical form when it resolves.
+///
+/// Both sides of a `path` comparison go through this, because a prefix test on
+/// strings is only meaningful when the two sides are spelled the same way. If
+/// the rule says `~/work/notebook` and `~/work` is a symlink to another mount,
+/// the canonicalized working directory the shim computes for itself never
+/// starts with the rule's literal text, and the rule silently never fires —
+/// the exact fail-*open* the firewall exists to prevent.
+///
+/// A rule path that does **not** resolve (it names a directory that doesn't
+/// exist yet, or one this process can't stat) keeps only its literal spelling
+/// rather than being dropped: a rule that cannot be canonicalized still gets
+/// enforced verbatim. That is the closed choice — the alternative, skipping the
+/// rule, would let an unreadable path disarm it. In practice a `path` rule that
+/// can match at all names an ancestor of the working directory, which must
+/// exist for the process to be running there, so the fallback is a safety net
+/// rather than the normal case.
+///
+/// Matching on *any* candidate pair denies, which is likewise the closed
+/// direction: extra spellings can only add refusals, never remove them.
+fn path_candidates(path: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let literal = path.to_string_lossy().trim_end_matches('/').to_owned();
+    if !literal.is_empty() {
+        out.push(literal.clone());
+    }
+    if let Ok(resolved) = fs::canonicalize(path) {
+        let resolved = resolved.to_string_lossy().trim_end_matches('/').to_owned();
+        if !resolved.is_empty() && resolved != literal {
+            out.push(resolved);
+        }
+    }
+    out
+}
+
+fn is_at_or_under(cwd: &str, prefix: &str) -> bool {
+    cwd == prefix || cwd.starts_with(&format!("{prefix}/"))
+}
+
+/// Matcher: does this working directory / remote set hit a deny rule?
+///
+/// Path comparison canonicalizes both sides (see [`path_candidates`]) so a
+/// symlinked rule path or a symlinked working directory cannot walk past a rule
+/// that was meant to cover it.
 pub fn match_firewall(
     rules: &[Rule],
     cwd: &Path,
     remotes: &[String],
     home: Option<&str>,
 ) -> Option<DenyMatch> {
-    let cwd_str = cwd.to_string_lossy().trim_end_matches('/').to_owned();
+    let cwds = path_candidates(cwd);
     for rule in rules {
         match rule {
             Rule::Path(p) => {
                 let expanded = expand_tilde(p, home);
-                let prefix = expanded.trim_end_matches('/');
-                if prefix.is_empty() {
-                    continue;
-                }
-                if cwd_str == prefix || cwd_str.starts_with(&format!("{prefix}/")) {
-                    return Some(DenyMatch {
-                        rule: rule.clone(),
-                        evidence: format!("working directory {cwd_str}"),
-                    });
+                for prefix in path_candidates(Path::new(&expanded)) {
+                    if let Some(hit) = cwds.iter().find(|c| is_at_or_under(c, &prefix)) {
+                        return Some(DenyMatch {
+                            rule: rule.clone(),
+                            evidence: format!("working directory {hit}"),
+                        });
+                    }
                 }
             }
             Rule::Remote(needle) => {
@@ -745,11 +803,14 @@ pub fn enforce_firewall() -> Result<()> {
 
     let cwd =
         env::current_dir().context("invention firewall: cannot read the working directory")?;
-    let cwd = fs::canonicalize(&cwd).unwrap_or(cwd);
+    // The git-config walk wants the resolved directory; `match_firewall` gets
+    // the un-resolved one and canonicalizes both sides itself, so a rule
+    // written with a symlinked path still matches (see `path_candidates`).
+    let resolved_cwd = fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
 
     let mut remotes = Vec::new();
     if rules.iter().any(|r| matches!(r, Rule::Remote(_))) {
-        if let Some(config) = git_config_path(&cwd)? {
+        if let Some(config) = git_config_path(&resolved_cwd)? {
             let contents = fs::read_to_string(&config).with_context(|| {
                 format!(
                     "invention firewall: {} lists remote rules but {} could not be read — \
@@ -835,13 +896,37 @@ mod tests {
     }
 
     #[test]
-    fn fence_token_re_salts_on_collision() {
-        // Construct the pathological case directly: a payload containing its
-        // own first-choice token must still get a token it doesn't contain.
-        let first = format!("{:016x}", fnv1a64(b"", 0));
-        let payload = format!("contains {first} already");
-        let token = fence_token(&payload);
-        assert!(!payload.contains(&token));
+    fn fence_token_re_salts_until_the_token_is_unoccupied() {
+        // A payload that contains its own first-choice token cannot be
+        // constructed (that is the scheme's whole point), so the collision is
+        // forced through the injected predicate instead — otherwise the retry
+        // branch has no coverage at all and deleting it would fail nothing.
+        let payload = "ordinary room content";
+        let salt0 = format!("{:016x}", fnv1a64(payload.as_bytes(), 0));
+        let salt1 = format!("{:016x}", fnv1a64(payload.as_bytes(), 1));
+        let salt2 = format!("{:016x}", fnv1a64(payload.as_bytes(), 2));
+        assert_ne!(salt0, salt1);
+        assert_ne!(salt1, salt2);
+
+        let attempts = std::cell::RefCell::new(Vec::new());
+        let token = fence_token_avoiding(payload, |t| {
+            attempts.borrow_mut().push(t.to_owned());
+            t == salt0 || t == salt1
+        });
+
+        assert_eq!(token, salt2, "must re-salt past both occupied tokens");
+        assert_eq!(
+            attempts.into_inner(),
+            vec![salt0, salt1, salt2],
+            "salts are tried in order, one increment at a time"
+        );
+    }
+
+    #[test]
+    fn fence_token_takes_the_first_salt_when_nothing_collides() {
+        let payload = "ordinary room content";
+        let token = fence_token(payload);
+        assert_eq!(token, format!("{:016x}", fnv1a64(payload.as_bytes(), 0)));
     }
 
     // ---- 2. secret-shaped body refusal -------------------------------------
@@ -1036,6 +1121,58 @@ mod tests {
             Some("/home/other")
         )
         .is_none());
+    }
+
+    #[test]
+    fn path_rule_matches_through_a_symlinked_rule_path() {
+        // Regression (Judge, PR #183): `enforce_firewall` canonicalizes the
+        // invoking working directory, but the rule prefix used to be compared
+        // verbatim. With `link -> real`, a rule written `path <root>/link/notebook`
+        // was compared against the resolved cwd `<root>/real/notebook/...`,
+        // never matched, and the invocation was **allowed** — a firewall that
+        // fails open on exactly the spelling an operator types every day.
+        let tmp = TempDir::new("firewall-symlink");
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let real = root.join("real");
+        fs::create_dir_all(real.join("notebook/src")).unwrap();
+        fs::create_dir_all(real.join("notebook-public")).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Rule written through the symlink, cwd resolved (the reported bypass).
+        let rules = parse_firewall(&format!("path {}/notebook\n", link.display())).unwrap();
+        let resolved_cwd = fs::canonicalize(link.join("notebook/src")).unwrap();
+        assert_eq!(resolved_cwd, real.join("notebook/src"));
+        assert!(
+            match_firewall(&rules, &resolved_cwd, &[], None).is_some(),
+            "symlinked rule path must still deny the directory it names"
+        );
+        // ...and the unresolved spelling of the same directory.
+        assert!(match_firewall(&rules, &link.join("notebook/src"), &[], None).is_some());
+        assert!(match_firewall(&rules, &real.join("notebook"), &[], None).is_some());
+
+        // The mirror image: rule written canonically, cwd reached via the link.
+        let canonical_rules =
+            parse_firewall(&format!("path {}/notebook\n", real.display())).unwrap();
+        assert!(match_firewall(&canonical_rules, &link.join("notebook/src"), &[], None).is_some());
+
+        // Neither spelling over-blocks: a sibling outside the denied subtree,
+        // including the name-prefix near-miss, is still allowed.
+        assert!(match_firewall(&rules, &real.join("notebook-public"), &[], None).is_none());
+        assert!(match_firewall(&rules, &link.join("notebook-public"), &[], None).is_none());
+    }
+
+    #[test]
+    fn unresolvable_rule_path_is_still_enforced_literally() {
+        // Fail closed: a rule naming a directory that doesn't exist (yet)
+        // cannot be canonicalized, and must keep being matched verbatim rather
+        // than being dropped from the rule set.
+        let tmp = TempDir::new("firewall-missing");
+        let missing = tmp.path().join("not-created-yet");
+        assert!(fs::canonicalize(&missing).is_err());
+        let rules = vec![Rule::Path(missing.to_string_lossy().into_owned())];
+        assert!(match_firewall(&rules, &missing.join("deep"), &[], None).is_some());
+        assert!(match_firewall(&rules, tmp.path(), &[], None).is_none());
     }
 
     #[test]

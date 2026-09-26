@@ -371,7 +371,9 @@ sent it to *what it says*. The token is derived from the payload, so a message b
 a closing marker cannot end the fence early and continue "outside" it. On the CLI the markers are
 written to **stderr** and the JSON to stdout, so `safehouse-mcp read | jq` still sees exactly one
 JSON document; the reply also gains an additive `untrusted_content` field for consumers that only
-read stdout. Bodies are never rewritten. `list-rooms`/`status`/`send` replies are the daemon
+read stdout. The enclosure is therefore only visually intact for a reader that keeps the two streams
+separate — a consumer that merges stderr into stdout sees the markers interleaved with the JSON, and
+should key off `untrusted_content` instead. Bodies are never rewritten. `list-rooms`/`status`/`send` replies are the daemon
 describing its own state and are deliberately left unfenced.
 
 **2. A credential-shaped body is refused before the socket is opened.** `send` scans the outgoing
@@ -401,6 +403,13 @@ reach a room. It fails **closed**: an explicitly-configured file that is missing
 doesn't parse, or remote rules whose repository config can't be read are all refusals, because "the
 firewall couldn't tell" must never read as "the firewall said yes". With no deny file, behavior is
 unchanged. `--help`/`--version` still work from inside a denied repository; they reach no room.
+
+`path` rules are compared on both the literal and the resolved spelling of each side, so a rule
+written through a symlink (`~/work` → another mount) still fires from the resolved directory and
+vice versa; a rule path that cannot be resolved is matched verbatim rather than dropped. `remote`
+rules read only the invoking repository's own git config — `insteadOf` rewrites, `[include]`
+directives, and remotes defined in `~/.gitconfig` are *not* followed, so name the URL substring as
+it appears in the repo's `.git/config`.
 
 ## Chosen stack (verified live)
 
