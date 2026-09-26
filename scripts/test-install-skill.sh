@@ -20,7 +20,7 @@ name=$(sed -n 's/^name: *//p' <<<"$fm")
 desc=$(sed -n 's/^description: *//p' <<<"$fm")
 [ "$name" = "$(basename "$(dirname "$SRC")")" ] || fail "name '$name' != directory name"
 [[ "$name" =~ ^[a-z0-9-]{1,64}$ ]] || fail "name '$name' not [a-z0-9-]{1,64}"
-[ -n "$desc" ] && [ "${#desc}" -le 1024 ] || fail "description missing or > 1024 chars"
+if [ -z "$desc" ] || [ "${#desc}" -gt 1024 ]; then fail "description missing or > 1024 chars"; fi
 pass "frontmatter portable (name=$name, description ${#desc} chars)"
 
 # --- every CLI subcommand the skill tells an agent to run exists ------------
@@ -61,7 +61,7 @@ pass "symlinked target replaced, its target untouched"
 # --- repo install, and argument errors ---------------------------------------
 mkdir -p "$T/repo"
 HOME="$T/home2" "$INSTALL" --repo "$T/repo" >/dev/null
-[ -f "$T/repo/.agents/skills/safehouse/SKILL.md" ] && [ -f "$T/repo/.claude/skills/safehouse/SKILL.md" ] || fail "--repo install"
+if [ ! -f "$T/repo/.agents/skills/safehouse/SKILL.md" ] || [ ! -f "$T/repo/.claude/skills/safehouse/SKILL.md" ]; then fail "--repo install"; fi
 [ ! -e "$T/home2/.agents" ] || fail "--repo also wrote to HOME"
 if "$INSTALL" --repo "$T/nope" 2>/dev/null; then fail "--repo on a missing dir should fail"; fi
 if "$INSTALL" --bogus 2>/dev/null; then fail "unknown flag should fail"; fi
