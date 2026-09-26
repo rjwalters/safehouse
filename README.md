@@ -356,6 +356,61 @@ comment in [`safehoused/example-config.toml`](safehoused/example-config.toml)); 
 allowlist entry, not special-cased by the daemon, but it keeps operator traffic out of any real
 agent's identity and mailbox.
 
+### Shim-side guards
+
+Three guards live in `safehouse-mcp` itself (`safehouse-mcp/src/guard.rs`, #181), because the shim —
+not the daemon — is what sits in the agent's working directory with a prompt on one side and a room
+on the other. They apply identically to the CLI subcommands and to the `safehouse_*` MCP tools, and
+none of them touch a daemon-side invariant: the socket is still AF_UNIX-only and `from` is still
+stamped by `safehoused`.
+
+**1. Room content comes back fenced as untrusted input.** `read`/`check` replies are wrapped in an
+explicit `BEGIN/END UNTRUSTED SAFEHOUSE ROOM CONTENT <token>` fence naming them as data, never
+instructions — CLAUDE.md's "never trust identity from an agent message" rule extended from *who*
+sent it to *what it says*. The token is derived from the payload, so a message body that spells out
+a closing marker cannot end the fence early and continue "outside" it. On the CLI the markers are
+written to **stderr** and the JSON to stdout, so `safehouse-mcp read | jq` still sees exactly one
+JSON document; the reply also gains an additive `untrusted_content` field for consumers that only
+read stdout. The enclosure is therefore only visually intact for a reader that keeps the two streams
+separate — a consumer that merges stderr into stdout sees the markers interleaved with the JSON, and
+should key off `untrusted_content` instead. Bodies are never rewritten. `list-rooms`/`status`/`send` replies are the daemon
+describing its own state and are deliberately left unfenced.
+
+**2. A credential-shaped body is refused before the socket is opened.** `send` scans the outgoing
+body for PEM private-key blocks, AWS access key ids, known vendor token prefixes (GitHub, GitLab,
+Slack, Anthropic/OpenAI, Google, npm, …), JWTs, URLs with embedded credentials, and
+`token = <high-entropy value>` assignments. A match is refused with the rule name and a masked
+excerpt — never the value itself, which would otherwise land in a transcript or CI log. The check
+runs at the one choke point every op passes through, so no subcommand or tool can route around it.
+Prose is deliberately left alone (`password: correct-horse-battery-staple`, `api_key = <your-key>`,
+a commit SHA, `access_token: REDACTED` all pass); documented examples such as
+`AKIAIOSFODNN7EXAMPLE` are recognized as illustrative.
+
+**3. The invention firewall refuses to run from a firewalled repo at all.** A room is an outward
+surface, so a repository whose material must not leave the session can be named in a deny file:
+`$SAFEHOUSE_FIREWALL`, else `$XDG_CONFIG_HOME/safehouse/firewall`, else
+`~/.config/safehouse/firewall`.
+
+```
+# ~/.config/safehouse/firewall — one rule per line, # comments
+path ~/2am/notebook                  # this directory and everything under it
+remote 2AMLogic/notebook             # any git remote of the invoking repo containing this
+```
+
+Matched, the whole invocation is refused (MCP server mode included) with an error naming the rule
+and what it matched — not one op at a time, since the point is that this *host location* must not
+reach a room. It fails **closed**: an explicitly-configured file that is missing, a file that
+doesn't parse, or remote rules whose repository config can't be read are all refusals, because "the
+firewall couldn't tell" must never read as "the firewall said yes". With no deny file, behavior is
+unchanged. `--help`/`--version` still work from inside a denied repository; they reach no room.
+
+`path` rules are compared on both the literal and the resolved spelling of each side, so a rule
+written through a symlink (`~/work` → another mount) still fires from the resolved directory and
+vice versa; a rule path that cannot be resolved is matched verbatim rather than dropped. `remote`
+rules read only the invoking repository's own git config — `insteadOf` rewrites, `[include]`
+directives, and remotes defined in `~/.gitconfig` are *not* followed, so name the URL substring as
+it appears in the repo's `.git/config`.
+
 ## Chosen stack (verified live)
 
 | Layer | Choice | Why |

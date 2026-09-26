@@ -24,6 +24,20 @@
 //! Running with no arguments (or an argument this dispatcher doesn't
 //! recognize as a subcommand) preserves the original stdio-MCP-server
 //! behavior exactly.
+//!
+//! ## Shim-side guards (#181, see `guard.rs`)
+//!
+//! Three things this binary refuses or annotates on the agent's behalf,
+//! because it — not the daemon — is what sits in the agent's working
+//! directory between a prompt and a room: room content read back through
+//! `read`/`check` is **fenced and labelled untrusted**, a `send` whose body
+//! is credential-shaped is **refused before the socket is opened**, and an
+//! invocation from a repository named in the operator's invention-firewall
+//! deny file is **refused outright**. None of them touch a daemon-side
+//! invariant: the socket is still AF_UNIX-only and `from` is still stamped by
+//! `safehoused`.
+
+mod guard;
 
 use std::{
     env,
@@ -65,6 +79,13 @@ fn main() -> Result<()> {
             _ => {}
         }
     }
+
+    // Invention firewall (#181): refuse the whole invocation — MCP server mode
+    // included — when this working directory or its git remote is on the
+    // operator's deny list. Checked after --help/--version (which reach no
+    // room and leak nothing) and before any op is built, because the refusal
+    // is about *where this ran*, not about which op it was asked for.
+    guard::enforce_firewall()?;
 
     // One-shot operator CLI: `safehouse-mcp <subcommand> [flags...]`. Only
     // dispatches for a recognized subcommand name in first position, so a
@@ -180,6 +201,24 @@ fn print_usage(out: &mut impl Write) {
     let _ = writeln!(
         out,
         "  safehouse-mcp invite --room <id|name|alias> --user <@bot:server>   # onboard a new fleet host (#94)"
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Guards (see README \"Shim-side guards\"):");
+    let _ = writeln!(
+        out,
+        "  read/check output is fenced as UNTRUSTED room content (markers on stderr; stdout stays JSON)"
+    );
+    let _ = writeln!(
+        out,
+        "  send refuses a credential-shaped body before it reaches the daemon"
+    );
+    let _ = writeln!(
+        out,
+        "  invention firewall: refuses to run from a repo listed in $SAFEHOUSE_FIREWALL"
+    );
+    let _ = writeln!(
+        out,
+        "    (default ~/.config/safehouse/firewall; lines: `path <dir>` / `remote <substring>`)"
     );
 }
 
@@ -358,9 +397,34 @@ fn flag_u64(args: &[String], i: &mut usize, flag: &str) -> Result<u64> {
 /// if the daemon reported `ok: false` (so scripts can check `$?` without
 /// parsing JSON). Connection/protocol failures propagate as `Err` so `main`
 /// reports them the same way it reports any other startup error.
+///
+/// For the two ops that return someone else's words (`read`/`check`), the
+/// reply is fenced as untrusted content (#181). The fence markers go to
+/// **stderr** and the JSON to stdout, so `safehouse-mcp read | jq` still sees
+/// exactly one JSON document while an agent — which reads both streams —
+/// gets the framing. The JSON itself gains an additive `untrusted_content`
+/// field for consumers that only ever see stdout.
 fn run_cli(sub: &str, op: Value) -> Result<()> {
+    let op_name = op
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     let reply = daemon_call(op).with_context(|| format!("safehouse-mcp {sub}"))?;
-    println!("{}", serde_json::to_string_pretty(&reply)?);
+
+    let mut stdout = std::io::stdout();
+    if guard::returns_room_content(&op_name) {
+        let text = serde_json::to_string_pretty(&guard::mark_untrusted(&reply))?;
+        let fence = guard::fence_for(&text);
+        eprint!("{}", fence.open);
+        writeln!(stdout, "{text}")?;
+        stdout.flush()?;
+        eprint!("{}", fence.close);
+    } else {
+        writeln!(stdout, "{}", serde_json::to_string_pretty(&reply)?)?;
+        stdout.flush()?;
+    }
+
     if reply.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         Ok(())
     } else {
@@ -410,9 +474,23 @@ fn handle_tool_call(msg: &Value) -> Result<Value> {
         }
         other => bail!("unknown tool: {other}"),
     };
+    let op_name = op
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
     match daemon_call(op) {
         Ok(reply) => Ok(json!({
-            "content": [{"type": "text", "text": serde_json::to_string_pretty(&reply)?}],
+            // #181: `safehouse_read`/`safehouse_check` hand a model other
+            // people's text, so it arrives inside an explicit untrusted-content
+            // fence. Everything else is the daemon describing its own state and
+            // is returned unfenced — fencing every reply would only teach a
+            // reader to skip the fence.
+            "content": [{"type": "text", "text": if guard::returns_room_content(&op_name) {
+                guard::fenced(&serde_json::to_string_pretty(&guard::mark_untrusted(&reply))?)
+            } else {
+                serde_json::to_string_pretty(&reply)?
+            }}],
             "isError": !reply.get("ok").and_then(Value::as_bool).unwrap_or(false),
         })),
         Err(err) => Ok(json!({
@@ -425,7 +503,15 @@ fn handle_tool_call(msg: &Value) -> Result<Value> {
 /// One connection per call: hello, op, first non-push reply, close. Push
 /// lines (inbound room events, no "id") are skipped — polling agents use
 /// safehouse_read instead.
+///
+/// This is also the single choke point every outgoing op passes through, so
+/// the secret-shaped-body refusal (#181) lives here rather than in each
+/// subcommand/tool: a `send` carrying a credential is rejected before the
+/// socket is opened, which is the last moment that value is still only in
+/// this process — past it, it is in the daemon, the homeserver, and every
+/// member's key backup, and nothing sent can be un-sent.
 fn daemon_call(mut op: Value) -> Result<Value> {
+    guard::check_outbound_op(&op)?;
     let socket = env::var("SAFEHOUSED_SOCKET").context("SAFEHOUSED_SOCKET must be set")?;
     let persona = env::var("SAFEHOUSE_PERSONA").context("SAFEHOUSE_PERSONA must be set")?;
     let stream = UnixStream::connect(&socket).with_context(|| {
