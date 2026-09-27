@@ -121,6 +121,14 @@
 #       head; a repeat block escalates to a loom:operator hold and returns
 #       exit 1 with the original refusal. Full rationale:
 #       defaults/docs/merge-pr-exit-code-exceptions.md.
+#   5 = --auto's bounded settle-wait expired before this head's checks
+#       finished (or before the check-runs API became readable) — #8896. CI
+#       simply outlasted LOOM_AUTO_MERGE_TIMEOUT: nothing merged, nothing
+#       failed, no required check went red. Same caller contract as exits 3
+#       and 4 — re-queue for a later pass, never a failure comment. Reachable
+#       on any repo whose suites outrun the default 600s (this one's `Shell
+#       Test Suites (hermetic)` alone takes ~10 minutes), and especially on
+#       the pass right after an exit-4 --redate-stale-checks re-run.
 
 set -euo pipefail
 
@@ -328,6 +336,7 @@ Precedence (highest wins):
 Exit codes:
   0 = merged (or --help)
   1 = failed
+  3 = PR head moved past the SHA this attempt gated on (#5579) · 5 = --auto's bounded settle-wait expired before CI finished (#8896) — neither is a failure; retry later
   4 = stale required checks re-running in place (#8914) or re-dated by a push (#8508) under --redate-stale-checks — not a failure; retry later
 
 Examples:
@@ -611,8 +620,9 @@ fi
 # POST-merge _auto_reconcile_stacked_children at the bottom of the merge flow).
 #
 # The race it closes: when a stacked PARENT PR (branch feature/issue-<N>)
-# squash-merges, item 1's post-merge _auto_reconcile_stacked_children rebases any
-# open CHILD PRs off the now-squashed parent branch onto the default branch. That
+# merges, item 1's post-merge _auto_reconcile_stacked_children rebases any
+# open CHILD PRs off the parent branch onto the default branch (the
+# rebase --onto re-root is merge-method-agnostic). That
 # rebase (reconcile-stack.sh's `git rebase --onto <default> <parent-branch>
 # <child-branch>`) needs <parent-branch> to still resolve as a ref. But Loom's own
 # recommended repo setting — delete_branch_on_merge:true, applied by
@@ -877,22 +887,31 @@ _check_defaults_version_bump_collision
 # from the current head. forge_get_pr's response has no `.comments` (unlike
 # champion-pr-merge.md's own `gh pr view --json comments,...` fetch), so this
 # needs the dedicated forge_get_pr_comments() helper (lib/forge-helpers.sh).
+#
+# The marker extraction and the staleness comparison are
+# `loom-daemon merge-pr hold-state` (Rust, loom-daemon/src/merge_pr/
+# hold_state.rs -- #8191 slice). Only the forge READ stays here, so this
+# script keeps owning the GitHub/Gitea split forge_get_pr_comments encodes.
+# The retired `grep -o '...head=[0-9a-f]*' | tail -1 | sed` pipeline lost this
+# warning silently in two ways the port fixes: `[0-9a-f]*` also matched the
+# documentation line `head=<sha>` (quoted in champion-pr-merge.md and in this
+# file), and `tail -1` then let that empty capture erase a real hold's SHA;
+# and a bare substring anywhere -- prose, backticks, an example -- counted as
+# recorded state, the hazard Champion's own reader answered with `startswith`
+# (#5371). See the module docs for both, and for the fence-stripping
+# divergence deliberately NOT taken.
+#
+# Advisory, so it fails OPEN, unlike every gate around it: a binary that
+# cannot run this check has not found a reason to stop the merge, and turning
+# "could not warn" into a refusal would make an advisory note more fatal than
+# the gates. The fault is still said out loud rather than swallowed.
 _check_champion_hold_state_staleness() {
-  local comments hold_head
+  local comments msg rc=0
   comments="$(forge_get_pr_comments "$REPO_NWO" "$PR_NUMBER" 2>/dev/null || true)"
   [[ -n "$comments" ]] || return 0
-
-  # Mirrors champion-pr-merge.md's own extraction (same marker, same capture
-  # group); "last" match wins in case of multiple hold episodes on one PR.
-  hold_head="$(printf '%s\n' "$comments" \
-    | grep -o 'champion:hold-state head=[0-9a-f]*' \
-    | tail -1 \
-    | sed -n 's/.*head=\([0-9a-f]*\)/\1/p')" || true
-  [[ -n "$hold_head" ]] || return 0
-
-  if [[ "$hold_head" != "$PR_HEAD_SHA" ]]; then
-    warning "champion:hold-state marker recorded head=$hold_head, but PR #$PR_NUMBER's current head is $PR_HEAD_SHA — the hold/approval state may have been recorded against a different tree than the one about to merge. loom:pr's presence means Judge approved SOME head; verify it still covers this one before proceeding."
-  fi
+  msg="$(printf '%s\n' "$comments" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr hold-state --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" 2>/dev/null)" || rc=$?
+  [[ $rc -eq 0 ]] || { warning "The champion:hold-state staleness check (#7419) did not run — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr hold-state' exited $rc (a loom-daemon predating #8191's slice has no such verb). Advisory only: the merge is NOT blocked by this, but nothing verified that Champion's recorded hold head matches the head being merged. Build or install loom-daemon (cargo build --release -p loom-daemon, or re-run the Loom installer) to restore it."; return 0; }
+  [[ "$msg" == "LOOM-HOLD-STATE-CLEAN" || -z "$msg" ]] || warning "$msg"
 }
 
 # The decision itself (loom:pr present? overridden? blocked, and the exact
@@ -918,7 +937,16 @@ _check_loom_pr_label() {
   fi
   if [[ $rc -eq 0 && "$ALLOW_UNAPPROVED" == "true" && "$msg" == "loom:pr guard:"* ]]; then
     warning "$msg"
-    if [[ "$DRY_RUN" != "true" ]]; then
+    # #8896: the audit comment is posted AT MOST ONCE per merge-pr.sh run. On
+    # the --auto path this guard runs twice against the same merge — once at
+    # queue time, once from _revalidate_merge_guards() after the settle-wait —
+    # and an --allow-unapproved run with no loom:pr posted the identical
+    # "Merge Proceeded Without loom:pr" comment both times. The warning above
+    # is unconditional (it is the log record, and the second evaluation is a
+    # real re-check worth logging); only the durable forge comment is deduped.
+    # The flag is set only once the comment actually LANDS, so a failed first
+    # post still leaves the post-wait re-check free to record the override.
+    if [[ "$DRY_RUN" != "true" && "${_LOOM_PR_OVERRIDE_COMMENTED:-false}" != "true" ]]; then
       local override_comment="## Merge Proceeded Without \`loom:pr\` (Override)
 
 PR #$PR_NUMBER was merged via \`merge-pr.sh --allow-unapproved\` while the \`loom:pr\` label was absent — no forge-visible Judge review signal existed for the head being merged.
@@ -930,7 +958,7 @@ The operator running this merge explicitly asserted responsibility for this over
 
 ---
 *Recorded by merge-pr.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)*"
-      forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" 2>/dev/null || warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"
+      if forge_gh_comment_rl_safe "$REPO_NWO" "$PR_NUMBER" "$override_comment" 2>/dev/null; then _LOOM_PR_OVERRIDE_COMMENTED=true; else warning "Could not post loom:pr override audit comment on PR #$PR_NUMBER (merge proceeds anyway; the warning above is still the log record)"; fi
     fi
     return 0
   fi
@@ -1336,7 +1364,9 @@ _check_partial_increment_close_conflict() {
   pr_body="$(echo "$PR_JSON" | jq -r '.body // ""')"
   [[ -n "$pr_body" ]] || return 0
 
-  local partial_refs
+  # bt_warn/bt_rc are declared here, not next to their own assignment below,
+  # purely so that assignment can own a line: see the SC2046 note below.
+  local partial_refs bt_warn bt_rc=0
   partial_refs="$(_partial_increment_refs "$pr_body")"
 
   # Backticked-trailer warning (#5690, ported to Rust #8831 —
@@ -1347,13 +1377,28 @@ _check_partial_increment_close_conflict() {
   # where $partial_refs is EMPTY — a trailer the author backticked, which
   # parses as no declaration at all. Pure text analysis, no forge calls, so
   # the common (non-partial-increment) path still costs zero extra requests.
-  # (The three statements below share one line deliberately — #8831 pays for
-  # the daemon round trip inside the shell-budget ratchet's portable pool, and
+  # (The statements below share one line deliberately — #8831 pays for the
+  # daemon round trip inside the shell-budget ratchet's portable pool, and
   # this keeps that cost at net zero. The unquoted $(...) is intentional: it
   # expands to a single `--dry-run` token or nothing, never anything word
-  # splitting could mis-tokenize.)
+  # splitting could mis-tokenize — hence the SC2046 disable directly below.
+  # That directive covers only the ONE statement that follows it, which is why
+  # bt_warn/bt_rc are declared up with `local partial_refs` instead of leading
+  # this line: as `local bt_warn bt_rc=0; bt_warn="$(...)"` the disable landed
+  # on the declaration and the real finding leaked into CI (#8985). Moving the
+  # declaration rather than adding a line keeps the budget at net zero too.)
+  #
+  # #8897: a BARE assignment (not `local var=$(...)`) with `2>/dev/null` and
+  # `|| bt_rc=$?`, mirroring _mp_refs's own `out="$(...)" || rc=$?` pattern
+  # above — so a daemon that answers `closing-refs` (checked already) but
+  # rejects this newer MODE (unrecognized-subcommand exit) is detected here
+  # instead of only printing _mp_refs's hardcoded closing-ref "Refusing..."
+  # wording to the terminal (wrong mode, wrong PR, wrong version) while the
+  # merge proceeds anyway (the `local var=$(...)` exit-status swallow that made
+  # this call fail-open in practice all along). This call stays advisory-only:
+  # a mode failure is reported as a skipped check, never as a refusal.
   # shellcheck disable=SC2046
-  local bt_warn="$(printf '%s\n' "$pr_body" | _mp_refs backticks-partial-increment-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run))"; [[ -z "$bt_warn" ]] || warning "$bt_warn"; [[ -n "$partial_refs" ]] || return 0
+  bt_warn="$(printf '%s\n' "$pr_body" | _mp_refs backticks-partial-increment-warnings --pr "$PR_NUMBER" $([[ "${DRY_RUN:-false}" == "true" ]] && echo --dry-run) 2>/dev/null)" || bt_rc=$?; if [[ $bt_rc -eq 0 ]]; then [[ -z "$bt_warn" ]] || warning "$bt_warn"; else warning "Skipped backticked-trailer advisory warning check: loom-daemon rejected 'merge-pr-refs backticks-partial-increment-warnings' (exit $bt_rc) -- most likely a daemon predating this mode. Not refusing; this check is advisory-only."; fi; [[ -n "$partial_refs" ]] || return 0
 
   # Closing references GitHub will honor on merge, from three unioned signals:
   #   1. the body's own closing keywords (quota-free regex);
@@ -1974,6 +2019,8 @@ _recheck_mergeable_before_refusal() {
 #   - calls error() (exit 1) → a required status check failed, or the wait timed
 #                  out. A normal recoverable failure Champion's cron retries.
 # Requires LOOM_AUTO_MERGE_POLL_INTERVAL / LOOM_AUTO_MERGE_TIMEOUT set.
+# LOOM_ZERO_CHECKS_SETTLE_POLLS / LOOM_ZERO_CHECKS_SETTLE_INTERVAL (#9091) are
+# read and validated by `loom-daemon merge-pr zero-checks-settle`, not here.
 _wait_for_checks_then_sync_merge() {
   local head_sha base_ref
   # Poll the SHA this run will actually MERGE, not the one the initial
@@ -1993,7 +2040,11 @@ _wait_for_checks_then_sync_merge() {
     return 0
   fi
 
-  local deadline observed_checks
+  # zero_row_* / _zcs_* are #9091's zero-row settle state; see that branch at
+  # the bottom of the loop. Declared here (rather than beside it) so the
+  # zero-row poll count and the cached required-context token survive across
+  # loop iterations for the lifetime of this call.
+  local deadline observed_checks zero_row_polls=0 zero_row_required=unknown _zcs _zcs_action _zcs_sleep _zcs_msg
   deadline=$(( $(date +%s) + LOOM_AUTO_MERGE_TIMEOUT ))
   # #6169: whether we have ever seen a nonzero check-runs total_count for this
   # head SHA. A check-runs rollup with zero rows is ambiguous on its own — it
@@ -2050,8 +2101,22 @@ _wait_for_checks_then_sync_merge() {
         info "PR #$PR_NUMBER: check-runs API unavailable for this repo (no checks configured); proceeding to synchronous merge"
         return 0
       fi
+      # A SHORT read (#8895) is not a fetch failure: the rollup arrived, it was
+      # just a subset of the commit's check-runs (the forge's own total_count
+      # said so). forge_get_check_runs withholds it rather than let a subset
+      # look like settlement, and this loop's existing nonzero handling —
+      # re-poll, then hard-fail at the deadline — is exactly the fail-closed
+      # outcome wanted. Name it explicitly so the narration is not the
+      # misleading "could not fetch" (the helper's own stderr detail is
+      # suppressed at the callsite above). Guarded one-liner rather than an
+      # `if` block: `set -e` exempts AND-lists (see the note above
+      # _wait_for_checks_then_sync_merge's reads), and this is the same idiom
+      # the two `fetch_rc`/`observed_checks` assignments in this loop use.
+      [[ "$fetch_rc" -eq "${FORGE_CHECK_RUNS_RC_TRUNCATED:-45}" ]] && warning "PR #$PR_NUMBER: check-runs read was TRUNCATED (fewer rows than the forge's own total_count); refusing to classify a partial set, continuing to poll"
       if [[ "$(date +%s)" -ge "$deadline" ]]; then
-        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER. Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."
+        # #8896: exit 5, not error()'s exit 1 — an unreadable check-runs API is
+        # a forge condition this run waited out, not a merge failure.
+        warning "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for check-runs to become fetchable for PR #$PR_NUMBER — exiting 5 (not merged, not a failure: re-queue). Re-run once the forge API is healthy, or raise LOOM_AUTO_MERGE_TIMEOUT."; exit 5
       fi
       warning "Failed to fetch check-runs for PR #$PR_NUMBER (rc=$fetch_rc); treating as still-pending and continuing to poll"
       sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
@@ -2079,7 +2144,7 @@ _wait_for_checks_then_sync_merge() {
       local required lookup_rc=0
       required="$(forge_get_required_status_check_contexts "$REPO_NWO" "$base_ref" "$GH")" || lookup_rc=$?
       if [[ "$lookup_rc" -ne 0 ]]; then
-        error "Failed to resolve required status checks for $base_ref (rc=$lookup_rc); refusing to merge PR #$PR_NUMBER with failing check(s) while auto-merge is disabled"
+        error "Failed to resolve required status checks for $base_ref (rc=$lookup_rc); refusing to merge PR #$PR_NUMBER with failing check(s) that cannot be classified as required or informational (fails closed)"
       fi
       local overlap
       overlap="$(comm -12 \
@@ -2099,11 +2164,16 @@ _wait_for_checks_then_sync_merge() {
     fi
 
     if [[ -n "$pending" ]]; then
-      if [[ "$(date +%s)" -ge "$deadline" ]]; then
-        local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
-        error "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${n} pending check(s) on PR #$PR_NUMBER to complete. Re-run once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."
-      fi
+      # Hoisted out of both branches below (it was computed identically in
+      # each) so the #8896 comment can land without growing the file.
       local n; n="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+      if [[ "$(date +%s)" -ge "$deadline" ]]; then
+        # #8896: exit 5, not error()'s exit 1. CI outlasting the bounded wait is
+        # the re-queue signal exits 3/4 already carry — nothing merged, nothing
+        # failed, no required check went red — so it must not be
+        # indistinguishable from a genuine merge failure to Champion.
+        warning "Timed out after ${LOOM_AUTO_MERGE_TIMEOUT}s waiting for ${n} pending check(s) on PR #$PR_NUMBER to complete — exiting 5 (not merged, not a failure: re-queue). Re-run once CI settles, or raise LOOM_AUTO_MERGE_TIMEOUT."; exit 5
+      fi
       info "PR #$PR_NUMBER: ${n} check(s) still running; waiting ${LOOM_AUTO_MERGE_POLL_INTERVAL}s for CI (timeout ${LOOM_AUTO_MERGE_TIMEOUT}s)..."
       sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
       continue
@@ -2111,17 +2181,32 @@ _wait_for_checks_then_sync_merge() {
 
     # Nothing failing, nothing pending -- but a zero-row rollup we have never
     # seen non-empty is ambiguous (#6169: could be a transient forge read, not
-    # genuine settlement). Re-poll instead of trusting it, bounded by the same
-    # deadline as the pending-wait above; only fall through once the wait is
-    # fully exhausted (at which point continuing to wait cannot help either).
+    # genuine settlement), so it is never trusted on a single read.
+    #
+    # The decision — settle now, keep waiting (and for how long), or report the
+    # whole wait spent — is `loom-daemon merge-pr zero-checks-settle` (Rust,
+    # loom-daemon/src/merge_pr/zero_checks.rs, #9091). It holds #6169's rule,
+    # #9091's narrowing of it (bounded only when the base branch requires NO
+    # status-check contexts, so nothing that can gate this merge may still be
+    # registering), the LOOM_ZERO_CHECKS_SETTLE_* knobs and their floors, and
+    # the two-source required-context lookup it shares with the #8248 freshness
+    # guard. $zero_row_required is that lookup's answer, echoed back on field 3
+    # of every decision line and replayed on the next poll, which is what makes
+    # it happen ONCE per wait rather than once per poll.
+    #
+    # No requires-daemon floor -- same choice `loom-pr-guard`/`redate-checks`
+    # make above. Output that does not begin with a LOOM-ZERO-CHECKS-* sentinel
+    # (missing binary, older binary, clap usage error, silence) falls back to
+    # #6169's full deadline-bounded wait: the status quo ante this narrows, so
+    # a fault can only cost time, never skip a gate. It can NOT degrade into
+    # settling on one empty read, which is #6169 itself.
     if [[ "$total_count" -eq 0 ]] && [[ "$observed_checks" != "true" ]]; then
-      if [[ "$(date +%s)" -ge "$deadline" ]]; then
-        warning "PR #$PR_NUMBER: check-runs rollup remained empty (zero rows) for the entire ${LOOM_AUTO_MERGE_TIMEOUT}s wait; proceeding on the assumption this repo genuinely has no checks configured for this commit"
-      else
-        info "PR #$PR_NUMBER: check-runs rollup is empty (zero rows) -- ambiguous between 'no checks configured' and a transient forge read; re-polling before trusting it"
-        sleep "$LOOM_AUTO_MERGE_POLL_INTERVAL"
-        continue
-      fi
+      zero_row_polls=$(( zero_row_polls + 1 ))
+      _zcs="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr zero-checks-settle --pr "$PR_NUMBER" --repo "$REPO_NWO" --base-ref "$base_ref" --polls "$zero_row_polls" --required-state "$zero_row_required" --poll-interval "$LOOM_AUTO_MERGE_POLL_INTERVAL" --timeout "$LOOM_AUTO_MERGE_TIMEOUT" --now "$(date +%s)" --deadline "$deadline" 2>/dev/null | head -1)" || true
+      [[ "$_zcs" == LOOM-ZERO-CHECKS-* ]] || _zcs="LOOM-ZERO-CHECKS-$([[ "$(date +%s)" -ge "$deadline" ]] && echo TIMEOUT || echo WAIT) $LOOM_AUTO_MERGE_POLL_INTERVAL lookup-failed PR #$PR_NUMBER: check-runs rollup is empty (zero rows) and 'loom-daemon merge-pr zero-checks-settle' returned no verdict (missing or older binary), so #9091's bounded settle is unavailable; falling back to #6169's full ${LOOM_AUTO_MERGE_TIMEOUT}s wait before trusting it"
+      read -r _zcs_action _zcs_sleep zero_row_required _zcs_msg <<<"$_zcs"
+      if [[ "$_zcs_action" == "LOOM-ZERO-CHECKS-WAIT" ]]; then info "$_zcs_msg"; sleep "$_zcs_sleep"; continue; fi
+      [[ "$_zcs_action" == "LOOM-ZERO-CHECKS-TIMEOUT" ]] && warning "$_zcs_msg" || info "$_zcs_msg"
     fi
 
     # Nothing failing (or only informational), nothing pending → effectively
@@ -2207,7 +2292,14 @@ _revalidate_merge_guards() {
   # the check results this run validated describe a tree that is no longer the
   # head, so this is the #5579 "re-queue, not a failure" signal (exit 3), not a
   # merge we should complete against the new tree.
-  fresh_sha="$(echo "$fresh" | jq -r '.head.sha // empty')"
+  # #8896: an unusable re-read (the `|| echo '{}'` fallback above, or any
+  # payload with no head SHA in it) must SAY that. It used to fall through to
+  # the loom:pr guard, which reported the genuine-absence wording ("does not
+  # carry the `loom:pr` label") — failing closed, correctly, but sending the
+  # operator to re-review a PR whose approval was never actually read. Nothing
+  # about the verdict changes here: an unreadable response is evidence neither
+  # that loom:pr is present nor that it is absent, so the merge still refuses.
+  fresh_sha="$(echo "$fresh" | jq -r '.head.sha // empty')"; [[ -n "$fresh_sha" ]] || error "Merge blocked: could not re-read PR #$PR_NUMBER after --auto's settle-wait — the uncached re-read returned no usable payload (no head SHA), so neither the head nor the label set could be re-validated against current state. This is a forge read failure, NOT a missing \`loom:pr\` label: refusing to merge rather than treating an unreadable response as a verdict. Re-run once the forge API is healthy."
   if [[ -n "$fresh_sha" && -n "$MERGE_PRECONDITION_SHA" && "$fresh_sha" != "$MERGE_PRECONDITION_SHA" ]]; then
     error_head_moved "PR #$PR_NUMBER: head moved while --auto waited for this head's checks to settle (#8410)" \
       "$MERGE_PRECONDITION_SHA" "$fresh_sha"
@@ -2585,132 +2677,49 @@ _find_worktree_by_branch() {
 # `branch_landed`'s fail-closed `unknown` is false there, so both callers keep
 # their conservative behaviour when nothing could prove the branch landed.
 
-# Delete the matching local branch (#4100).
+# Delete the matching local branch (#4100/#5015/#7812).
 #
 # _maybe_delete_local_branch <branch> [expected_head_sha]
 #
-# The `-d` → `-D` upgrade is gated on the shared `branch_landed` primitive
-# (#7812): `git branch -D` (force) is safe exactly when the default branch
-# already contains everything this branch has, which stays true under a
-# squash merge (where `git branch --merged` is always false) and under a
-# rebase merge (where the tip SHA match this used to rely on is always false).
+# A thin call into `loom-daemon merge-pr delete-branch` (#8191), which shares
+# the exact squash-aware `-d`/`-D` rule and #5015 primary-checkout
+# auto-cleanup `worktree.sh remove` already uses
+# (`worktree_cli::branch_delete`, #8195 slice 3) — one implementation instead
+# of two `awk`-and-`eval` copies. `expected_head_sha` is the merged PR's
+# `head.sha` (already parsed into $PR_HEAD_SHA); a tip matching it is landed
+# with no forge round-trip, per the shared `branch_landed` primitive (#7812).
+# `--no-cleanup-primary` (CLEANUP_PRIMARY_CHECKOUT=false) opts out of #5015.
 #
-# `expected_head_sha` is optional — the merged PR's `head.sha` (already parsed
-# into $PR_HEAD_SHA at the top of this script). It is passed through purely as
-# a hint: a tip that matches it is landed with no forge round-trip at all.
-# When it is absent, or does not match, `branch_landed` falls through to the
-# forge probe and the offline tree-equality check. Anything short of a
-# `landed` verdict — including the fail-closed `unknown` — keeps the original
-# `git branch -d` behaviour: Git's own "not fully merged" safety net, which
-# keeps the branch and reports it rather than force-deleting.
+# The daemon emits one `LEVEL<TAB>message` line per decision on stdout, which
+# is replayed here through this script's own info/warning/success — the
+# operator-visible text and coloring are unchanged from before the port.
 #
-# Primary-checkout auto-cleanup (#5015): when the branch turns out to be
-# checked out in the repo's PRIMARY working copy rather than a removable
-# worktree, and the landed safety check above already held, and
-# the primary checkout's working tree is clean with no stash entries (see
-# the auto-cleanup block below for the exact gate), this checks out the
-# default branch there and force-deletes the now-unreferenced branch
-# instead of just printing manual instructions. Opt out with
-# --no-cleanup-primary (CLEANUP_PRIMARY_CHECKOUT=false) if silently moving
-# HEAD in the operator's primary checkout is unwanted.
-#
-# Never fails the cleanup pipeline — always returns 0, warns on errors.
+# Never fails the cleanup pipeline — always returns 0; the merge already
+# happened by the time this runs. A daemon that is missing, stale (exit 2) or
+# non-executable fails SAFE: it never ran, so nothing was deleted, and that is
+# a warning, not a blocker. A pinned $LOOM_DAEMON_BIN is used as-is, never
+# swapped for another binary off PATH. Whatever the daemon DID print is
+# replayed before a non-zero exit is reported, so a crash after a delete cannot
+# hide the delete. Only stdout is parsed — stderr (clap errors, logs) passes
+# through untouched, never replayed as a bogus INFO line. `${a[@]+…}` is bash
+# 3.2's `set -u` empty-array guard; cleanup-branches.sh evals this body without
+# `_mp_daemon_roll_hint`, hence the `declare -F` probe.
 _maybe_delete_local_branch() {
   local branch="$1" expected_head_sha="${2:-}"
-  if [[ -z "$branch" ]]; then
-    return 0
-  fi
-  if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
-    info "Local branch '$branch' does not exist — skipping branch delete"
-    return 0
-  fi
-  # Never delete the repo's default branch (cheap belt-and-suspenders; the
-  # merged PR's head branch should never legitimately BE the default branch,
-  # but a misdetected $PR_BRANCH must not take this out).
-  if [[ -n "$DEFAULT_BRANCH_NAME" && "$branch" == "$DEFAULT_BRANCH_NAME" ]] || \
-     [[ "$branch" == "main" ]] || [[ "$branch" == "master" ]]; then
-    warning "Refusing to delete local branch '$branch' — it is the repository's default branch"
-    return 0
-  fi
-
-  # #7812: ask the shared primitive, as a plain statement so the
-  # BRANCH_LANDED_* globals survive (a `$(...)` subshell would discard them).
-  # Fail closed: only a `landed` verdict force-deletes. `not-landed` and
-  # `unknown` both keep `git branch -d`, which still deletes a branch git
-  # itself can prove merged and refuses (loudly) otherwise.
-  branch_landed "$branch" "${DEFAULT_BRANCH_NAME:-}" "$expected_head_sha" >/dev/null
-  local delete_flag="-d" safety_note=""
-  if [[ "$BRANCH_LANDED_VERDICT" == "landed" ]]; then
-    delete_flag="-D"
-    safety_note=" (branch has landed: $BRANCH_LANDED_EVIDENCE — safe force-delete)"
-  elif [[ "$BRANCH_LANDED_FORGE_STATUS" == "unavailable" ]]; then
-    info "Could not query the forge for a merged PR on '$branch' — fell back to the offline tree-equality check (verdict: $BRANCH_LANDED_VERDICT) and kept the conservative 'git branch -d'"
-  elif [[ "$BRANCH_LANDED_VERDICT" == "unknown" ]]; then
-    info "Could not determine whether '$branch' has landed — keeping the conservative 'git branch -d'"
-  fi
-
-  local delete_output
-  if delete_output="$(git -C "$REPO_ROOT" branch "$delete_flag" "$branch" 2>&1)"; then
-    success "Local branch '$branch' deleted$safety_note"
-    return 0
-  fi
-
-  # Distinguish "checked out somewhere" (current HEAD or another worktree)
-  # from a genuine "not fully merged" refusal — the former gets a specific
-  # message instead of the generic unmerged-commits warning (#4100 AC #4).
-  if echo "$delete_output" | grep -qiE "checked out at|is currently checked out|used by worktree"; then
-    # Further distinguish WHERE it's checked out (#4171): if it's the PRIMARY
-    # (main) working copy, `git worktree remove`/`--worktree-path` can never
-    # apply — there is no worktree to remove, only a branch to switch away
-    # from. Give the exact two-step remediation instead of the generic
-    # message, which otherwise routes the operator toward worktree cleanup
-    # advice that doesn't exist for the primary checkout. A genuine OTHER
-    # linked worktree keeps the original generic message unchanged.
-    local checkout_loc=""
-    checkout_loc="$(_find_worktree_by_branch "$branch")"
-    if [[ -n "$checkout_loc" ]] && _is_primary_worktree_path "$checkout_loc"; then
-      local default_label="${DEFAULT_BRANCH_NAME:-<default-branch>}"
-
-      # Auto-cleanup (#5015): the two-step remediation below (checkout the
-      # default branch, then force-delete) is exactly what this script
-      # already knows is safe to do itself whenever ALL of the following
-      # hold — do it instead of just printing instructions:
-      #   1. Not opted out via --no-cleanup-primary / CLEANUP_PRIMARY_CHECKOUT.
-      #   2. The default branch actually resolved (never silently guess one).
-      #   3. delete_flag == "-D" — the `branch_landed` safety check above
-      #      already returned `landed`, so the default branch already has
-      #      every change on $branch; nothing is lost by deleting it.
-      #   4. The primary checkout's working tree is clean (no uncommitted
-      #      changes, no staged changes) AND has no stash entries — checked
-      #      HERE, immediately before the mutating `checkout`, not cached
-      #      earlier, to avoid a TOCTOU gap against a concurrent process
-      #      working in the same checkout.
-      # A dirty tree, a present stash, an opt-out, or a tip mismatch all fall
-      # straight through to the manual two-step instructions unchanged.
-      if [[ "${CLEANUP_PRIMARY_CHECKOUT:-true}" == "true" ]] && \
-         [[ -n "$DEFAULT_BRANCH_NAME" ]] && \
-         [[ "$delete_flag" == "-D" ]] && \
-         [[ -z "$(git -C "$checkout_loc" status --porcelain 2>/dev/null)" ]] && \
-         [[ -z "$(git -C "$checkout_loc" stash list 2>/dev/null)" ]]; then
-        if git -C "$checkout_loc" checkout -q "$DEFAULT_BRANCH_NAME" 2>/dev/null && \
-           git -C "$checkout_loc" branch -D "$branch" >/dev/null 2>&1; then
-          success "Local branch '$branch' deleted$safety_note"
-          info "Primary checkout ($checkout_loc) was on '$branch' — automatically switched to '$DEFAULT_BRANCH_NAME' to free it up for deletion"
-          return 0
-        fi
-        warning "Attempted to auto-clean up '$branch' in the primary checkout ($checkout_loc) but the checkout or delete failed — falling back to manual instructions"
-      fi
-
-      warning "Could not delete local branch '$branch' — it is checked out in the primary repository checkout ($checkout_loc)."
-      warning "To clean it up: git -C '$checkout_loc' checkout $default_label && git -C '$checkout_loc' branch -D $branch"
-    else
-      warning "Could not delete local branch '$branch' — it is checked out (current HEAD or another worktree)"
-    fi
-  elif [[ "$delete_flag" == "-d" ]]; then
-    warning "Could not delete local branch '$branch' (may have unpushed commits — use 'git branch -D $branch' if intentional)"
-  else
-    warning "Could not delete local branch '$branch': $delete_output"
-  fi
+  [[ -n "$branch" ]] || return 0
+  local flags=() out rc=0 level text
+  [[ -z "${DEFAULT_BRANCH_NAME:-}" ]] || flags+=(--default-branch "$DEFAULT_BRANCH_NAME")
+  [[ "${CLEANUP_PRIMARY_CHECKOUT:-true}" == "true" ]] || flags+=(--no-cleanup-primary)
+  out="$("${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr delete-branch --repo-root "$REPO_ROOT" --branch "$branch" --expected-head-sha "$expected_head_sha" ${flags[@]+"${flags[@]}"})" || rc=$?
+  while IFS=$'\t' read -r level text; do
+    [[ -n "$level" ]] || continue
+    case "$level" in
+      SUCCESS) success "$text" ;;
+      WARNING) warning "$text" ;;
+      *) info "$text" ;;
+    esac
+  done <<< "$out"
+  [[ $rc -eq 0 ]] || warning "The local-branch cleanup guard for '$branch' did not complete — '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr delete-branch' exited $rc. Advisory only — the merge already happened; any branch action it did take is reported above, otherwise '$branch' is left as-is. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
   return 0
 }
 
@@ -2821,41 +2830,48 @@ _remove_loom_worktree() {
   #     rate (observation only, behavior unchanged on collision by design). This
   #     guard is the behavioral mitigation for the data-loss instance #4146 is
   #     meant to eventually quantify.
-  local dirty
-  dirty="$(git -C "$worktree_path" status --porcelain 2>/dev/null \
-    | grep -vE '[ /]\.loom-managed$|[ /]\.loom-in-use$|[ /]\.loom-checkpoint$|[ /]\.no-changes-needed$|[ /]\.snapshots/' \
-    | grep -vE '^[[:space:]]*$' || true)"
-  if [[ -n "$dirty" ]]; then
-    local live_branch
-    live_branch="$(_worktree_branch_for "$worktree_path" 2>/dev/null || true)"
-    # Classify the dirty set so the "cross-host duplicate dispatch" hypothesis
-    # is only offered when the dirt plausibly represents real, in-flight work.
-    # Trivial/generated-artifact churn (e.g. a lockfile regenerated by a
-    # routine install) is common and does NOT imply a live sibling builder —
-    # asserting the hypothesis there sends the operator hunting for a phantom
-    # concurrent session (#5658). Any tracked source change or untracked
-    # non-artifact file present ⇒ still offer the hypothesis, even alongside
-    # trivial dirt (mixed case: real work always wins).
-    local dirty_has_real_work=false dirty_line dirty_path
-    while IFS= read -r dirty_line; do
-      [[ -z "$dirty_line" ]] && continue
-      dirty_path="${dirty_line:3}"
-      # Rename entries look like "old -> new" — classify by the new path.
-      [[ "$dirty_path" == *" -> "* ]] && dirty_path="${dirty_path##* -> }"
-      case "$dirty_path" in
-        *.lock | *-lock.json) ;; # trivial/generated-artifact pattern
-        *) dirty_has_real_work=true ;;
-      esac
-    done <<<"$dirty"
-    warning "Refusing to remove worktree at $worktree_path — it has uncommitted changes${live_branch:+ on branch '$live_branch'} (data-loss guard, #5031):"
-    warning "$dirty"
-    if [[ "$dirty_has_real_work" == "true" ]]; then
-      warning "A different, still-live builder session likely shares this branch name (cross-host duplicate dispatch). Leaving it in place so that work is not lost."
+  #
+  # The three decisions — which porcelain lines are user work rather than Loom's
+  # own runtime markers, whether the remainder plausibly IS in-flight work
+  # (#5658), and the refusal text — are `loom-daemon merge-pr dirty-guard`
+  # (Rust, loom-daemon/src/merge_pr/dirty_guard.rs — #8191 slice). Only the
+  # porcelain READ stays here, on purpose: `git status` FAILING has always meant
+  # "no dirt, proceed" on this path (the #5177 orphaned-directory case cleanup
+  # exists for), and the `|| true` that encodes that must not migrate into an
+  # exit code the guard would read as a fault. The port retires the THIRD copy
+  # of Loom's marker list (#8195 slice 3 deleted worktree.sh's twin after
+  # #8279) and closes two holes in the retired `grep -vE`: a rename INTO a
+  # marker name was filtered as bookkeeping though it is a tracked-file change,
+  # and a marker under a git-quoted path was counted as user work.
+  #
+  # The refusal arrives as `LEVEL<TAB>message` lines replayed through this
+  # script's own warning/echo — the shape `merge-pr delete-branch` established —
+  # so the operator-visible text is unchanged. `PLAIN` is the uncolored `echo`
+  # the remediation command is pasted from. $live_branch is now resolved on
+  # every removal rather than only the dirty path (one extra local
+  # `git worktree list`), because the wrapper cannot know which it needs until
+  # the guard has answered.
+  #
+  # Unlike every other step in this function this one fails CLOSED: it gates
+  # `git worktree remove --force`, and destroyed uncommitted work is
+  # unrecoverable where a skipped removal is not (loom-clean, the daemon's
+  # reaper, or the next merge all retry it).
+  local dirty dirty_out dirty_rc=0 live_branch level text
+  dirty="$(git -C "$worktree_path" status --porcelain 2>/dev/null || true)"
+  live_branch="$(_worktree_branch_for "$worktree_path" 2>/dev/null || true)"
+  dirty_out="$(printf '%s\n' "$dirty" | "${LOOM_DAEMON_BIN:-loom-daemon}" merge-pr dirty-guard --worktree-path "$worktree_path" --repo-root "$REPO_ROOT" --branch "$live_branch")" || dirty_rc=$?
+  if [[ $dirty_rc -ne 0 ]] || [[ "$dirty_out" != "LOOM-DIRTY-GUARD-CLEAN" ]]; then
+    if [[ $dirty_rc -eq 1 ]] && [[ "$dirty_out" == *$'\t'* ]]; then
+      while IFS=$'\t' read -r level text; do
+        [[ -n "$level" ]] || continue
+        case "$level" in
+          PLAIN) echo "$text" ;;
+          *) warning "$text" ;;
+        esac
+      done <<<"$dirty_out"
     else
-      warning "The dirt above looks like environment/artifact churn (e.g. a regenerated lockfile), not concurrent work — verify and remove manually."
+      warning "Refusing to remove worktree at $worktree_path — its uncommitted-work data-loss guard, #5031, could not run: '${LOOM_DAEMON_BIN:-loom-daemon} merge-pr dirty-guard' exited $dirty_rc without the LOOM-DIRTY-GUARD-CLEAN signal (a loom-daemon predating this slice has no such verb). Only a positive clean signal authorizes the force-remove: a caller cannot tell 'nothing to save' from 'never looked', and this is the one cleanup step whose wrong answer is unrecoverable. $(! declare -F _mp_daemon_roll_hint >/dev/null || _mp_daemon_roll_hint merge-pr "$(command -v "${LOOM_DAEMON_BIN:-loom-daemon}" 2>/dev/null || true)")"
     fi
-    warning "Remove it manually once those changes are saved/committed:"
-    echo "  git -C \"$REPO_ROOT\" worktree remove \"$worktree_path\" --force"
     return 0
   fi
   # #7239: resolve the worktree's cargo target dir BEFORE removing it —
