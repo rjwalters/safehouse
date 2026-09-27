@@ -373,8 +373,12 @@ written to **stderr** and the JSON to stdout, so `safehouse-mcp read | jq` still
 JSON document; the reply also gains an additive `untrusted_content` field for consumers that only
 read stdout. The enclosure is therefore only visually intact for a reader that keeps the two streams
 separate — a consumer that merges stderr into stdout sees the markers interleaved with the JSON, and
-should key off `untrusted_content` instead. Bodies are never rewritten. `list-rooms`/`status`/`send` replies are the daemon
-describing its own state and are deliberately left unfenced.
+should key off `untrusted_content` instead. Bodies are never rewritten. `status`/`send` replies are the daemon
+describing its own state and are deliberately left unfenced. `list-rooms` is unfenced too, except
+that each room's name is the remote-authored `m.room.name` (#185): the shim replaces `name` with
+`name_untrusted` (the raw value, for matching) and `name_display` (flattened to one line with
+control/bidi characters removed and capped at 64 characters), and adds a scoped `untrusted_fields`
+notice — marking the one untrusted field rather than fencing four trustworthy ones.
 
 **2. A credential-shaped body is refused before the socket is opened.** `send` scans the outgoing
 body for PEM private-key blocks, AWS access key ids, known vendor token prefixes (GitHub, GitLab,
