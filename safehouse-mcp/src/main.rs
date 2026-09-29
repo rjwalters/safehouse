@@ -637,7 +637,7 @@ fn tool_definitions() -> Value {
                 "type": "object",
                 "properties": {
                     "peek": {"type": "boolean", "description": "If true, don't advance the read cursor — a repeated peek returns the same unread set (default false)"},
-                    "limit": {"type": "integer", "description": "Max envelopes to return (oldest unread first), capped at 1000; unset applies a default cap of 200 rather than returning everything unread — check `more_available`/`remaining` in the reply to see if more is waiting"}
+                    "limit": {"type": "integer", "description": "Max envelopes to return (oldest unread first), capped at 1000; unset applies a default cap of 200 rather than returning everything unread; the daemon also caps the reply at ~64 KiB, so large envelopes may come back in fewer rows — check `more_available`/`remaining` in the reply to see if more is waiting"}
                 }
             }
         }

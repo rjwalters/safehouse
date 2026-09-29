@@ -87,6 +87,45 @@ const MAX_UNCONSUMED_PER_PERSONA: i64 = 5_000;
 /// the truncation only by counting.
 pub(crate) const DEFAULT_CHECK_LIMIT: u32 = 200;
 
+/// Size budget, in bytes, on the envelopes a single [`Mailbox::check`] call
+/// returns (#190) — applied *in addition to* the row cap
+/// ([`DEFAULT_CHECK_LIMIT`] or an explicit `limit`), whichever bites first.
+///
+/// The row cap is only a proxy for what actually breaks a bounded MCP
+/// client: the reply's *size*. #188's repro measured ~619 chars/envelope in a
+/// busy room, so 200 of those is ~124K chars (~31K tokens at ~4 chars/token)
+/// — over Claude Code's default 25K-token `MAX_MCP_OUTPUT_TOKENS`. 64 KiB
+/// keeps a reply under ~22K tokens even at a pessimistic ~3 chars/token for
+/// JSON-heavy text, leaving headroom for the reply's own framing and for
+/// clients with somewhat smaller budgets. Each entry's cost is estimated by
+/// [`entry_cost`] (stored envelope JSON + routing fields + a fixed allowance
+/// for keys/pretty-printing), so this is an approximate bound on the
+/// rendered reply, not an exact byte count.
+///
+/// The budget never drops mail: at least one envelope is always returned (a
+/// single envelope larger than the budget comes back alone rather than
+/// wedging the mailbox), the cursor only advances past what was returned, and
+/// a budget-triggered truncation is reported through the same
+/// `more_available`/`remaining` signal as a row-cap truncation.
+pub(crate) const DEFAULT_CHECK_BYTE_BUDGET: usize = 64 * 1024;
+
+/// Fixed per-entry allowance for what [`entry_cost`] can't see from the raw
+/// stored strings: the `room_id`/`event_id`/`sender`/`envelope` keys, JSON
+/// punctuation, and the indentation the MCP shim adds when it pretty-prints
+/// the reply (`serde_json::to_string_pretty`) — each envelope field lands on
+/// its own indented line there. Measured at ~154 bytes for a typical
+/// five-field envelope (`v`/`from`/`to`/`type`/`body`); 192 leaves room for
+/// the optional `task_id`/`wake` fields while keeping a default-cap reply of
+/// 200 short envelopes (~50 KB rendered) under the budget, so #188's row cap
+/// remains the binding bound for ordinary chat traffic.
+const ENTRY_OVERHEAD_BYTES: usize = 192;
+
+/// Estimated contribution of one mailbox row to a `check` reply, for
+/// [`DEFAULT_CHECK_BYTE_BUDGET`] accounting.
+fn entry_cost(room_id: &str, event_id: &str, sender: &str, envelope_json: &str) -> usize {
+    room_id.len() + event_id.len() + sender.len() + envelope_json.len() + ENTRY_OVERHEAD_BYTES
+}
+
 /// True when `body` parses as a JSON object carrying [`EPHEMERAL_BODY_MARKER`]
 /// as a top-level key. Anything that isn't valid JSON, or is JSON but not an
 /// object, or is an object without the marker, is never ephemeral — plain
@@ -172,9 +211,10 @@ pub struct MailboxEntry {
 pub struct MailboxCheckResult {
     pub entries: Vec<MailboxEntry>,
     /// True when at least one unread row exists beyond what `entries`
-    /// contains — i.e. the cap (default or explicit `limit`) was the reason
-    /// fewer than the full unread backlog came back, not that there was
-    /// nothing more to return.
+    /// contains — i.e. the row cap (default or explicit `limit`) or the
+    /// size budget ([`DEFAULT_CHECK_BYTE_BUDGET`], #190) was the reason fewer
+    /// than the full unread backlog came back, not that there was nothing
+    /// more to return.
     pub more_available: bool,
     /// Count of unread rows beyond `entries` — `0` iff `more_available` is
     /// `false`. Lets a caller decide how much bigger a follow-up `limit`
@@ -290,11 +330,33 @@ impl Mailbox {
     /// [`MailboxCheckResult`] reports whether a cap (default or explicit)
     /// left more unread rows behind, so the caller can tell a genuinely empty
     /// mailbox apart from a truncated read.
+    ///
+    /// Independently of the row cap, the reply is also bounded by
+    /// [`DEFAULT_CHECK_BYTE_BUDGET`] (#190), so a backlog of large envelopes
+    /// may come back in fewer rows than `limit`; see [`Self::check_bounded`].
     pub async fn check(
         &self,
         persona: &str,
         advance: bool,
         limit: Option<u32>,
+    ) -> Result<MailboxCheckResult> {
+        self.check_bounded(persona, advance, limit, DEFAULT_CHECK_BYTE_BUDGET)
+            .await
+    }
+
+    /// [`Self::check`] with an explicit size budget (`max_bytes`, measured by
+    /// [`entry_cost`]). Rows are taken oldest-first until either the row cap
+    /// is reached or including the next row would push the accumulated cost
+    /// over `max_bytes` — except that the first row is always included, even
+    /// if it alone exceeds the budget, so one oversized envelope can never
+    /// wedge a persona's mailbox. Rows left behind by either bound are
+    /// reported via `more_available`/`remaining` and stay unread.
+    pub async fn check_bounded(
+        &self,
+        persona: &str,
+        advance: bool,
+        limit: Option<u32>,
+        max_bytes: usize,
     ) -> Result<MailboxCheckResult> {
         let conn = self.conn.lock().await;
         let cursor: i64 = conn
@@ -332,7 +394,16 @@ impl Mailbox {
 
         let mut entries = Vec::with_capacity(rows.len());
         let mut max_seq = cursor;
+        let mut used_bytes: usize = 0;
         for (seq, room_id, event_id, sender, envelope) in rows {
+            // #190: stop before the row that would push the reply over the
+            // size budget — but never before the first row, so an envelope
+            // that alone exceeds the budget is still delivered (alone).
+            let cost = entry_cost(&room_id, &event_id, &sender, &envelope);
+            if !entries.is_empty() && used_bytes.saturating_add(cost) > max_bytes {
+                break;
+            }
+            used_bytes = used_bytes.saturating_add(cost);
             max_seq = max_seq.max(seq);
             let envelope: Envelope =
                 serde_json::from_str(&envelope).context("decoding stored envelope")?;
@@ -347,8 +418,8 @@ impl Mailbox {
         // Rows still unread beyond what this call is about to return — same
         // "seq > N" shape as the primary query above, anchored to the last
         // seq actually included (or the original cursor, when `entries` is
-        // empty) so this is correct whether or not the cap was the limiting
-        // factor.
+        // empty) so this is correct whether the row cap, the byte budget, or
+        // neither was the limiting factor.
         let remaining: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM messages WHERE persona = ?1 AND seq > ?2",
@@ -543,6 +614,167 @@ mod tests {
         assert_eq!(unread.len(), 3);
         assert!(!unread.more_available);
         assert_eq!(unread.remaining, 0);
+    }
+
+    async fn deliver_bodies(mailbox: &Mailbox, persona: &str, bodies: &[String]) {
+        for (i, body) in bodies.iter().enumerate() {
+            mailbox
+                .deliver(
+                    persona,
+                    "!room:x",
+                    &format!("$event{i}"),
+                    "@robb:x",
+                    &env("@robb:x", persona, body),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// #190: a backlog of large envelopes is bounded by the byte budget well
+    /// before the row cap, with the truncation reported through the same
+    /// `more_available`/`remaining` signal, and nothing is skipped across
+    /// the follow-up calls that drain it.
+    #[tokio::test]
+    async fn byte_budget_truncates_before_the_row_cap_and_reports_more_available() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        // 50 envelopes of ~4 KiB body each (~200 KiB total) — far under the
+        // 200-row default cap, well over the 64 KiB budget.
+        let bodies: Vec<String> = (0..50)
+            .map(|i| format!("msg {i:02} {}", "x".repeat(4096)))
+            .collect();
+        deliver_bodies(&mailbox, "writer_agent", &bodies).await;
+
+        let first = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert!(!first.is_empty());
+        assert!(
+            first.len() < bodies.len(),
+            "the byte budget, not the row cap, must bound this reply"
+        );
+        let first_bytes: usize = first
+            .iter()
+            .map(|e| serde_json::to_string(&e.envelope).unwrap().len())
+            .sum();
+        assert!(
+            first_bytes <= DEFAULT_CHECK_BYTE_BUDGET,
+            "returned envelopes ({first_bytes} bytes) must fit the budget"
+        );
+        assert!(first.more_available);
+        assert_eq!(first.remaining, (bodies.len() - first.len()) as i64);
+
+        // Drain the rest; every envelope comes back exactly once, in order.
+        let mut seen: Vec<String> = first.iter().map(|e| e.envelope.body.clone()).collect();
+        let mut more = first.more_available;
+        while more {
+            let next = mailbox.check("writer_agent", true, None).await.unwrap();
+            assert!(!next.is_empty(), "more_available must imply progress");
+            seen.extend(next.iter().map(|e| e.envelope.body.clone()));
+            more = next.more_available;
+        }
+        assert_eq!(seen, bodies);
+    }
+
+    /// #190: an envelope whose own size exceeds the budget is still returned
+    /// — alone — rather than wedging the mailbox, and the envelopes behind it
+    /// are reported as remaining.
+    #[tokio::test]
+    async fn single_oversized_envelope_is_returned_alone() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        let bodies = vec![
+            "y".repeat(DEFAULT_CHECK_BYTE_BUDGET * 2),
+            "small 1".to_owned(),
+            "small 2".to_owned(),
+        ];
+        deliver_bodies(&mailbox, "writer_agent", &bodies).await;
+
+        let first = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(first.len(), 1, "the oversized envelope comes back alone");
+        assert_eq!(first[0].envelope.body, bodies[0]);
+        assert!(first.more_available);
+        assert_eq!(first.remaining, 2);
+
+        let rest = mailbox.check("writer_agent", true, None).await.unwrap();
+        let got: Vec<_> = rest.iter().map(|e| e.envelope.body.clone()).collect();
+        assert_eq!(got, vec!["small 1", "small 2"]);
+        assert!(!rest.more_available);
+    }
+
+    /// #190: an oversized envelope *behind* smaller ones is deferred to the
+    /// next call (where it is returned alone), not dropped.
+    #[tokio::test]
+    async fn oversized_envelope_after_small_ones_is_deferred_not_dropped() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        let bodies = vec![
+            "small 0".to_owned(),
+            "z".repeat(DEFAULT_CHECK_BYTE_BUDGET + 1),
+            "small 2".to_owned(),
+        ];
+        deliver_bodies(&mailbox, "writer_agent", &bodies).await;
+
+        let first = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].envelope.body, "small 0");
+        assert_eq!(first.remaining, 2);
+
+        let second = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].envelope.body, bodies[1]);
+        assert_eq!(second.remaining, 1);
+
+        let third = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0].envelope.body, "small 2");
+        assert!(!third.more_available);
+    }
+
+    /// #190: the byte budget applies to an explicit `limit` too — a large
+    /// explicit limit over large envelopes is still size-bounded — while a
+    /// small explicit limit under budget still bounds by rows as before.
+    #[tokio::test]
+    async fn explicit_limit_is_also_subject_to_the_byte_budget() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        let bodies: Vec<String> = (0..40)
+            .map(|i| format!("msg {i:02} {}", "x".repeat(4096)))
+            .collect();
+        deliver_bodies(&mailbox, "writer_agent", &bodies).await;
+
+        // Small explicit limit: the row cap bites first, as before #190.
+        let peek = mailbox.check("writer_agent", false, Some(3)).await.unwrap();
+        assert_eq!(peek.len(), 3);
+        assert_eq!(peek.remaining, 37);
+
+        // Large explicit limit: the byte budget bites first.
+        let big = mailbox
+            .check("writer_agent", true, Some(1000))
+            .await
+            .unwrap();
+        assert!(big.len() > 3 && big.len() < bodies.len());
+        assert!(big.more_available);
+        assert_eq!(big.remaining, (bodies.len() - big.len()) as i64);
+        assert_eq!(big[0].envelope.body, bodies[0]);
+    }
+
+    /// #190: `check_bounded` exposes the mechanism with an arbitrary budget;
+    /// a backlog entirely under budget is returned unchanged.
+    #[tokio::test]
+    async fn backlog_under_budget_is_unchanged_and_small_budget_truncates() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        let bodies: Vec<String> = (0..5).map(|i| format!("msg {i}")).collect();
+        deliver_bodies(&mailbox, "writer_agent", &bodies).await;
+
+        let all = mailbox.check("writer_agent", false, None).await.unwrap();
+        let got: Vec<_> = all.iter().map(|e| e.envelope.body.clone()).collect();
+        assert_eq!(got, bodies, "an under-budget backlog is returned whole");
+        assert!(!all.more_available);
+        assert_eq!(all.remaining, 0);
+
+        // A budget of zero still returns exactly one row (never wedges).
+        let one = mailbox
+            .check_bounded("writer_agent", false, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one.remaining, 4);
     }
 
     #[tokio::test]
