@@ -48,7 +48,7 @@ const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 use crate::{
     envelope::{self, Envelope},
-    mailbox::{Mailbox, MailboxEntry},
+    mailbox::{Mailbox, MailboxCheckResult},
 };
 
 pub struct Registry {
@@ -325,13 +325,13 @@ impl Registry {
     }
 
     /// Unread mailbox envelopes for `persona` — the `check` op / MCP tool.
-    /// See [`Mailbox::check`] for the peek/limit/cursor semantics.
+    /// See [`Mailbox::check`] for the peek/limit/cursor/default-cap semantics.
     pub async fn check(
         &self,
         persona: &str,
         advance: bool,
         limit: Option<u32>,
-    ) -> anyhow::Result<Vec<MailboxEntry>> {
+    ) -> anyhow::Result<MailboxCheckResult> {
         self.mailbox.check(persona, advance, limit).await
     }
 }
@@ -707,15 +707,21 @@ async fn handle_op(
             Ok(json!({"ok": true, "room_id": room.room_id(), "messages": messages}))
         }
         "check" => {
-            // Peek mode (no-advance) and `limit`, per the issue spec.
-            // Default is to advance the cursor past everything returned.
+            // Peek mode (no-advance) and `limit`, per the issue spec. Default
+            // is to advance the cursor past everything returned. An unset
+            // `limit` no longer means unbounded (#188) — `Mailbox::check`
+            // applies `DEFAULT_CHECK_LIMIT` itself; an explicit `limit` is
+            // still honored, only clamped to a 1000-row ceiling here.
             let peek = req.get("peek").and_then(Value::as_bool).unwrap_or(false);
             let limit = req
                 .get("limit")
                 .and_then(Value::as_u64)
                 .map(|l| l.min(1000) as u32);
-            let entries = registry.check(persona, !peek, limit).await?;
-            let messages: Vec<Value> = entries
+            let result = registry.check(persona, !peek, limit).await?;
+            let more_available = result.more_available;
+            let remaining = result.remaining;
+            let messages: Vec<Value> = result
+                .entries
                 .into_iter()
                 .map(|e| {
                     json!({
@@ -726,7 +732,17 @@ async fn handle_op(
                     })
                 })
                 .collect();
-            Ok(json!({"ok": true, "advanced": !peek, "messages": messages}))
+            Ok(json!({
+                "ok": true,
+                "advanced": !peek,
+                "messages": messages,
+                // #188: tells a context-bounded caller whether a cap (default
+                // or explicit `limit`) left unread mail behind, so it can
+                // choose to call `check` again rather than assume the
+                // mailbox is empty.
+                "more_available": more_available,
+                "remaining": remaining,
+            }))
         }
         other => anyhow::bail!("unknown op {other:?}"),
     }
@@ -2085,6 +2101,11 @@ mod tests {
         send(&mut write, json!({"op": "check", "limit": 2})).await;
         let reply = recv(&mut read).await;
         assert_eq!(reply["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            reply["more_available"], true,
+            "#188: one row remains unread beyond the explicit limit of 2"
+        );
+        assert_eq!(reply["remaining"], 1);
 
         send(&mut write, json!({"op": "check"})).await;
         let reply = recv(&mut read).await;
@@ -2093,5 +2114,51 @@ mod tests {
             1,
             "the remaining unread message must still be there"
         );
+        assert_eq!(reply["more_available"], false);
+        assert_eq!(reply["remaining"], 0);
+    }
+
+    /// #188: an unset `limit` over the socket must not dump an unbounded
+    /// backlog — the daemon applies `DEFAULT_CHECK_LIMIT` and reports
+    /// `more_available`/`remaining` so the caller knows to check again.
+    #[tokio::test]
+    async fn check_with_no_limit_applies_the_default_cap_over_the_socket() {
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        let total = crate::mailbox::DEFAULT_CHECK_LIMIT as usize + 10;
+        for i in 0..total {
+            registry
+                .mailbox_deliver(
+                    false,
+                    "!room:x",
+                    &format!("$event{i}"),
+                    "@robb:x",
+                    &env_to("@robb:x", "writer_agent"),
+                )
+                .await
+                .unwrap();
+        }
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "check"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(
+            reply["messages"].as_array().unwrap().len(),
+            crate::mailbox::DEFAULT_CHECK_LIMIT as usize,
+            "an unset limit must be capped, not unbounded"
+        );
+        assert_eq!(reply["more_available"], true);
+        assert_eq!(reply["remaining"], 10);
+
+        // A follow-up check drains the rest and reports nothing left.
+        send(&mut write, json!({"op": "check"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["messages"].as_array().unwrap().len(), 10);
+        assert_eq!(reply["more_available"], false);
+        assert_eq!(reply["remaining"], 0);
     }
 }
