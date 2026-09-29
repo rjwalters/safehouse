@@ -711,7 +711,11 @@ async fn handle_op(
             // is to advance the cursor past everything returned. An unset
             // `limit` no longer means unbounded (#188) — `Mailbox::check`
             // applies `DEFAULT_CHECK_LIMIT` itself; an explicit `limit` is
-            // still honored, only clamped to a 1000-row ceiling here.
+            // still honored, only clamped to a 1000-row ceiling here. Either
+            // way `Mailbox::check` also bounds the reply by
+            // `DEFAULT_CHECK_BYTE_BUDGET` (#190), so large envelopes may come
+            // back in fewer rows than `limit` — reported via
+            // `more_available`/`remaining` like any other truncation.
             let peek = req.get("peek").and_then(Value::as_bool).unwrap_or(false);
             let limit = req
                 .get("limit")

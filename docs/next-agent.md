@@ -139,9 +139,11 @@ Per-persona durable mailbox in `safehoused` (`mailbox.rs`), populated from the s
 timeline that drives live dispatch (`on_message`) — a broadcast (`to: "*"`) fans out to every
 registered persona, a direct `to:` lands only in that persona's mailbox, own-host loop-back still
 skips only the authoring persona. Read cursors persist in sqlite (`<state_dir>/mailbox.sqlite3`),
-so an agent that was away for N messages — including across a daemon restart mid-gap — gets exactly
-those N on its next `safehouse_check` and nothing on the immediate repeat. `safehouse_check` supports
-`peek` (no-advance) and `limit`. The envelope's advisory `wake` field is stamped when a sender
+so an agent that was away for N messages — including across a daemon restart mid-gap — gets all N,
+oldest first, with none skipped or repeated. Each reply is bounded (#188/#190: at most 200 rows by
+default or an explicit `limit` up to 1000, and ~64 KiB of envelopes), so a large backlog takes several
+calls — the reply's `more_available`/`remaining` say when to call again — and once drained the next
+check returns nothing. `safehouse_check` supports `peek` (no-advance) and `limit`. The envelope's advisory `wake` field is stamped when a sender
 supplies it (`safehouse_send`'s new `wake` argument) and round-trips through into `check` output
 unchanged, per D16 (the daemon never acts on it — only optional external wakers would).
 
