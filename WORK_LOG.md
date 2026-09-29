@@ -3,8 +3,58 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-09-27
+
+- **PR #186**: fix(shim): mark and flatten remote-authored room name in list_rooms
+- **Issue #185** (closed): list-rooms reply is unfenced, but m.room.name in it is remote-authored untrusted text
+
+### 2026-09-26
+
+- **PR #183**: feat(shim): fence untrusted room content, refuse secret bodies, add invention firewall
+
+### 2026-09-18
+
+- **Issue #176** (closed): Clean up leftover test room loom-room-cutover-scripttest-DELETE-ME on production homeserver
+- **PR #175**: feat: script the room-DAG-death cutover (room-cutover.sh)
+- **Issue #172** (closed): Room-DAG death is now a recurring failure shape: capture server-side forensics for upstream, and script the room cutover so the third wedge is minutes not days
+
+### 2026-09-15
+
+- **PR #177**: feat: unattended host onboarding via Matrix admin-room automation (#94)
+- **PR #174**: chore(repo-skills): update installed Repo Skills to 0.11.12
+- **Issue #159** (closed): verdict-staleness-guard.sh errors on every run: gh pr view has no 'merged' JSON field
+
+### 2026-09-09
+
+- **Issue #169** (closed): Narration room v2 rejects all sends: 500 M_UNKNOWN 'no forward extremities' — peer-coordination liveness unknowable
+
+### 2026-09-06
+
+- **PR #171**: fix: normalize operator-premise state before hashing (CLOSED/MERGED churn)
+- **Issue #170** (closed): dep-recheck-fingerprint.sh operator-premise: CLOSED vs MERGED state string causes spurious hash churn
+
+### 2026-09-02
+
+- **PR #167**: fix(check-promotion-landed): parse tolerance-window timestamps portably on BSD/macOS date
+- **Issue #166** (closed): check-promotion-landed.sh's tolerance-window date math silently degrades on macOS/BSD date
+- **PR #165**: fix: check-promotion-landed.sh timeline comparison is direction-insensitive within a tolerance window
+- **Issue #164** (closed): check-promotion-landed.sh: timeline comparison is backwards, misdiagnoses legitimately-parked promotions as MISMATCH
+
+### 2026-08-23
+
+- **PR #160**: fix: replace invalid gh --json field 'merged' with 'mergedAt'
+- **Issue #158** (closed): verdict-staleness-guard.sh: 'merged' is not a valid gh pr view JSON field, breaks entire Stale-Verdict Sweep
+- **Issue #157** (closed): verdict-staleness-guard.sh fails on every invocation: invalid gh --json field 'merged'
+
+### 2026-08-20
+
+- **PR #156**: egress: gate the public completion feed on repo visibility (fail closed on an absent tag)
+- **Issue #155** (closed): egress: gate the public completion feed on repo visibility (fail closed on an absent tag)
+
 ### 2026-08-17
 
+- **PR #154**: fix: add ThrottleInterval to macOS LaunchAgent plist
+- **Issue #153** (closed): macOS LaunchAgent has no KeepAlive — a clean exit on a transient sqlite failure left safehoused down 24h (parity with systemd Restart=always)
 - **PR #151**: refactor: deduplicate completion_meta() test helper into test_support
 - **Issue #149** (closed): Deduplicate identical completion_meta() test helper (egress.rs + rpc.rs)
 
