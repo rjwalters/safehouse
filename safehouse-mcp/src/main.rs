@@ -632,12 +632,12 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "safehouse_check",
-            "description": "Check your mailbox: unread envelopes addressed to you (`to: <your persona>` or broadcasts), oldest first, since you last checked. Call this on your own cadence, like checking your phone — no agent needs to stay connected to receive. By default this advances your read cursor so a repeat call returns nothing new; pass peek=true to look without consuming. Survives daemon restarts: anything you missed while the daemon (or you) were down is still here.",
+            "description": "Check your mailbox: unread envelopes addressed to you (`to: <your persona>` or broadcasts), oldest first, since you last checked. Call this on your own cadence, like checking your phone — no agent needs to stay connected to receive. By default this advances your read cursor so a repeat call returns nothing new; pass peek=true to look without consuming. Survives daemon restarts: anything you missed while the daemon (or you) were down is still here. The reply includes `more_available` (bool) and `remaining` (count) — when true/nonzero, a cap left unread mail behind and you should call again (optionally with a larger `limit`) rather than assume the mailbox is empty.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "peek": {"type": "boolean", "description": "If true, don't advance the read cursor — a repeated peek returns the same unread set (default false)"},
-                    "limit": {"type": "integer", "description": "Max envelopes to return (oldest unread first); unset returns everything unread"}
+                    "limit": {"type": "integer", "description": "Max envelopes to return (oldest unread first), capped at 1000; unset applies a default cap of 200 rather than returning everything unread — check `more_available`/`remaining` in the reply to see if more is waiting"}
                 }
             }
         }

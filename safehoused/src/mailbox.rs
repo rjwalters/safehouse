@@ -69,6 +69,24 @@ const EPHEMERAL_BODY_MARKER: &str = "loom_claim";
 /// still bounding worst-case storage for one that never does (#60).
 const MAX_UNCONSUMED_PER_PERSONA: i64 = 5_000;
 
+/// Default cap on how many envelopes a single [`Mailbox::check`] call returns
+/// when the caller doesn't pass an explicit `limit` (#188). This is a
+/// *response-size* bound, distinct from [`MAX_UNCONSUMED_PER_PERSONA`]'s
+/// *storage* bound above: a persona with a stale cursor in a busy broadcast
+/// room can legitimately have thousands of unconsumed rows on disk, but
+/// handing all of them back in one `safehouse_check` reply produces a
+/// multi-megabyte payload no bounded-context MCP client (an LLM agent) can
+/// consume — the one tool this substrate exists to make reliable for agents
+/// becomes unusable for exactly the caller who most needs it (a first/
+/// returning agent in an active room). A caller that wants more than this in
+/// one shot still can — pass an explicit `limit` (`check`'s cap on an
+/// explicit value is 1000, set in `rpc.rs`) — this only bounds the *unset*
+/// case. `more_available`/`remaining` in [`MailboxCheckResult`] tell the
+/// caller when a cap (default or explicit) left unread rows behind, so it can
+/// call again with a smaller/larger `limit` as needed instead of discovering
+/// the truncation only by counting.
+pub(crate) const DEFAULT_CHECK_LIMIT: u32 = 200;
+
 /// True when `body` parses as a JSON object carrying [`EPHEMERAL_BODY_MARKER`]
 /// as a top-level key. Anything that isn't valid JSON, or is JSON but not an
 /// object, or is an object without the marker, is never ephemeral — plain
@@ -142,6 +160,42 @@ pub struct MailboxEntry {
     /// §6 on why this is surfaced alongside `envelope.from`).
     pub sender: String,
     pub envelope: Envelope,
+}
+
+/// Result of [`Mailbox::check`]: the entries returned, plus whether a cap
+/// (default or caller-supplied) left more unread rows behind (#188). Derefs
+/// to `Vec<MailboxEntry>` so existing call sites that only care about the
+/// entries (`.len()`, `.is_empty()`, indexing, `.iter()`) don't need to
+/// change; a caller that needs the backlog signal reaches for `.more_available`
+/// / `.remaining` explicitly.
+#[derive(Clone, Debug)]
+pub struct MailboxCheckResult {
+    pub entries: Vec<MailboxEntry>,
+    /// True when at least one unread row exists beyond what `entries`
+    /// contains — i.e. the cap (default or explicit `limit`) was the reason
+    /// fewer than the full unread backlog came back, not that there was
+    /// nothing more to return.
+    pub more_available: bool,
+    /// Count of unread rows beyond `entries` — `0` iff `more_available` is
+    /// `false`. Lets a caller decide how much bigger a follow-up `limit`
+    /// needs to be instead of only learning that *some* backlog remains.
+    pub remaining: i64,
+}
+
+impl std::ops::Deref for MailboxCheckResult {
+    type Target = Vec<MailboxEntry>;
+
+    fn deref(&self) -> &Vec<MailboxEntry> {
+        &self.entries
+    }
+}
+
+impl std::ops::Index<usize> for MailboxCheckResult {
+    type Output = MailboxEntry;
+
+    fn index(&self, idx: usize) -> &MailboxEntry {
+        &self.entries[idx]
+    }
 }
 
 pub struct Mailbox {
@@ -228,15 +282,20 @@ impl Mailbox {
     /// "newest last", per the issue's `safehouse_check` spec). When `advance`
     /// is true the persona's read cursor moves past everything returned; a
     /// peek (`advance = false`) leaves the cursor untouched, so a repeated
-    /// peek is idempotent. `limit`, when set, caps how many are returned —
-    /// the cursor only ever advances to cover what was actually returned, so
-    /// a limited check never skips unread mail.
+    /// peek is idempotent. `limit`, when set, caps how many are returned; when
+    /// unset, [`DEFAULT_CHECK_LIMIT`] applies instead of an unbounded return
+    /// (#188) — the cursor only ever advances to cover what was actually
+    /// returned, so a capped check never skips unread mail, it just may take
+    /// more than one call to fully drain a large backlog. The returned
+    /// [`MailboxCheckResult`] reports whether a cap (default or explicit)
+    /// left more unread rows behind, so the caller can tell a genuinely empty
+    /// mailbox apart from a truncated read.
     pub async fn check(
         &self,
         persona: &str,
         advance: bool,
         limit: Option<u32>,
-    ) -> Result<Vec<MailboxEntry>> {
+    ) -> Result<MailboxCheckResult> {
         let conn = self.conn.lock().await;
         let cursor: i64 = conn
             .query_row(
@@ -248,7 +307,9 @@ impl Mailbox {
             .context("reading mailbox cursor")?
             .unwrap_or(0);
 
-        let cap: i64 = limit.map(i64::from).unwrap_or(i64::MAX);
+        let cap: i64 = limit
+            .map(i64::from)
+            .unwrap_or(i64::from(DEFAULT_CHECK_LIMIT));
         let mut stmt = conn
             .prepare(
                 "SELECT seq, room_id, event_id, sender, envelope FROM messages \
@@ -283,6 +344,19 @@ impl Mailbox {
             });
         }
 
+        // Rows still unread beyond what this call is about to return — same
+        // "seq > N" shape as the primary query above, anchored to the last
+        // seq actually included (or the original cursor, when `entries` is
+        // empty) so this is correct whether or not the cap was the limiting
+        // factor.
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE persona = ?1 AND seq > ?2",
+                params![persona, max_seq],
+                |row| row.get(0),
+            )
+            .context("counting remaining unread mailbox rows")?;
+
         if advance && max_seq > cursor {
             conn.execute(
                 "INSERT INTO cursors (persona, seq) VALUES (?1, ?2) \
@@ -291,7 +365,11 @@ impl Mailbox {
             )
             .context("advancing mailbox cursor")?;
         }
-        Ok(entries)
+        Ok(MailboxCheckResult {
+            entries,
+            more_available: remaining > 0,
+            remaining,
+        })
     }
 }
 
@@ -385,10 +463,86 @@ mod tests {
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].envelope.body, "msg 0");
         assert_eq!(first[1].envelope.body, "msg 1");
+        assert!(
+            first.more_available,
+            "3 rows remain unread beyond the explicit limit of 2"
+        );
+        assert_eq!(first.remaining, 3);
 
         let rest = mailbox.check("writer_agent", true, None).await.unwrap();
         let bodies: Vec<_> = rest.iter().map(|e| e.envelope.body.clone()).collect();
         assert_eq!(bodies, vec!["msg 2", "msg 3", "msg 4"]);
+        assert!(
+            !rest.more_available,
+            "nothing left unread after draining the rest"
+        );
+        assert_eq!(rest.remaining, 0);
+    }
+
+    /// #188: an unset `limit` must not return an unbounded backlog — a
+    /// persona with a stale cursor in a busy room gets `DEFAULT_CHECK_LIMIT`
+    /// envelopes per call, with `more_available`/`remaining` telling it a
+    /// bigger backlog is still waiting so it can call again.
+    #[tokio::test]
+    async fn check_with_no_limit_applies_the_default_cap_and_reports_more_available() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        let total = DEFAULT_CHECK_LIMIT as usize + 50;
+        for i in 0..total {
+            mailbox
+                .deliver(
+                    "writer_agent",
+                    "!room:x",
+                    &format!("$event{i}"),
+                    "@robb:x",
+                    &env("@robb:x", "writer_agent", &format!("msg {i}")),
+                )
+                .await
+                .unwrap();
+        }
+
+        let first = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(
+            first.len(),
+            DEFAULT_CHECK_LIMIT as usize,
+            "an unset limit must be capped at DEFAULT_CHECK_LIMIT, not unbounded"
+        );
+        assert_eq!(first[0].envelope.body, "msg 0");
+        assert!(
+            first.more_available,
+            "50 rows remain beyond the default cap"
+        );
+        assert_eq!(first.remaining, 50);
+
+        // The cursor only advanced past what was actually returned, so a
+        // follow-up call (still uncapped by the caller) drains the rest.
+        let rest = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(rest.len(), 50);
+        assert!(!rest.more_available);
+        assert_eq!(rest.remaining, 0);
+    }
+
+    /// #188: a mailbox whose entire unread backlog fits under the default cap
+    /// must report `more_available: false` — the signal only fires when a cap
+    /// actually truncated the result, never unconditionally.
+    #[tokio::test]
+    async fn check_more_available_is_false_when_the_whole_backlog_fits() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        for i in 0..3 {
+            mailbox
+                .deliver(
+                    "writer_agent",
+                    "!room:x",
+                    &format!("$event{i}"),
+                    "@robb:x",
+                    &env("@robb:x", "writer_agent", &format!("msg {i}")),
+                )
+                .await
+                .unwrap();
+        }
+        let unread = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(unread.len(), 3);
+        assert!(!unread.more_available);
+        assert_eq!(unread.remaining, 0);
     }
 
     #[tokio::test]
