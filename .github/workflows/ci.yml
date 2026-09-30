@@ -103,3 +103,13 @@ jobs:
             echo "empty --invite should pass validation and fail on missing SAFEHOUSED_SOCKET, got: $out" >&2
             exit 1
           }
+
+  agent-skill:
+    name: agent skill (install-skill.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/install-skill.sh scripts/test-install-skill.sh
+      - name: skill frontmatter, documented commands, installer
+        run: scripts/test-install-skill.sh
