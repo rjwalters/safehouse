@@ -10,18 +10,17 @@ Judge-approved PRs stuck under a `loom:operator` merge-risk hold — implementat
 
 _None._
 
-## Urgent
+## Operator Priority
 
-Issues flagged as highest priority (`loom:urgent`).
+Issues the operator starred (`loom:operator-priority`); land these first.
 
-- **#94**: Host onboarding needs a human on the homeserver, which caps the fleet at the rate an operator can mint Matrix accounts — blocks dynamic scale-out to hundreds of hosts
-- **#22**: Upgrade tuwunel to v1.8.3 for MSC4108 QR login (Element X onboarding)
+_None._
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#22**: Upgrade tuwunel to v1.8.3 for MSC4108 QR login (Element X onboarding)
+_None._
 
 ## In Progress
 
@@ -39,16 +38,14 @@ _None._
 
 PRs that passed review and are queued for Champion auto-merge (`loom:pr`).
 
-- **#102**: feat: add scripted unencrypted claims-room creation (D6 carve-out)
+_None._
 
 ## Proposed
 
 Issues carrying `loom:curated`.
 
-- **#101**: Unencrypted claims room + client-side provisioning parity — E2EE black-holed the fleet's peer-claim channel *(curated)*
-- **#94**: Host onboarding needs a human on the homeserver, which caps the fleet at the rate an operator can mint Matrix accounts — blocks dynamic scale-out to hundreds of hosts *(curated)*
-- **#24**: Retire the Studio rollback backup once the EC2 homeserver is proven stable *(curated)*
-- **#22**: Upgrade tuwunel to v1.8.3 for MSC4108 QR login (Element X onboarding) *(curated)*
+- **#178**: Verify Tuwunel/Synapse users-deactivate actually force-leaves rooms (follow-up to #94/#177) *(curated)*
+- **#181**: Ship a portable safehouse skill so Claude, Codex, pi and opencode can post/read rooms *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -63,12 +60,12 @@ _None._
 | Tier | Count |
 |------|-------|
 | Operator merge-risk holds | 0 |
-| Urgent | 2 |
-| Ready (`loom:issue`) | 1 |
+| Operator priority | 0 |
+| Ready (`loom:issue`) | 0 |
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
-| Approved PRs awaiting merge | 1 |
-| Curated | 4 |
+| Approved PRs awaiting merge | 0 |
+| Curated | 2 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
