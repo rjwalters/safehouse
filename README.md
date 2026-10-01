@@ -97,6 +97,15 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
   to a strictly-outbound sink (`sink_url` HTTP POST with bounded retry, or a local JSON-lines
   `sink_path`). Disabled unless configured; see `[egress]` in
   [`safehoused/example-config.toml`](safehoused/example-config.toml).
+- **Voice notes become text (#200):** an `m.audio` event's Matrix `body` is just a file name, so an
+  agent would otherwise get "Voice message.ogg". Configure `[transcribe]` and the daemon — the only
+  component holding the room keys — downloads and decrypts the attachment, pipes it to a **local**
+  transcriber (whisper.cpp; never a hosted API, since the audio arrived end-to-end encrypted), and
+  synthesizes the envelope from the transcript: `🎙 (voice note, 0:42) <text>`. Bounded by size,
+  duration, a subprocess timeout, and a single-flight slot; any failure falls back to the file name
+  plus a visible reason, never a silent drop. Disabled unless configured; see `[transcribe]` in
+  [`safehoused/example-config.toml`](safehoused/example-config.toml) and
+  [`docs/design.md` §4.1.3](docs/design.md).
 - ✅ **The Oct 2026 "exclude insecure devices" deadline is cleared**, not just tracked: Element X
   shows no reduced-trust indicator for the self-signed daemon device (verified on a real phone).
 

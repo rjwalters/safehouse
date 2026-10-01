@@ -13,6 +13,7 @@ mod mailbox;
 mod rpc;
 #[cfg(test)]
 mod test_support;
+mod transcribe;
 
 use std::{
     env, fs,
@@ -32,8 +33,10 @@ use matrix_sdk::{
     ruma::{
         api::client::membership::joined_rooms,
         events::room::{
-            encrypted::OriginalSyncRoomEncryptedEvent, member::StrippedRoomMemberEvent,
-            message::OriginalSyncRoomMessageEvent, redaction::OriginalSyncRoomRedactionEvent,
+            encrypted::OriginalSyncRoomEncryptedEvent,
+            member::StrippedRoomMemberEvent,
+            message::{MessageType, OriginalSyncRoomMessageEvent},
+            redaction::OriginalSyncRoomRedactionEvent,
         },
     },
     Client, Error as MatrixError, Room, RoomState,
@@ -45,12 +48,18 @@ use crate::{
     egress::{Egress, EgressConfig},
     mailbox::Mailbox,
     rpc::Registry,
+    transcribe::{TranscribeConfig, Transcriber, Transcription},
 };
 
 /// The egress subsystem is optional; when absent from config the daemon runs
 /// exactly as before. This is the event-handler context type carrying that
 /// optionality through to `on_message`/`on_redaction`.
 type EgressHandle = Option<Arc<Egress>>;
+
+/// Voice-note transcription (#200) is optional the same way egress is: absent
+/// from config means `None` threads through `on_message` and not one line of
+/// `transcribe.rs` executes.
+type TranscribeHandle = Option<Arc<Transcriber>>;
 
 /// The current config schema version (issue #101, provisioning parity).
 /// Bump this whenever a new field is added to [`Config`] that would
@@ -64,7 +73,7 @@ type EgressHandle = Option<Arc<Egress>>;
 /// `scripts/install.sh` reads this via `safehoused --schema-version` (see
 /// `main()`) so the check has one source of truth instead of a
 /// hand-duplicated number in the shell script.
-const CONFIG_SCHEMA_VERSION: u32 = 3;
+const CONFIG_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -122,6 +131,14 @@ struct Config {
     /// non-empty or the daemon refuses to boot (fail-safe, per #28).
     #[serde(default)]
     egress: Option<EgressConfig>,
+    /// Optional local voice-note transcription (#200). Absent = no `m.audio`
+    /// event is ever downloaded, decrypted, or piped anywhere, and an agent
+    /// keeps seeing the file name exactly as before. When present, the
+    /// configured command must be an absolute local path and the daemon
+    /// refuses to boot otherwise — see
+    /// [`validate_transcribe_config`](crate::transcribe::validate_transcribe_config).
+    #[serde(default)]
+    transcribe: Option<TranscribeConfig>,
     /// Config schema version this file was written against (issue #101,
     /// provisioning parity). Absent defaults to `0` — "predates this
     /// versioning scheme" — and the daemon boots identically either way;
@@ -280,6 +297,22 @@ async fn run() -> Result<()> {
         None => None,
     };
 
+    // Optional local voice-note transcription (#200). Same shape as egress:
+    // built (and its boot guard enforced) only when configured, otherwise
+    // `None` threads through `on_message` and the daemon behaves exactly as
+    // it did before this feature existed.
+    let transcriber: TranscribeHandle = match config.transcribe.clone() {
+        Some(cfg) => {
+            let transcriber = Transcriber::open(cfg).context("initializing transcription")?;
+            println!(
+                "safehoused: voice-note transcription enabled: {}",
+                transcriber.describe()
+            );
+            Some(transcriber)
+        }
+        None => None,
+    };
+
     client.add_event_handler(on_invite);
     client.add_event_handler(on_message);
     client.add_event_handler(on_redaction);
@@ -288,6 +321,7 @@ async fn run() -> Result<()> {
     client.add_event_handler_context(Arc::new(config.invite_allowlist.clone()));
     client.add_event_handler_context(UnknownPersonaAck(config.unknown_persona_ack));
     client.add_event_handler_context(egress.clone());
+    client.add_event_handler_context(transcriber.clone());
 
     // The background flush task: it polls the durable delay buffer and writes
     // due, un-retracted rows to the sink. Only spawned when egress is on.
@@ -791,6 +825,12 @@ async fn on_invite(
     }
 }
 
+// The arity is matrix-sdk's, not ours: every parameter is an extractor the
+// SDK fills in (the event, the room, the client, the raw JSON, and one `Ctx`
+// per registered context value). Collapsing the `Ctx`es into one struct would
+// buy a smaller signature at the cost of a context type that exists only to
+// satisfy a lint. #200 pushed this from 7 to 8.
+#[allow(clippy::too_many_arguments)]
 async fn on_message(
     event: OriginalSyncRoomMessageEvent,
     room: Room,
@@ -798,6 +838,7 @@ async fn on_message(
     raw: RawEvent,
     Ctx(registry): Ctx<Arc<Registry>>,
     Ctx(egress): Ctx<EgressHandle>,
+    Ctx(transcriber): Ctx<TranscribeHandle>,
     Ctx(UnknownPersonaAck(ack_unknown)): Ctx<UnknownPersonaAck>,
 ) {
     // #85: any room event is evidence of life — narration chatter, not only
@@ -805,17 +846,48 @@ async fn on_message(
     // so this is recorded unconditionally, before any early return below.
     registry.record_event_received();
     let own_event = Some(event.sender.as_ref()) == client.user_id();
-    let content: Value = serde_json::from_str(raw.get())
+    let mut content: Value = serde_json::from_str(raw.get())
         .ok()
         .and_then(|v: Value| v.get("content").cloned())
         .unwrap_or(Value::Null);
+
+    // #200: voice notes. An `m.audio` event's Matrix `body` is just a file
+    // name, so without this an agent behind the socket receives "Voice
+    // message.ogg" and nothing it can act on. When `[transcribe]` is
+    // configured, the attachment is downloaded and decrypted *here* — this
+    // daemon holds the room keys, so no other component can — and `body` is
+    // rewritten to the transcript before envelope synthesis runs. Everything
+    // downstream (§5 synthesis, §7 routing, the mailbox, egress) then treats
+    // it like any other human message; `from_event_json` stays entirely
+    // unaware that audio exists. The original event remains the source of
+    // truth and is never modified; the transcript is daemon-derived.
+    //
+    // Scope choice (issue #200's second open question): this runs for every
+    // `m.audio` event observed, *before* §7 decides who the envelope reaches
+    // — including in rooms the daemon only mirrors. Transcribing uniformly
+    // keeps delivery decisions in the one place that already makes them
+    // rather than introducing a second, divergent notion of "will this reach
+    // an agent". Transcription stays off entirely unless configured.
+    let transcript_to_post = transcribe_audio_body(
+        transcriber.as_ref(),
+        &client,
+        &event,
+        room.room_id().as_str(),
+        &mut content,
+    )
+    .await;
 
     if !own_event {
         println!(
             "[{}] {}: {}",
             room.name().unwrap_or_else(|| room.room_id().to_string()),
             event.sender,
-            event.content.body()
+            // The (possibly transcribed) body, so the mirror log shows what
+            // the agents were given rather than a file name.
+            content
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| event.content.body())
         );
     }
 
@@ -948,6 +1020,130 @@ async fn on_message(
                 "safehoused: failed to post unknown-persona ack for @{token} in {}: {err:#}",
                 room.room_id()
             );
+        }
+    }
+
+    // #200: with `post_transcript = true`, echo the transcript back into the
+    // room under the voice note so the humans can see exactly what the agents
+    // were handed (and spot a mis-transcription). `None` whenever
+    // transcription is off, the event was not audio, it failed, or the option
+    // is off — see `transcribe_audio_body`.
+    if let Some(transcript) = transcript_to_post {
+        post_transcript_notice(
+            &room,
+            event.sender.as_str(),
+            &thread_root,
+            &event_id,
+            &transcript,
+        )
+        .await;
+    }
+}
+
+/// #200: post a transcript back into the room as a **threaded notice** under
+/// the voice note. `m.notice` (not `m.text`) is the Matrix convention for a
+/// bot's derived commentary, and Element renders it muted so it reads as
+/// annotation rather than as something a human said.
+///
+/// It carries a real v1 envelope, like every other daemon-authored message
+/// (`unknown_persona_ack`'s precedent): a notice *without* one would come back
+/// through `on_message` and be synthesized as a human chat from the daemon's
+/// own account.
+///
+/// It is addressed `to` the **voice note's sender** — a Matrix user id, never a
+/// persona — exactly as `unknown_persona_ack` is. That is load-bearing, not
+/// cosmetic: §7 routing matches `to` against the local persona list, so a
+/// human's MXID matches nothing and the notice reaches no mailbox. The agents
+/// already have the transcript (it *is* the voice note's body); re-broadcasting
+/// it as an `ack` would put the same text in every persona's mailbox a second
+/// time. This copy is the humans'. Send failures are logged, never fatal.
+async fn post_transcript_notice(
+    room: &Room,
+    sender: &str,
+    thread_root: &str,
+    event_id: &str,
+    transcript: &str,
+) {
+    let env = envelope::Envelope {
+        v: envelope::SUPPORTED_VERSION,
+        from: envelope::DAEMON_PERSONA.to_owned(),
+        to: sender.to_owned(),
+        kind: "ack".to_owned(),
+        task_id: None,
+        body: format!("🎙 transcript: {transcript}"),
+        wake: None,
+        meta: None,
+    };
+    let mut content =
+        envelope::to_event_content(&env, Some(envelope::thread_relation(thread_root, event_id)));
+    content["msgtype"] = Value::String("m.notice".to_owned());
+    if let Err(err) = room.send_raw("m.room.message", content).await {
+        eprintln!(
+            "safehoused: failed to post transcript notice for {event_id} in {}: {err:#}",
+            room.room_id()
+        );
+    }
+}
+
+/// #200: if `content` is an `m.audio` event and transcription is configured,
+/// replace its `body` (a file name) with a transcript-derived body before
+/// envelope synthesis sees it. Returns the bare transcript **only** when it
+/// succeeded *and* `post_transcript` is on, i.e. exactly when the caller
+/// should echo it back into the room.
+///
+/// A no-op in three cases, each of which leaves `content` untouched and the
+/// daemon's behavior identical to before this feature: transcription is not
+/// configured; the event is not `m.audio`; or the typed msgtype disagrees with
+/// the raw JSON (nothing to download from).
+///
+/// Never returns an error: a failure rewrites `body` to the file name plus a
+/// visible "transcription failed" note (see
+/// [`transcribe::fallback_body`]) and logs the reason. Silently dropping a
+/// human's voice note, or delivering it as an unexplained file name, are both
+/// worse than a noisy body.
+async fn transcribe_audio_body(
+    transcriber: Option<&Arc<Transcriber>>,
+    client: &Client,
+    event: &OriginalSyncRoomMessageEvent,
+    room_id: &str,
+    content: &mut Value,
+) -> Option<String> {
+    let transcriber = transcriber?;
+    let note = transcribe::audio_note_from_content(content)?;
+    let MessageType::Audio(audio) = &event.content.msgtype else {
+        return None;
+    };
+    let media = client.media();
+    let outcome = transcriber
+        .transcribe(&note, || async move {
+            // `use_cache: false` — the media store would otherwise persist
+            // decrypted voice-note audio on disk for a one-shot read. The
+            // transcript is the artifact worth keeping; the plaintext audio
+            // is not.
+            media
+                .get_file(audio, false)
+                .await
+                .map_err(|err| format!("{err:#}"))?
+                .ok_or_else(|| "the event carries no media source".to_owned())
+        })
+        .await;
+
+    transcribe::apply_to_content(content, &outcome);
+
+    match outcome {
+        Transcription::Transcribed { transcript, .. } => {
+            println!(
+                "safehoused: transcribed {} ({} in {room_id})",
+                event.event_id, note.filename
+            );
+            transcriber.post_transcript().then_some(transcript)
+        }
+        Transcription::Fallback { reason, .. } => {
+            eprintln!(
+                "safehoused: {} in {room_id} not transcribed ({}): {reason}",
+                event.event_id, note.filename
+            );
+            None
         }
     }
 }
@@ -1221,6 +1417,59 @@ mod config_tests {
         .unwrap();
         let egress = config.egress.expect("egress block present");
         assert!(egress::validate_egress_config(&egress).is_err());
+    }
+
+    #[test]
+    fn config_without_transcribe_leaves_it_disabled() {
+        // #200: the load-bearing regression. No `[transcribe]` block means no
+        // `m.audio` event is ever downloaded, decrypted, or piped to a
+        // subprocess — the daemon behaves exactly as it did before.
+        let config: Config = toml::from_str(&config_toml("")).unwrap();
+        assert!(config.transcribe.is_none());
+    }
+
+    #[test]
+    fn config_parses_a_transcribe_block_and_defaults_its_bounds() {
+        let config: Config = toml::from_str(&config_toml(
+            "[transcribe]\n\
+             command = [\"/usr/local/bin/whisper-cli\", \"-m\", \"/opt/ggml-small.en.bin\", \"-f\", \"-\"]\n",
+        ))
+        .unwrap();
+        let transcribe = config.transcribe.expect("transcribe block present");
+        assert_eq!(transcribe.command.len(), 5);
+        // Every bound has a conservative default, so a minimal block is still
+        // fully bounded.
+        assert_eq!(transcribe.max_seconds, 600);
+        assert_eq!(transcribe.timeout_seconds, 120);
+        assert_eq!(transcribe.max_bytes, transcribe::DEFAULT_MAX_BYTES);
+        assert!(!transcribe.post_transcript);
+        assert!(transcribe::validate_transcribe_config(&transcribe).is_ok());
+    }
+
+    #[test]
+    fn transcribe_block_with_a_path_resolved_command_is_a_boot_error() {
+        // The boot guard: what runs against decrypted E2EE audio must be an
+        // absolute path, not whatever PATH resolves.
+        let config: Config = toml::from_str(&config_toml(
+            "[transcribe]\n\
+             command = [\"whisper-cli\", \"-f\", \"-\"]\n",
+        ))
+        .unwrap();
+        let transcribe = config.transcribe.expect("transcribe block present");
+        assert!(transcribe::validate_transcribe_config(&transcribe).is_err());
+    }
+
+    #[test]
+    fn transcribe_block_rejects_an_unknown_key() {
+        // `deny_unknown_fields` on the block itself, matching [egress]: a
+        // typo'd `timeout_second` must fail fast rather than silently leave
+        // the default bound in place.
+        assert!(toml::from_str::<Config>(&config_toml(
+            "[transcribe]\n\
+             command = [\"/bin/true\"]\n\
+             timeout_second = 5\n",
+        ))
+        .is_err());
     }
 
     #[test]

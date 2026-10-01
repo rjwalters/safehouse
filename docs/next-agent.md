@@ -160,6 +160,21 @@ bounded exponential-backoff retry on `5xx`/network errors and no retry on `4xx` 
 `sink_path` local JSON-lines file for backward compatibility). See `design.md` §4.1.2 for the full
 shape and the D8 compliance note (never a listening socket).
 
+### 8. ~~Voice notes become text (#200)~~ ✅ DONE
+`safehoused/src/transcribe.rs` — an **opt-in** `[transcribe]` config block. An `m.audio` event's
+Matrix `body` is the file name, so an agent used to get "Voice message.ogg"; the daemon now
+downloads and decrypts the attachment (it holds the room keys — nothing else can) and rewrites the
+body to `🎙 (voice note, 0:42) <transcript>` *before* `envelope::from_event_json` runs, so §5
+synthesis, §7 routing, the mailbox and egress all stay unaware that audio exists. **Local
+subprocess only** — the audio arrived E2E encrypted and a hosted API would undo that, so
+`command[0]` must be an absolute local path and the module opens no socket of its own. Bounded by
+`max_bytes` (checked pre- and post-download), `max_seconds`, `timeout_seconds`, and a daemon-wide
+single-flight slot; every failure falls back to the file name plus a visible reason. Optional
+`post_transcript` echoes the transcript into the room as a threaded `m.notice` addressed at the
+sender (so it reaches no agent mailbox). Design rationale: `design.md` §4.1.3; config:
+`safehoused/example-config.toml`. **Not yet measured on real hardware** — the `base.en` vs
+`small.en` latency recommendation in the example config is reasoned, not benchmarked.
+
 ## Deferred, with a deadline
 - ~~**D11 — CLA vs. DCO.**~~ ✅ Decided 2026-07-26: **DCO** (`CONTRIBUTING.md`, D11).
 - **Claude Code Channels push-wake** remains a **v1** item. `safehouse-mcp` covers the tools story

@@ -138,6 +138,53 @@ content:
   source of truth (§3); the public feed is a lossy, best-effort mirror of it, not something the
   daemon's core loop depends on.
 
+#### 4.1.3 Local voice-note transcription (#200)
+
+**Off by default.** With no `transcribe` block in the daemon config, no `m.audio` event is ever
+downloaded, decrypted, or piped anywhere — zero behavior change from a daemon that predates it.
+
+People send voice notes. In Matrix that is an `m.audio` event (often with MSC3245's
+`org.matrix.msc3245.voice` marker) whose media is an encrypted attachment, and whose `body` — the
+only thing §5 envelope synthesis has to work from — is the file name. Unconfigured, an agent gets
+"Voice message.ogg" and nothing it can act on. safehoused is the only component that can do better:
+it holds the room keys, so it is the only one that can decrypt the attachment. Doing it here gives
+every agent on the host the result instead of making each re-implement media decryption.
+
+When configured (`safehoused/src/transcribe.rs`, hooked into `on_message` *before*
+`envelope::from_event_json`):
+
+- **Local subprocess only, deliberately.** The configured `transcribe.command` is an absolute local
+  path, executed with the decrypted media bytes on stdin; the module opens no network connection of
+  its own, and the daemon refuses to boot on a PATH-resolved `command[0]`. This is a security
+  property, not a style preference: the audio arrived end-to-end encrypted, and shipping it to a
+  hosted transcription API would quietly undo that for every voice note in the room. A hosted
+  backend is therefore something an operator must build and point `command` at explicitly. The
+  recommended transcriber is whisper.cpp on the host.
+- **Bounded four ways.** A size cap checked against the sender-advertised `info.size` *before*
+  download and against the real byte count after (`max_bytes`); a duration cap (`max_seconds`); a
+  wall-clock cap that kills the subprocess (`timeout_seconds`); and a daemon-wide single-flight
+  slot, so a burst of voice notes can never fan out into N concurrent transcriber processes on a
+  small host. The transcript folded into the body is length-clamped too — a mis-configured command
+  must not be able to push an unbounded body into every mailbox.
+- **Never silently partial.** The daemon does not attempt to trim an encoded Opus/Ogg stream. Audio
+  over `max_seconds` is either trimmed *by the command* (when `command` carries a
+  `{max_seconds}`/`{max_millis}` placeholder, substituted into argv) with the body saying
+  `first 10:00 transcribed`, or not transcribed at all with the body saying why.
+- **Never a silent drop.** Every failure path — download/decrypt error, missing binary, non-zero
+  exit, timeout, empty output, over-cap audio — falls back to today's behavior (the file name) plus
+  a visible note naming the reason. The message is always delivered.
+- **The event stays the source of truth.** Only the synthesized envelope's `body` is rewritten; the
+  original `m.audio` event is never modified or redacted. The wire format is unchanged
+  (`protocol/envelope-v1.md` §10). Optionally (`post_transcript`) the transcript is echoed back into
+  the room as a threaded `m.notice` under the voice note, addressed at the note's sender so §7
+  routing matches no persona and it reaches no agent mailbox — the agents already have the
+  transcript as the body; that copy is the humans'.
+- **Transcription is not a routing decision.** It runs for every observed `m.audio` event, before §7
+  decides who the envelope reaches, including in rooms the daemon only mirrors. Making it conditional
+  on "will this reach an agent" would mean a second, divergent notion of delivery alongside the one
+  §7 already owns, and would make a room's transcript history depend on which personas happened to be
+  configured when each note arrived.
+
 ### 4.2 Agents — ephemeral, behind the daemon
 
 - Spawn and die freely (per-task). **Never touch keys, never verify, never hit "unable to decrypt."**

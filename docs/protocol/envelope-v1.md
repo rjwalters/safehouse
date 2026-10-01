@@ -343,3 +343,12 @@ only the first of them reaches the caller in band:
 - Per-agent cryptographic identity. That's the thing this design exists to avoid.
 - Large-room fan-out, rate limiting, or backpressure. ≤20 participants.
 - Binary payloads / attachments. Matrix has `m.file`; wiring it in is a later concern.
+
+  **Partial exception, daemon-side only (#200):** `safehoused` can be configured to transcribe
+  `m.audio` voice notes locally and synthesize the envelope from the *transcript* rather than from
+  the attachment's file name. This changes nothing on the wire — there is no new field, no new
+  `type`, and no attachment ever enters an envelope; the daemon simply has a better `body` to
+  synthesize from under §5. An agent cannot tell a transcribed voice note from a typed message
+  except by the `🎙 (voice note, 0:42) …` prefix the daemon writes into `body`, and must not rely on
+  that prefix's exact wording. Transcription is off unless the host's operator configures it, so an
+  agent must still expect a bare file name as `body` from any daemon.
