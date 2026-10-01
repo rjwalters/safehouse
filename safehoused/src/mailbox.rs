@@ -48,7 +48,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::Mutex;
 
-use crate::envelope::Envelope;
+use crate::envelope::{Envelope, MatrixMeta};
 
 /// JSON object key that marks a `body` payload as an ephemeral coordination
 /// broadcast rather than agent-facing content — e.g. loom-daemon's
@@ -199,6 +199,9 @@ pub struct MailboxEntry {
     /// §6 on why this is surfaced alongside `envelope.from`).
     pub sender: String,
     pub envelope: Envelope,
+    /// Daemon-observed Matrix addressing metadata (#194); `None` when the
+    /// event carried none (and for rows stored before this column existed).
+    pub matrix: Option<MatrixMeta>,
 }
 
 /// Result of [`Mailbox::check`]: the entries returned, plus whether a cap
@@ -271,7 +274,8 @@ impl Mailbox {
                 room_id   TEXT NOT NULL,
                 event_id  TEXT NOT NULL,
                 sender    TEXT NOT NULL,
-                envelope  TEXT NOT NULL
+                envelope  TEXT NOT NULL,
+                matrix    TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_messages_persona_seq ON messages(persona, seq);
             CREATE TABLE IF NOT EXISTS cursors (
@@ -281,6 +285,17 @@ impl Mailbox {
             ",
         )
         .context("creating mailbox schema")?;
+        // #194: `CREATE TABLE IF NOT EXISTS` won't add a column to a mailbox
+        // store created before it existed, so add the nullable `matrix`
+        // column explicitly when missing. Old rows read back as NULL.
+        let has_matrix: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'matrix'")
+            .and_then(|mut s| s.exists([]))
+            .context("inspecting mailbox schema")?;
+        if !has_matrix {
+            conn.execute("ALTER TABLE messages ADD COLUMN matrix TEXT", [])
+                .context("adding matrix column to mailbox schema")?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -294,6 +309,7 @@ impl Mailbox {
     /// A no-op when `env.body` matches [`is_ephemeral_body`] — see the module
     /// doc for why (#60). Otherwise inserts, then runs [`gc_persona`] to keep
     /// `persona`'s mailbox bounded.
+    #[cfg(test)]
     pub async fn deliver(
         &self,
         persona: &str,
@@ -302,15 +318,35 @@ impl Mailbox {
         sender: &str,
         env: &Envelope,
     ) -> Result<()> {
+        self.deliver_with_matrix(persona, room_id, event_id, sender, env, None)
+            .await
+    }
+
+    /// [`Self::deliver`] plus the event's Matrix addressing metadata (#194),
+    /// stored as JSON in the nullable `matrix` column. An empty `matrix` is
+    /// stored as NULL.
+    pub async fn deliver_with_matrix(
+        &self,
+        persona: &str,
+        room_id: &str,
+        event_id: &str,
+        sender: &str,
+        env: &Envelope,
+        matrix: Option<&MatrixMeta>,
+    ) -> Result<()> {
         if is_ephemeral_body(&env.body) {
             return Ok(());
         }
         let payload = serde_json::to_string(env).context("serializing envelope for mailbox")?;
+        let matrix_json = match matrix.filter(|m| !m.is_empty()) {
+            Some(m) => Some(serde_json::to_string(m).context("serializing matrix metadata")?),
+            None => None,
+        };
         let conn = self.conn.lock().await;
         conn.execute(
-            "INSERT INTO messages (persona, room_id, event_id, sender, envelope) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![persona, room_id, event_id, sender, payload],
+            "INSERT INTO messages (persona, room_id, event_id, sender, envelope, matrix) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![persona, room_id, event_id, sender, payload, matrix_json],
         )
         .context("inserting mailbox row")?;
         gc_persona(&conn, persona, MAX_UNCONSUMED_PER_PERSONA)
@@ -374,7 +410,7 @@ impl Mailbox {
             .unwrap_or(i64::from(DEFAULT_CHECK_LIMIT));
         let mut stmt = conn
             .prepare(
-                "SELECT seq, room_id, event_id, sender, envelope FROM messages \
+                "SELECT seq, room_id, event_id, sender, envelope, matrix FROM messages \
                  WHERE persona = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
             )
             .context("preparing mailbox query")?;
@@ -386,6 +422,7 @@ impl Mailbox {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .context("querying mailbox rows")?
@@ -395,11 +432,12 @@ impl Mailbox {
         let mut entries = Vec::with_capacity(rows.len());
         let mut max_seq = cursor;
         let mut used_bytes: usize = 0;
-        for (seq, room_id, event_id, sender, envelope) in rows {
+        for (seq, room_id, event_id, sender, envelope, matrix) in rows {
             // #190: stop before the row that would push the reply over the
             // size budget — but never before the first row, so an envelope
             // that alone exceeds the budget is still delivered (alone).
-            let cost = entry_cost(&room_id, &event_id, &sender, &envelope);
+            let cost = entry_cost(&room_id, &event_id, &sender, &envelope)
+                + matrix.as_ref().map_or(0, String::len);
             if !entries.is_empty() && used_bytes.saturating_add(cost) > max_bytes {
                 break;
             }
@@ -407,11 +445,15 @@ impl Mailbox {
             max_seq = max_seq.max(seq);
             let envelope: Envelope =
                 serde_json::from_str(&envelope).context("decoding stored envelope")?;
+            // A matrix blob that fails to decode is dropped rather than
+            // failing the whole check — it's advisory metadata.
+            let matrix = matrix.and_then(|m| serde_json::from_str::<MatrixMeta>(&m).ok());
             entries.push(MailboxEntry {
                 room_id,
                 event_id,
                 sender,
                 envelope,
+                matrix,
             });
         }
 
@@ -1029,5 +1071,81 @@ mod tests {
         assert!(second.is_empty());
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn matrix_metadata_round_trips_and_is_absent_when_empty() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        let meta = MatrixMeta {
+            in_reply_to: Some("$e".to_owned()),
+            ..Default::default()
+        };
+        let e = env("@robb:x", "writer_agent", "hi");
+        mailbox
+            .deliver_with_matrix("writer_agent", "!r:x", "$1", "@robb:x", &e, Some(&meta))
+            .await
+            .unwrap();
+        mailbox
+            .deliver_with_matrix(
+                "writer_agent",
+                "!r:x",
+                "$2",
+                "@robb:x",
+                &e,
+                Some(&MatrixMeta::default()),
+            )
+            .await
+            .unwrap();
+        let got = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(got[0].matrix.as_ref(), Some(&meta));
+        assert!(got[1].matrix.is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_existing_mailbox_db_without_matrix_column_is_upgraded() {
+        let dir = std::env::temp_dir().join(format!("sh-mbx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mailbox.db");
+        let _ = std::fs::remove_file(&path);
+        let e = env("@robb:x", "writer_agent", "old row");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, persona TEXT NOT NULL,
+                    room_id TEXT NOT NULL, event_id TEXT NOT NULL,
+                    sender TEXT NOT NULL, envelope TEXT NOT NULL);
+                 CREATE TABLE cursors (persona TEXT PRIMARY KEY, seq INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (persona, room_id, event_id, sender, envelope) \
+                 VALUES ('writer_agent', '!r:x', '$old', '@robb:x', ?1)",
+                params![serde_json::to_string(&e).unwrap()],
+            )
+            .unwrap();
+        }
+        // Opening twice also proves the guarded ALTER is idempotent.
+        drop(Mailbox::open(&path).unwrap());
+        let mailbox = Mailbox::open(&path).unwrap();
+        mailbox
+            .deliver_with_matrix(
+                "writer_agent",
+                "!r:x",
+                "$new",
+                "@robb:x",
+                &e,
+                Some(&MatrixMeta {
+                    mentions: vec!["@bot:x".to_owned()],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let got = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got[0].matrix.is_none());
+        assert_eq!(got[1].matrix.as_ref().unwrap().mentions, vec!["@bot:x"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

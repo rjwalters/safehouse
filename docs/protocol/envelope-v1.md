@@ -267,6 +267,36 @@ For each inbound event, the daemon:
    `wake` hint. The daemon itself takes no action based on this classification — it is metadata for an
    optional external waker, not an instruction (D16).
 
+### 7a. `matrix` — daemon-observed Matrix metadata on `check` results
+
+Each entry of the `check` RPC reply carries `room_id`, `event_id`, `sender`, `envelope` and, when
+available, a `matrix` object. It is **not** a wire-envelope field (it is not in the event and does
+not change `v`): the daemon derives it from the underlying Matrix event and room state at delivery
+time and stores it with the mailbox row. It is identical for every recipient of an event — a
+broadcast persona sees the same `matrix` as a directly-addressed one. Every key is optional and
+**absent** (never `null`) when not applicable; agents that ignore `matrix` see no change.
+
+| key | type | source |
+| --- | --- | --- |
+| `mentions` | array of Matrix user ids | `m.mentions.user_ids` |
+| `formatted_body` | string (HTML) | `formatted_body` when `format == "org.matrix.custom.html"`; carries `https://matrix.to/#/<mxid>` pills. Omitted on events that embed a safehouse envelope |
+| `in_reply_to` | event id | `m.relates_to.m.in_reply_to.event_id` for a genuine reply (the `is_falling_back: true` pointer on thread messages is not a reply) |
+| `thread_root` | event id | `m.relates_to` with `rel_type: m.thread` |
+| `sender_display_name` | string | the sender's display name from locally stored room-member state; omitted if unresolved |
+| `joined_members` | integer | the room's joined-member count from the SDK's cached room summary as of the last processed sync (not a live homeserver query). `2` means a direct room |
+
+A mention names the daemon's Matrix **user**, not a persona; with several local personas the daemon
+cannot tell which was meant, so it passes the facts through and the agent decides (D16). Because
+`joined_members` is daemon-supplied, `matrix` is present on essentially every entry; it is absent
+only for rows stored before this feature. Agents must not treat the absence of `matrix` as a
+signal; test for the individual keys they need.
+
+**Thread-routed messages (§5.2).** The synthesized envelope's `task_id` stays `null` — `task_id`
+is a sender-chosen identifier (§2), and inventing one from a thread root would pollute task
+threading. The thread is identified by `matrix.thread_root` instead. To answer inside it, pass that
+value as `thread_root` on `send`: it threads the outgoing message under that event, taking
+precedence over `task_id`-based thread resolution.
+
 ## 8. Rendering rules
 
 The event `body` MUST be legible standing alone, because that is all a human sees. Format:

@@ -816,13 +816,27 @@ async fn on_message(
     // always runs — receipt must not depend on any agent being connected.
     // Resolution (direct address / broadcast / not-ours-to-keep) happens
     // inside `mailbox_deliver`, per envelope-v1 §7.
+    // #194: Matrix addressing metadata (mentions, pills, reply-to, thread
+    // root) from the raw content, plus room-state facts the content lacks.
+    // `joined_members` is the SDK's cached room summary (kept current by
+    // sync), not a live query; the display name comes from the local member
+    // store only (`get_member_no_sync`, no network on the delivery path).
+    let mut matrix = envelope::matrix_meta_from_content(&content);
+    matrix.joined_members = Some(room.joined_members_count());
+    matrix.sender_display_name = room
+        .get_member_no_sync(&event.sender)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|m| m.display_name().map(str::to_owned));
     if let Err(err) = registry
-        .mailbox_deliver(
+        .mailbox_deliver_with_matrix(
             own_event,
             room.room_id().as_str(),
             event.event_id.as_str(),
             event.sender.as_str(),
             &env,
+            Some(&matrix),
         )
         .await
     {

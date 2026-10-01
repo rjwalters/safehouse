@@ -283,6 +283,7 @@ impl Registry {
     /// id) is not ours to keep. This is what makes receipt independent of
     /// whether any agent is connected right now (D16/D17) — unlike the live
     /// `dispatch` above, this always runs, for every event.
+    #[cfg(test)]
     pub async fn mailbox_deliver(
         &self,
         own_event: bool,
@@ -291,9 +292,26 @@ impl Registry {
         sender: &str,
         env: &Envelope,
     ) -> anyhow::Result<()> {
+        self.mailbox_deliver_with_matrix(own_event, room_id, event_id, sender, env, None)
+            .await
+    }
+
+    /// [`Self::mailbox_deliver`] plus the event's Matrix addressing metadata
+    /// (#194). The same `matrix` goes to every recipient: it describes the
+    /// underlying Matrix event, not the addressing resolution, so a broadcast
+    /// recipient sees exactly what a directly-addressed one would.
+    pub async fn mailbox_deliver_with_matrix(
+        &self,
+        own_event: bool,
+        room_id: &str,
+        event_id: &str,
+        sender: &str,
+        env: &Envelope,
+        matrix: Option<&crate::envelope::MatrixMeta>,
+    ) -> anyhow::Result<()> {
         for persona in self.mailbox_recipients(own_event, env) {
             self.mailbox
-                .deliver(persona, room_id, event_id, sender, env)
+                .deliver_with_matrix(persona, room_id, event_id, sender, env, matrix)
                 .await?;
         }
         Ok(())
@@ -470,20 +488,12 @@ async fn handle_op(
             // earlier send, or from having observed one over sync — D6),
             // attach native `m.thread` threading; otherwise this send
             // *becomes* the root and carries no relation.
-            let known_root = match &env.task_id {
-                Some(task_id) => registry.threads.root_for_task(task_id).await,
-                None => None,
-            };
-            let relates_to = if let Some(root) = &known_root {
-                let latest = registry
-                    .threads
-                    .latest_in_thread(root)
-                    .await
-                    .unwrap_or_else(|| root.clone());
-                Some(envelope::thread_relation(root, &latest))
-            } else {
-                None
-            };
+            //
+            // #194: an explicit `thread_root` (a Matrix event id, e.g. the
+            // `matrix.thread_root` from a `check` entry) takes precedence
+            // and threads the send under that event regardless of `task_id`,
+            // so an agent can answer inside a human-started thread.
+            let (known_root, relates_to) = resolve_send_thread(registry, req, &env).await;
 
             let content = envelope::to_event_content(&env, relates_to);
             let response = room
@@ -728,12 +738,18 @@ async fn handle_op(
                 .entries
                 .into_iter()
                 .map(|e| {
-                    json!({
+                    let mut entry = json!({
                         "room_id": e.room_id,
                         "event_id": e.event_id,
                         "sender": e.sender,
                         "envelope": e.envelope,
-                    })
+                    });
+                    // #194: daemon-observed Matrix metadata, absent entirely
+                    // when the event carried none.
+                    if let Some(matrix) = e.matrix.filter(|m| !m.is_empty()) {
+                        entry["matrix"] = json!(matrix);
+                    }
+                    entry
                 })
                 .collect();
             Ok(json!({
@@ -750,6 +766,43 @@ async fn handle_op(
         }
         other => anyhow::bail!("unknown op {other:?}"),
     }
+}
+
+/// Resolve the thread a `send` belongs to: `(root, m.relates_to)`. An
+/// explicit `thread_root` wins over `task_id`-based resolution (#194); the
+/// `latest` event of the reply chain is whatever the registry has seen for
+/// that root, else the root itself.
+async fn resolve_send_thread(
+    registry: &Registry,
+    req: &Value,
+    env: &Envelope,
+) -> (Option<String>, Option<Value>) {
+    let known_root = match (send_thread_root(req), &env.task_id) {
+        (Some(root), _) => Some(root),
+        (None, Some(task_id)) => registry.threads.root_for_task(task_id).await,
+        (None, None) => None,
+    };
+    let relates_to = match &known_root {
+        Some(root) => {
+            let latest = registry
+                .threads
+                .latest_in_thread(root)
+                .await
+                .unwrap_or_else(|| root.clone());
+            Some(envelope::thread_relation(root, &latest))
+        }
+        None => None,
+    };
+    (known_root, relates_to)
+}
+
+/// The explicit `thread_root` event id of a `send` request (#194), if any.
+/// Empty strings are treated as absent.
+fn send_thread_root(req: &Value) -> Option<String> {
+    req.get("thread_root")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 /// Build the outbound envelope for a `send` request. `persona` comes from the
@@ -2000,6 +2053,64 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_thread_root_threads_independent_of_task_id() {
+        let (_w, _r, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        let req = json!({"to": "*", "body": "hi", "thread_root": "$humanroot"});
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
+        assert!(env.task_id.is_none());
+        let (root, relates) = resolve_send_thread(&registry, &req, &env).await;
+        assert_eq!(root.as_deref(), Some("$humanroot"));
+        let relates = relates.unwrap();
+        assert_eq!(relates["rel_type"], "m.thread");
+        assert_eq!(relates["event_id"], "$humanroot");
+        // No thread_root and no task_id: no relation.
+        let req = json!({"to": "*", "body": "hi"});
+        let (root, relates) = resolve_send_thread(&registry, &req, &env).await;
+        assert!(root.is_none() && relates.is_none());
+    }
+
+    #[tokio::test]
+    async fn check_surfaces_matrix_metadata_only_when_present() {
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        let meta = crate::envelope::MatrixMeta {
+            mentions: vec!["@bot:x".to_owned()],
+            thread_root: Some("$root".to_owned()),
+            joined_members: Some(2),
+            ..Default::default()
+        };
+        registry
+            .mailbox_deliver_with_matrix(
+                false,
+                "!room:x",
+                "$1",
+                "@robb:x",
+                &env_to("@robb:x", "*"),
+                Some(&meta),
+            )
+            .await
+            .unwrap();
+        registry
+            .mailbox_deliver(false, "!room:x", "$2", "@robb:x", &env_to("@robb:x", "*"))
+            .await
+            .unwrap();
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+        send(&mut write, json!({"op": "check"})).await;
+        let reply = recv(&mut read).await;
+        let msgs = reply["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(
+            msgs[0]["matrix"],
+            json!({"mentions": ["@bot:x"], "thread_root": "$root", "joined_members": 2})
+        );
+        assert!(msgs[1].as_object().unwrap().get("matrix").is_none());
     }
 
     // ---- `check` op end-to-end over the socket (acceptance criteria) ------
