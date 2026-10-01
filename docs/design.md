@@ -160,11 +160,20 @@ When configured (`safehoused/src/transcribe.rs`, hooked into `on_message` *befor
   hosted transcription API would quietly undo that for every voice note in the room. A hosted
   backend is therefore something an operator must build and point `command` at explicitly. The
   recommended transcriber is whisper.cpp on the host.
-- **Bounded four ways.** A size cap checked against the sender-advertised `info.size` *before*
-  download and against the real byte count after (`max_bytes`); a duration cap (`max_seconds`); a
-  wall-clock cap that kills the subprocess (`timeout_seconds`); and a daemon-wide single-flight
-  slot, so a burst of voice notes can never fan out into N concurrent transcriber processes on a
-  small host. The transcript folded into the body is length-clamped too — a mis-configured command
+- **Bounded four ways, with two caveats.** A size cap (`max_bytes`) checked against the
+  sender-advertised `info.size` before download (only if the sender included it) and against the
+  real byte count after; a duration cap (`max_seconds`); a wall-clock cap (`timeout_seconds`); and a
+  daemon-wide single-flight slot, so a burst of voice notes can never fan out into N concurrent
+  transcriber processes on a small host. Caveats: (1) `info.size` is sender-controlled and may be
+  omitted or understated, and matrix-sdk 0.18 has no streaming/size-capped download, so the whole
+  attachment is buffered before the post-download check; the real memory bound is the homeserver's
+  upload limit, not `max_bytes`. (2) Transcription is awaited inline in `on_message`, and
+  matrix-sdk awaits event handlers to completion before the next `/sync`, so while a voice note is
+  transcribing the daemon processes no event in any room. `timeout_seconds` bounds three sequential
+  stages (download, slot wait, subprocess), so the worst case is up to ~3x it; the single-flight
+  slot is effectively only observable in tests because the sync loop already serializes handlers.
+  Decoupling transcription from the sync loop (trading away in-turn ordering into §5 synthesis) and
+  a streaming download remain open follow-ons. The transcript folded into the body is length-clamped too — a mis-configured command
   must not be able to push an unbounded body into every mailbox.
 - **Never silently partial.** The daemon does not attempt to trim an encoded Opus/Ogg stream. Audio
   over `max_seconds` is either trimmed *by the command* (when `command` carries a
