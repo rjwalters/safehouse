@@ -193,6 +193,13 @@ same class of invisible-until-it-bites-you problem, just for the binary instead 
    [`safehoused/example-config.toml`](safehoused/example-config.toml)); leaving it unset keeps
    today's accept-any behavior.
 
+   **On a federated homeserver that premise does not hold**, so declare it: `homeserver_mode =
+   "federated"` (default `"sealed"`) tells the daemon it is reachable from other servers and/or
+   open to registration, where anyone anywhere can invite the bot. In that mode
+   `invite_allowlist` is mandatory — the daemon refuses to boot with it unset or empty, before it
+   ever logs in. Existing configs that omit `homeserver_mode` are unaffected: they mean
+   `"sealed"`, which is exactly how the daemon has always behaved.
+
    **Onboarding a new fleet host into an existing room** (e.g. adding a second daemon to a
    room the first one already occupies) no longer needs raw CS-API calls or temporary devices:
    from the already-onboarded host's socket, send an `invite` op —
@@ -276,8 +283,9 @@ export LOOM_SAFEHOUSE_ROOM_CLAIMS='!the-printed-room-id:your-server'
 ```
 
 Each invited bot's own `safehoused` auto-joins the invite on its next sync (same accept-any/
-`invite_allowlist` policy as any other invite — see step 4 above). Restart each daemon after wiring
-the room ID in so it starts using the new room.
+`invite_allowlist`/`homeserver_mode` policy as any other invite — see step 4 above; under
+`homeserver_mode = "federated"` the inviting account must be in each bot's `invite_allowlist`).
+Restart each daemon after wiring the room ID in so it starts using the new room.
 
 ## Room-DAG death cutover
 

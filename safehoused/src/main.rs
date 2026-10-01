@@ -64,7 +64,7 @@ type EgressHandle = Option<Arc<Egress>>;
 /// `scripts/install.sh` reads this via `safehoused --schema-version` (see
 /// `main()`) so the check has one source of truth instead of a
 /// hand-duplicated number in the shell script.
-const CONFIG_SCHEMA_VERSION: u32 = 2;
+const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +101,12 @@ struct Config {
     /// other invite is declined (logged, not joined).
     #[serde(default)]
     invite_allowlist: Option<Vec<String>>,
+    /// Which trust model the homeserver this daemon logs into actually has
+    /// (issue #198). Defaults to [`HomeserverMode::Sealed`] — today's
+    /// behavior, unchanged for every existing config. `"federated"` makes
+    /// `invite_allowlist` mandatory at boot; see [`validate_homeserver_mode`].
+    #[serde(default)]
+    homeserver_mode: HomeserverMode,
     /// Whether to post envelope-v1 §5.1's visible "unknown persona" ack when a
     /// human message starts with `@token` and `token` names no local persona
     /// (issue #195). Default `true`, today's behaviour: in an agent room a typo
@@ -129,6 +135,61 @@ struct Config {
 
 fn default_true() -> bool {
     true
+}
+
+/// The trust model of the homeserver this daemon logs into (issue #198).
+///
+/// safehouse's defaults assume a *sealed* homeserver (federation off,
+/// registration off — D5/D12): every account on it belongs to the operator, so
+/// every invite does too, and `on_invite` may safely accept any of them. On a
+/// *federated* homeserver that premise is gone — anyone on any server can
+/// invite the bot — so accept-any becomes unsafe and `invite_allowlist` stops
+/// being optional hardening.
+///
+/// This is an enum rather than a bare `String` on purpose: `Config` carries
+/// `deny_unknown_fields`, and a typo'd *value* should be a deserialize-time
+/// error ("unknown variant `federeted`"), never a silent fallback to the
+/// permissive mode.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum HomeserverMode {
+    /// Federation off, registration off. Every account is the operator's, so
+    /// an unrestricted `invite_allowlist` is acceptable. The default — absent
+    /// key means this, which is exactly how the daemon behaved before #198.
+    #[default]
+    Sealed,
+    /// Reachable from other homeservers and/or open to registration. Any
+    /// stranger can invite the bot, so `invite_allowlist` is mandatory.
+    Federated,
+}
+
+/// Boot-time fail-safe guard for [`HomeserverMode::Federated`] (issue #198).
+///
+/// Mirrors `egress::validate_egress_config`: a free function returning
+/// `Result<(), String>`, called before the daemon opens a client connection, so
+/// a config whose declared trust model contradicts its invite policy fails fast
+/// instead of running accept-any against the open internet.
+///
+/// Note the asymmetry with `on_invite`, which is unchanged: it already enforces
+/// `invite_allowlist` whenever it is `Some`. What this adds is *mandatoriness* —
+/// under `federated`, an absent or empty allowlist is a boot error rather than
+/// an accept-everything policy.
+fn validate_homeserver_mode(
+    mode: HomeserverMode,
+    invite_allowlist: &Option<Vec<String>>,
+) -> std::result::Result<(), String> {
+    if mode == HomeserverMode::Federated
+        && invite_allowlist.as_ref().is_none_or(|list| list.is_empty())
+    {
+        return Err(
+            "homeserver_mode is \"federated\" but invite_allowlist is empty or unset — \
+             refusing to accept invites from any user on any homeserver (list the \
+             senders whose invites this daemon should join, or set homeserver_mode = \
+             \"sealed\" if this homeserver really has federation and registration off)"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 /// Event-handler context carrying `unknown_persona_ack` to `on_message`. A
@@ -178,6 +239,11 @@ async fn run() -> Result<()> {
             config.schema_version, CONFIG_SCHEMA_VERSION
         );
     }
+    // Fail fast, before `boot()` opens a client connection: a config that
+    // declares a federated homeserver without an invite allowlist would
+    // otherwise come up accepting invites from anyone on any server (#198).
+    validate_homeserver_mode(config.homeserver_mode, &config.invite_allowlist)
+        .map_err(|err| anyhow::anyhow!(err))?;
     let client = boot(&config).await?;
 
     for persona in &config.personas {
@@ -1009,6 +1075,76 @@ mod config_tests {
         assert!(config.unknown_persona_ack);
         let config: Config = toml::from_str(&config_toml("unknown_persona_ack = false\n")).unwrap();
         assert!(!config.unknown_persona_ack);
+    }
+
+    #[test]
+    fn homeserver_mode_defaults_to_sealed_and_leaves_invites_unrestricted() {
+        // #198: an existing config has no `homeserver_mode` key at all. It must
+        // keep parsing, default to sealed, and — with no invite_allowlist, the
+        // pre-#198 accept-any shape — still pass the boot guard.
+        let config: Config = toml::from_str(&config_toml("")).unwrap();
+        assert_eq!(config.homeserver_mode, HomeserverMode::Sealed);
+        assert!(config.invite_allowlist.is_none());
+        assert!(validate_homeserver_mode(config.homeserver_mode, &config.invite_allowlist).is_ok());
+    }
+
+    #[test]
+    fn federated_without_invite_allowlist_is_a_boot_error() {
+        // #198: on a federated homeserver anyone on any server can invite the
+        // bot, so an absent allowlist must refuse to boot...
+        let config: Config =
+            toml::from_str(&config_toml("homeserver_mode = \"federated\"\n")).unwrap();
+        assert_eq!(config.homeserver_mode, HomeserverMode::Federated);
+        let err = validate_homeserver_mode(config.homeserver_mode, &config.invite_allowlist)
+            .expect_err("federated with no allowlist must fail the boot guard");
+        assert!(err.contains("invite_allowlist"), "{err}");
+        assert!(err.contains("federated"), "{err}");
+
+        // ...and so must an explicitly empty one, which is the same hazard
+        // written out longhand.
+        let config: Config = toml::from_str(&config_toml(
+            "homeserver_mode = \"federated\"\n\
+             invite_allowlist = []\n",
+        ))
+        .unwrap();
+        assert!(
+            validate_homeserver_mode(config.homeserver_mode, &config.invite_allowlist).is_err()
+        );
+    }
+
+    #[test]
+    fn federated_with_a_non_empty_invite_allowlist_boots() {
+        let config: Config = toml::from_str(&config_toml(
+            "homeserver_mode = \"federated\"\n\
+             invite_allowlist = [\"@ops-console:example.com\"]\n",
+        ))
+        .unwrap();
+        assert_eq!(config.homeserver_mode, HomeserverMode::Federated);
+        assert!(validate_homeserver_mode(config.homeserver_mode, &config.invite_allowlist).is_ok());
+        // `on_invite` is unchanged: the allowlist it enforces is exactly the
+        // one the operator configured.
+        assert_eq!(
+            config.invite_allowlist.as_deref(),
+            Some(["@ops-console:example.com".to_owned()].as_slice())
+        );
+    }
+
+    #[test]
+    fn sealed_with_an_empty_invite_allowlist_still_boots() {
+        // The guard is scoped to federated mode only — a sealed host that
+        // writes `invite_allowlist = []` keeps its pre-#198 behavior (declining
+        // every invite) rather than newly failing to boot.
+        let config: Config = toml::from_str(&config_toml("invite_allowlist = []\n")).unwrap();
+        assert!(validate_homeserver_mode(config.homeserver_mode, &config.invite_allowlist).is_ok());
+    }
+
+    #[test]
+    fn an_unrecognized_homeserver_mode_is_a_parse_error() {
+        // A typo'd value must be a deserialize-time error, never a silent
+        // fallback to the permissive mode — that is why this is an enum.
+        assert!(
+            toml::from_str::<Config>(&config_toml("homeserver_mode = \"federeted\"\n")).is_err()
+        );
     }
 
     #[test]
