@@ -64,7 +64,7 @@ type EgressHandle = Option<Arc<Egress>>;
 /// `scripts/install.sh` reads this via `safehoused --schema-version` (see
 /// `main()`) so the check has one source of truth instead of a
 /// hand-duplicated number in the shell script.
-const CONFIG_SCHEMA_VERSION: u32 = 1;
+const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +101,15 @@ struct Config {
     /// other invite is declined (logged, not joined).
     #[serde(default)]
     invite_allowlist: Option<Vec<String>>,
+    /// Whether to post envelope-v1 §5.1's visible "unknown persona" ack when a
+    /// human message starts with `@token` and `token` names no local persona
+    /// (issue #195). Default `true`, today's behaviour: in an agent room a typo
+    /// must not misdeliver silently. Set `false` for a daemon sharing a room with
+    /// people who address *each other* (`@alice can you look`). There every such
+    /// line would otherwise draw an ack from the bot's account. The message still
+    /// falls through to a broadcast either way; only the ack is suppressed.
+    #[serde(default = "default_true")]
+    unknown_persona_ack: bool,
     /// Optional public-feed egress (#30). Absent = the egress subsystem is
     /// entirely disabled and the daemon behaves identically to before. When
     /// present with a non-empty `rooms` allowlist, `deny_patterns` MUST also be
@@ -117,6 +126,15 @@ struct Config {
     #[serde(default)]
     schema_version: u32,
 }
+
+fn default_true() -> bool {
+    true
+}
+
+/// Event-handler context carrying `unknown_persona_ack` to `on_message`. A
+/// newtype, because matrix-sdk resolves handler contexts by type.
+#[derive(Clone, Copy)]
+struct UnknownPersonaAck(bool);
 
 fn load_config() -> Result<Config> {
     let path = env::args()
@@ -202,6 +220,7 @@ async fn run() -> Result<()> {
     client.add_event_handler(on_undecryptable);
     client.add_event_handler_context(registry.clone());
     client.add_event_handler_context(Arc::new(config.invite_allowlist.clone()));
+    client.add_event_handler_context(UnknownPersonaAck(config.unknown_persona_ack));
     client.add_event_handler_context(egress.clone());
 
     // The background flush task: it polls the durable delay buffer and writes
@@ -713,6 +732,7 @@ async fn on_message(
     raw: RawEvent,
     Ctx(registry): Ctx<Arc<Registry>>,
     Ctx(egress): Ctx<EgressHandle>,
+    Ctx(UnknownPersonaAck(ack_unknown)): Ctx<UnknownPersonaAck>,
 ) {
     // #85: any room event is evidence of life — narration chatter, not only
     // completions, is the sensitive liveness signal (it's far more frequent),
@@ -839,7 +859,8 @@ async fn on_message(
     // itself carries a real envelope, so the next sync round-trips through
     // the early-return branch of `from_event_json` above and never re-enters
     // this path.
-    if let Some(token) = unknown_persona {
+    // #195: suppressible for a daemon in a room of people talking to each other.
+    if let Some(token) = unknown_persona.filter(|_| ack_unknown) {
         let ack = envelope::unknown_persona_ack(&env.from, &token, &registry.personas);
         let content = envelope::to_event_content(&ack, None);
         if let Err(err) = room.send_raw("m.room.message", content).await {
@@ -965,6 +986,15 @@ mod config_tests {
              recovery_passphrase = \"rp\"\n\
              {extra}"
         )
+    }
+
+    #[test]
+    fn unknown_persona_ack_defaults_on_and_can_be_turned_off() {
+        // #195: absent keeps envelope-v1 §5.1's ack (today's behaviour).
+        let config: Config = toml::from_str(&config_toml("")).unwrap();
+        assert!(config.unknown_persona_ack);
+        let config: Config = toml::from_str(&config_toml("unknown_persona_ack = false\n")).unwrap();
+        assert!(!config.unknown_persona_ack);
     }
 
     #[test]

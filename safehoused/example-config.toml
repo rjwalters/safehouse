@@ -100,6 +100,14 @@ recovery_passphrase = "change-me-as-well"
 # daemon then auto-joins on its next sync, even if it's still cold-starting.
 # invite_allowlist = ["@ops-console:example.com"]
 
+# Visible "unknown persona" ack (envelope-v1 §5.1, issue #195). When a human
+# message starts with @token and token is no local persona, the daemon posts
+# an ack so a typo isn't silently misdelivered. That's right in an agent room
+# and noise in a room where people address each other ("@alice can you look"),
+# where every such line would draw an ack from the bot's account. false
+# suppresses the ack only; the message still arrives as a broadcast.
+# unknown_persona_ack = true
+
 # Per-persona mailbox store (docs/decisions.md D16/D17): a sqlite database
 # holding, for each registered persona, its unread-mail cursor. This is a
 # derived view over the room timeline, not a second source of truth — the
@@ -162,4 +170,4 @@ recovery_passphrase = "change-me-as-well"
 # entirely") — every config that existed before this field was introduced.
 # scripts/install.sh writes this automatically for every config it
 # generates; hand-written configs may set it explicitly or leave it out.
-# schema_version = 1
+# schema_version = 2
