@@ -18,6 +18,10 @@ toml = "0.8"
 # (envelope-v1 §8 leaves the HTML form to the daemon). MIT, so no licensing
 # constraint (D8). Raw HTML in a body is escaped, never passed through.
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# Both already vendored transitively via matrix-sdk; used directly by the
+# `send_image` op to decode its inline payload and name its type.
+base64 = "0.22"
+mime = "0.3"
 # Outbound-only HTTP POST client for the egress sink (#31). Never used to
 # accept inbound connections — see egress.rs's `Sink::Http`.
 reqwest = { workspace = true }
