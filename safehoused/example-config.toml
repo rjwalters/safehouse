@@ -100,6 +100,18 @@ recovery_passphrase = "change-me-as-well"
 # daemon then auto-joins on its next sync, even if it's still cold-starting.
 # invite_allowlist = ["@ops-console:example.com"]
 
+# Which trust model this homeserver actually has (issue #198). Default
+# "sealed" — federation off, registration off (docs/decisions.md D5/D12) —
+# which is what every config written before this key implicitly meant, and
+# why the accept-any invite policy above is safe there: every account on the
+# server is already the operator's. Set "federated" when the daemon logs into
+# a homeserver reachable from other servers and/or open to registration
+# (matrix.org, an org-wide homeserver). In that mode anyone, anywhere, can
+# invite the bot, so `invite_allowlist` above stops being optional hardening:
+# the daemon REFUSES TO BOOT unless it is set to a non-empty list. Any other
+# value is a config parse error, not a silent fallback to "sealed".
+# homeserver_mode = "sealed"
+
 # Visible "unknown persona" ack (envelope-v1 §5.1, issue #195). When a human
 # message starts with @token and token is no local persona, the daemon posts
 # an ack so a typo isn't silently misdelivered. That's right in an agent room
@@ -170,4 +182,4 @@ recovery_passphrase = "change-me-as-well"
 # entirely") — every config that existed before this field was introduced.
 # scripts/install.sh writes this automatically for every config it
 # generates; hand-written configs may set it explicitly or leave it out.
-# schema_version = 2
+# schema_version = 3
