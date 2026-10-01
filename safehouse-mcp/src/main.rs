@@ -283,6 +283,10 @@ fn build_send_op(args: &[String]) -> Result<Value> {
                 let v = flag_value(args, &mut i, "--task-id")?;
                 op["task_id"] = json!(v);
             }
+            "--thread-root" => {
+                let v = flag_value(args, &mut i, "--thread-root")?;
+                op["thread_root"] = json!(v);
+            }
             "--room" => {
                 let v = flag_value(args, &mut i, "--room")?;
                 op["room"] = json!(v);
@@ -450,7 +454,15 @@ fn handle_tool_call(msg: &Value) -> Result<Value> {
             copy_fields(
                 &args,
                 &mut op,
-                &["to", "body", "type", "task_id", "room", "wake"],
+                &[
+                    "to",
+                    "body",
+                    "type",
+                    "task_id",
+                    "thread_root",
+                    "room",
+                    "wake",
+                ],
             );
             op
         }
@@ -582,6 +594,7 @@ fn tool_definitions() -> Value {
                     "body": {"type": "string", "description": "Message content (plain text)"},
                     "type": {"type": "string", "enum": ["chat", "task", "handoff", "ack", "digest"], "description": "Message type (default chat)"},
                     "task_id": {"type": "string", "description": "Stable task identifier, [A-Za-z0-9_]"},
+                    "thread_root": {"type": "string", "description": "Matrix event id of a thread root; threads this message under it regardless of task_id. Use a received message's `matrix.thread_root` to answer inside a human-started thread"},
                     "room": {"type": "string", "description": "Room id, name, or alias; optional when only one room is joined. An ambiguous name/alias (matching more than one joined room) is an error, never a guess"},
                     "wake": {"type": "boolean", "description": "Advisory hint only — the daemon never acts on it. For optional external wakers deciding whether to nudge the recipient."}
                 },
@@ -621,7 +634,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "safehouse_read",
-            "description": "Read recent messages from a safehouse room, newest last. Each message carries its envelope (from/to/type/task_id/body); human messages get a synthesized envelope.",
+            "description": "Read recent messages from a safehouse room, newest last. Each message carries its envelope (from/to/type/task_id/body); human messages get a synthesized envelope. Matrix addressing metadata (mentions, thread_root, ...) is only on safehouse_check results, not here.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -632,7 +645,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "safehouse_check",
-            "description": "Check your mailbox: unread envelopes addressed to you (`to: <your persona>` or broadcasts), oldest first, since you last checked. Call this on your own cadence, like checking your phone — no agent needs to stay connected to receive. By default this advances your read cursor so a repeat call returns nothing new; pass peek=true to look without consuming. Survives daemon restarts: anything you missed while the daemon (or you) were down is still here. The reply includes `more_available` (bool) and `remaining` (count) — when true/nonzero, a cap left unread mail behind and you should call again (optionally with a larger `limit`) rather than assume the mailbox is empty.",
+            "description": "Check your mailbox: unread envelopes addressed to you (`to: <your persona>` or broadcasts), oldest first, since you last checked. Call this on your own cadence, like checking your phone — no agent needs to stay connected to receive. By default this advances your read cursor so a repeat call returns nothing new; pass peek=true to look without consuming. Survives daemon restarts: anything you missed while the daemon (or you) were down is still here. The reply includes `more_available` (bool) and `remaining` (count) — when true/nonzero, a cap left unread mail behind and you should call again (optionally with a larger `limit`) rather than assume the mailbox is empty. Each message may carry an optional `matrix` object of daemon-observed Matrix metadata (absent keys = not present on the event): `mentions` (m.mentions user ids — a mention names the daemon's Matrix user, not a persona, so you decide whether it means you), `formatted_body` (HTML, includes matrix.to pill links), `in_reply_to`, `thread_root` (pass it as `thread_root` to safehouse_send to answer inside that thread), `sender_display_name`, and `joined_members` (cached room member count; 2 means a direct room — gate secrets on that).",
             "inputSchema": {
                 "type": "object",
                 "properties": {

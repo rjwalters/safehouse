@@ -406,6 +406,88 @@ pub fn thread_root_from_content(content: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Daemon-observed Matrix addressing metadata for one event (#194). Not part
+/// of the wire envelope (so `v` is unaffected): it is surfaced only on `check`
+/// results, alongside `room_id`/`event_id`/`sender`/`envelope`. Every field is
+/// optional and absent from the serialized JSON when the event doesn't carry
+/// it, so agents that ignore `matrix` see no change.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixMeta {
+    /// `m.mentions.user_ids` — Element X's mention mechanism.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
+    /// The event's `formatted_body` (HTML; carries matrix.to pill links) when
+    /// `format == "org.matrix.custom.html"`. Omitted for events that embed a
+    /// safehouse envelope, whose `formatted_body` is just a rendering of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub formatted_body: Option<String>,
+    /// `m.relates_to.m.in_reply_to.event_id` for a genuine reply. The
+    /// `is_falling_back: true` reply pointer clients attach to thread
+    /// messages is not a reply and is omitted (see `thread_root`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    /// Thread root event id, set on every event inside an `m.thread`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root: Option<String>,
+    /// Sender's display name in the room, when resolvable from local state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_display_name: Option<String>,
+    /// Room joined-member count as of the last processed sync (cached room
+    /// summary, not a live homeserver query).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joined_members: Option<u64>,
+}
+
+impl MatrixMeta {
+    /// True when no field is set — such a value is never surfaced.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Extract the content-derived part of [`MatrixMeta`] (mentions,
+/// formatted_body, in_reply_to, thread_root) from raw event `content`. The
+/// caller fills in `sender_display_name`/`joined_members` from room state.
+pub fn matrix_meta_from_content(content: &Value) -> MatrixMeta {
+    let mentions = content
+        .get("m.mentions")
+        .and_then(|m| m.get("user_ids"))
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let formatted_body = if content.get(ENVELOPE_KEY).is_none()
+        && content.get("format").and_then(Value::as_str) == Some("org.matrix.custom.html")
+    {
+        content
+            .get("formatted_body")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    let in_reply_to = content
+        .get("m.relates_to")
+        .filter(|r| r.get("is_falling_back").and_then(Value::as_bool) != Some(true))
+        .and_then(|r| r.get("m.in_reply_to"))
+        .and_then(|r| r.get("event_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    MatrixMeta {
+        mentions,
+        formatted_body,
+        in_reply_to,
+        thread_root: thread_root_from_content(content),
+        sender_display_name: None,
+        joined_members: None,
+    }
+}
+
 /// Build the `m.relates_to` value for §2's native `m.thread` relation:
 /// `root_event_id` is the task's thread root, `latest_event_id` is the most
 /// recent event in that thread (used for the `is_falling_back` rich-reply
@@ -1167,6 +1249,63 @@ mod tests {
     fn thread_root_from_content_none_when_absent() {
         let content = json!({ "body": "no relation here" });
         assert!(thread_root_from_content(&content).is_none());
+    }
+
+    #[test]
+    fn matrix_meta_absent_for_plain_message() {
+        let content = json!({ "msgtype": "m.text", "body": "hello" });
+        let meta = matrix_meta_from_content(&content);
+        assert!(meta.is_empty());
+        assert_eq!(serde_json::to_value(&meta).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn matrix_meta_extracts_mentions_pill_reply_and_thread() {
+        let content = json!({
+            "msgtype": "m.text",
+            "body": "bot what broke?",
+            "format": "org.matrix.custom.html",
+            "formatted_body": "<a href=\"https://matrix.to/#/@bot:x\">bot</a> what broke?",
+            "m.mentions": { "user_ids": ["@bot:x"] },
+            "m.relates_to": { "m.in_reply_to": { "event_id": "$prev" } },
+        });
+        let meta = matrix_meta_from_content(&content);
+        assert_eq!(meta.mentions, vec!["@bot:x"]);
+        assert!(meta.formatted_body.unwrap().contains("matrix.to"));
+        assert_eq!(meta.in_reply_to.as_deref(), Some("$prev"));
+        assert!(meta.thread_root.is_none());
+    }
+
+    #[test]
+    fn matrix_meta_thread_fallback_is_not_a_reply() {
+        let content = json!({
+            "body": "follow-up",
+            "m.relates_to": thread_relation("$root", "$latest"),
+        });
+        let meta = matrix_meta_from_content(&content);
+        assert_eq!(meta.thread_root.as_deref(), Some("$root"));
+        assert!(meta.in_reply_to.is_none());
+        // A genuine reply inside a thread keeps both.
+        let mut relation = thread_relation("$root", "$msg");
+        relation["is_falling_back"] = json!(false);
+        let meta = matrix_meta_from_content(&json!({ "m.relates_to": relation }));
+        assert_eq!(meta.in_reply_to.as_deref(), Some("$msg"));
+    }
+
+    #[test]
+    fn matrix_meta_ignores_formatted_body_without_html_format_or_with_envelope() {
+        let no_format = json!({ "formatted_body": "<b>x</b>" });
+        assert!(matrix_meta_from_content(&no_format)
+            .formatted_body
+            .is_none());
+        let enveloped = json!({
+            "format": "org.matrix.custom.html",
+            "formatted_body": "<b>x</b>",
+            ENVELOPE_KEY: {},
+        });
+        assert!(matrix_meta_from_content(&enveloped)
+            .formatted_body
+            .is_none());
     }
 
     // ---- §4a — completion type + completion-v1 meta ----------------------
