@@ -82,7 +82,7 @@ user and decrypted a cross-user encrypted message. Refuses to run if the device 
 ### 4. ~~Add the unix-socket RPC + envelope~~ ✅ DONE 2026-07-26
 JSON-lines over `<state_dir>/safehoused.sock`: `hello` (persona gated by the config `personas`
 allowlist, enforced in the daemon), `send` (daemon stamps `from`, renders envelope v1),
-`create_room`, `add_to_space`, `list_rooms`, `read`, `check`, `invite` (#39), plus inbound push lines. **`safehouse-mcp`**
+`create_room`, `add_to_space`, `list_rooms`, `read`, `check`, `invite` (#39), `leave` (#201), plus inbound push lines. **`safehouse-mcp`**
 (workspace member) is the keyless stdio MCP shim over it — tools `safehouse_send` /
 `safehouse_create_room` / `safehouse_add_to_space` / `safehouse_list_rooms` / `safehouse_read` /
 `safehouse_check` —
@@ -118,6 +118,31 @@ host into an existing room is now one call from an already-onboarded host's sock
 daemon auto-joins on its next sync, cold-start included. The acceptance policy is now also
 explicit and, optionally, restrictable: `invite_allowlist` in config (default `None`/unset —
 accept-any, unchanged) limits which senders' invites `on_invite` will join.
+
+**Leaving rooms: the `leave` op and `leave_when_alone` (#201, `safehoused/src/leave.rs`).** The
+daemon used to have no way out of a room: when everyone else left, it stayed forever — re-syncing
+the room, replaying its history at every boot, keeping that room's thread state alive, and telling
+no agent the room was empty; getting it out meant logging in as the bot by hand. Two halves now
+close that, sharing one exit path (`leave_and_forget` — leave *and* forget, because a
+left-but-remembered room is the #57 stale-entry hazard: still replayed at boot, still addressable
+over RPC). **`{"op": "leave", "room": "<id|name|alias>", "reason": "..."}`** resolves the room
+through the usual `resolve_room` path and is gated by the one persona `hello` gate every op but
+`status` passes (there is no per-op allowlist in this protocol — "gated like `invite`" means that
+gate). `room` is mandatory: the "sole joined room" shorthand is not offered for a destructive op.
+Mirrored as the operator CLI `safehouse-mcp leave --room … [--reason …]` and, like `invite`,
+deliberately **not** an MCP tool. **`leave_when_alone`** (config, default `false` — unchanged
+behavior) adds the automatic half: an `m.room.member` handler records when the daemon becomes a
+room's last joined member, stamped with the *event's* `origin_server_ts`, and a 60s enforcer leaves
+rooms whose alone run has outlived a 10-minute grace period, logging `safehoused: leaving <room>
+(alone since <ts>)`. The grace is what makes a leave-and-rejoin safe; the enforcer re-derives
+membership before acting rather than trusting the stamp. It also runs once at boot (before the
+thread replay), reading the room's own newest leave event, so a room that emptied while the daemon
+was down is left immediately instead of waiting the window out from startup. Never auto-left: a room
+with a pending invite (the operator is mid-setup) and a server-notices room — detected by the spec's
+`m.server_notice` room tag, with a failed tag read deliberately answering "yes, it might be" (the
+notices room is the account's only admin channel; the cost of being wrong the other way is one
+`leave` op). The decision core (grace, reset, last-member test, tag test) is unit-tested without a
+homeserver; the live behaviors are listed as manual verification on #201.
 
 **Forward-compatible envelope types (#95, D19).** An envelope `type` this build doesn't know is
 **degraded to `chat` and delivered**, on ingest *and* on an agent's own `send` — the send path used

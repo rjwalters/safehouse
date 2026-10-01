@@ -14,7 +14,7 @@
 //!
 //! ## Operator CLI (see also README "Scripting the socket")
 //!
-//! `safehouse-mcp read|send|check|list-rooms|status|invite` runs one op against the
+//! `safehouse-mcp read|send|check|list-rooms|status|invite|leave` runs one op against the
 //! daemon and prints the JSON reply — no MCP client, no hand-rolled
 //! envelope-v1 socket client required. `check` defaults to **peek** (never
 //! advances a persona's mailbox cursor); pass `--consume` to advance it
@@ -202,6 +202,10 @@ fn print_usage(out: &mut impl Write) {
         out,
         "  safehouse-mcp invite --room <id|name|alias> --user <@bot:server>   # onboard a new fleet host (#94)"
     );
+    let _ = writeln!(
+        out,
+        "  safehouse-mcp leave --room <id|name|alias> [--reason <text>]   # leave AND forget a room (#201)"
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "Guards (see README \"Shim-side guards\"):");
     let _ = writeln!(
@@ -234,6 +238,7 @@ fn build_cli_op(sub: &str, args: &[String]) -> Result<Option<Value>> {
         "list-rooms" => build_list_rooms_op(args)?,
         "status" => build_status_op(args)?,
         "invite" => build_invite_op(args)?,
+        "leave" => build_leave_op(args)?,
         _ => return Ok(None),
     };
     Ok(Some(op))
@@ -366,6 +371,34 @@ fn build_invite_op(args: &[String]) -> Result<Value> {
     }
     anyhow::ensure!(op.get("room").is_some(), "invite: --room is required");
     anyhow::ensure!(op.get("user").is_some(), "invite: --user is required");
+    Ok(op)
+}
+
+/// Getting the daemon out of a room (#201): sends the daemon's `leave` RPC op,
+/// which leaves *and* forgets it. Deliberately a CLI subcommand only and **not**
+/// an MCP tool, exactly as `invite` is: this is an operator action against the
+/// host's own socket, not something an agent should reach for mid-conversation.
+///
+/// `--room` is required — there is no "the only joined room" shorthand for a
+/// destructive op — and `--reason` is recorded on the membership event the
+/// room's other members see.
+fn build_leave_op(args: &[String]) -> Result<Value> {
+    let mut op = json!({"op": "leave"});
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--room" => {
+                let v = flag_value(args, &mut i, "--room")?;
+                op["room"] = json!(v);
+            }
+            "--reason" => {
+                let v = flag_value(args, &mut i, "--reason")?;
+                op["reason"] = json!(v);
+            }
+            other => bail!("leave: unknown argument {other:?}"),
+        }
+    }
+    anyhow::ensure!(op.get("room").is_some(), "leave: --room is required");
     Ok(op)
 }
 
@@ -816,11 +849,28 @@ mod tests {
             .unwrap(),
             json!({"op": "invite", "room": "x", "user": "@bot:example.com"})
         );
+        assert_eq!(
+            build_cli_op("leave", &args(&["--room", "x"]))
+                .unwrap()
+                .unwrap(),
+            json!({"op": "leave", "room": "x"})
+        );
     }
 
     #[test]
     fn build_invite_op_requires_room_and_user() {
         assert!(build_invite_op(&args(&["--user", "@bot:example.com"])).is_err());
         assert!(build_invite_op(&args(&["--room", "x"])).is_err());
+    }
+
+    #[test]
+    fn build_leave_op_requires_room_and_passes_a_reason_through() {
+        // #201: no "the only joined room" shorthand for a destructive op.
+        assert!(build_leave_op(&args(&["--reason", "done"])).is_err());
+        assert!(build_leave_op(&args(&["--bogus"])).is_err());
+        assert_eq!(
+            build_leave_op(&args(&["--room", "!r:x", "--reason", "project finished"])).unwrap(),
+            json!({"op": "leave", "room": "!r:x", "reason": "project finished"})
+        );
     }
 }

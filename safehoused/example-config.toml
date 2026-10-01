@@ -120,6 +120,23 @@ recovery_passphrase = "change-me-as-well"
 # suppresses the ack only; the message still arrives as a broadcast.
 # unknown_persona_ack = true
 
+# Leave a room once the daemon is its only remaining member (issue #201).
+# Default false — today's behavior, in which the bot stays in a room everyone
+# else has left: it keeps syncing it, replays its history at every start, and
+# keeps that room's thread state alive, with nothing telling an agent the room
+# is empty. Set true and the daemon leaves AND forgets such a room after a
+# 10-minute grace period, measured from the membership event that emptied it,
+# so a quick leave-and-rejoin never pushes the bot out behind someone. It
+# checks once at startup too, so a room that emptied while the daemon was down
+# is left on the next boot. Never applies to a room with a pending invite
+# (something the operator is still setting up) or to a server-notices room
+# (tagged `m.server_notice` — the homeserver owns it). Each automatic leave is
+# logged as `safehoused: leaving <room> (alone since <ts>)`. Getting the daemon
+# out of a specific room by hand is the `leave` socket op instead:
+# `{"op": "leave", "room": "<id|name|alias>", "reason": "..."}`, or
+# `safehouse-mcp leave --room <id|name|alias>`.
+# leave_when_alone = false
+
 # Per-persona mailbox store (docs/decisions.md D16/D17): a sqlite database
 # holding, for each registered persona, its unread-mail cursor. This is a
 # derived view over the room timeline, not a second source of truth — the
@@ -253,4 +270,4 @@ recovery_passphrase = "change-me-as-well"
 # entirely") — every config that existed before this field was introduced.
 # scripts/install.sh writes this automatically for every config it
 # generates; hand-written configs may set it explicitly or leave it out.
-# schema_version = 4
+# schema_version = 5
