@@ -640,6 +640,11 @@ pub struct MatrixMeta {
     /// summary, not a live homeserver query).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub joined_members: Option<u64>,
+    /// An image/file/video/audio event's attachment, described (never its
+    /// bytes): `{msgtype, name, mimetype?, size?}`. An agent that needs the
+    /// content asks for it with the `fetch_media` socket op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Value>,
 }
 
 impl MatrixMeta {
@@ -647,6 +652,35 @@ impl MatrixMeta {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// The attachment of an `m.image`/`m.file`/`m.video`/`m.audio` event, as
+/// metadata only: `{msgtype, name, mimetype, size}` (mimetype and size when the
+/// sender gave them). None for any other event.
+pub fn attachment_from_content(content: &Value) -> Option<Value> {
+    let msgtype = content.get("msgtype").and_then(Value::as_str)?;
+    if !matches!(msgtype, "m.image" | "m.file" | "m.video" | "m.audio") {
+        return None;
+    }
+    let info = content.get("info");
+    let mut a = serde_json::Map::new();
+    a.insert("msgtype".into(), json!(msgtype));
+    let name = content
+        .get("filename")
+        .or_else(|| content.get("body"))
+        .and_then(Value::as_str)
+        .unwrap_or("attachment");
+    a.insert(
+        "name".into(),
+        json!(name.chars().take(200).collect::<String>()),
+    );
+    if let Some(m) = info.and_then(|i| i.get("mimetype")).and_then(Value::as_str) {
+        a.insert("mimetype".into(), json!(m));
+    }
+    if let Some(n) = info.and_then(|i| i.get("size")).and_then(Value::as_u64) {
+        a.insert("size".into(), json!(n));
+    }
+    Some(Value::Object(a))
 }
 
 /// Extract the content-derived part of [`MatrixMeta`] (mentions,
@@ -689,6 +723,7 @@ pub fn matrix_meta_from_content(content: &Value) -> MatrixMeta {
         thread_root: thread_root_from_content(content),
         sender_display_name: None,
         joined_members: None,
+        attachment: attachment_from_content(content),
     }
 }
 
@@ -2080,5 +2115,20 @@ mod tests {
             html.contains("&lt;script&gt;") && !html.contains("<script>"),
             "{html}"
         );
+    }
+
+    #[test]
+    fn attachment_is_described_for_media_events_only() {
+        let img = json!({"msgtype": "m.image", "body": "shot.png",
+                         "info": {"mimetype": "image/png", "size": 1234}, "url": "mxc://x/y"});
+        assert_eq!(
+            attachment_from_content(&img).unwrap(),
+            json!({"msgtype": "m.image", "name": "shot.png", "mimetype": "image/png", "size": 1234})
+        );
+        let file = json!({"msgtype": "m.file", "body": "caption text", "filename": "build.log", "file": {}});
+        assert_eq!(attachment_from_content(&file).unwrap()["name"], "build.log");
+        assert!(attachment_from_content(&json!({"msgtype": "m.text", "body": "hi"})).is_none());
+        let meta = matrix_meta_from_content(&img);
+        assert_eq!(meta.attachment.unwrap()["msgtype"], "m.image");
     }
 }

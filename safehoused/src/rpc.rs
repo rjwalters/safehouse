@@ -555,6 +555,71 @@ async fn handle_op(
                 "room_id": room.room_id().as_str(),
             }))
         }
+        "fetch_media" => {
+            let event_id = req
+                .get("event_id")
+                .and_then(Value::as_str)
+                .context("fetch_media requires `event_id`")?;
+            let event_id = matrix_sdk::ruma::OwnedEventId::try_from(event_id)
+                .map_err(|_| anyhow::anyhow!("event_id {event_id:?} is not an event id"))?;
+            let room = resolve_room(client, req.get("room").and_then(Value::as_str))?;
+            let event = room
+                .event(&event_id, None)
+                .await
+                .context("fetching the event")?;
+            let raw: Value =
+                serde_json::from_str(event.raw().json().get()).context("event json")?;
+            let content = raw.get("content").cloned().unwrap_or(Value::Null);
+            let attachment = envelope::attachment_from_content(&content)
+                .context("that event carries no image or file")?;
+            let advertised = attachment.get("size").and_then(Value::as_u64).unwrap_or(0);
+            anyhow::ensure!(
+                advertised <= MAX_FETCH_BYTES as u64,
+                "attachment is {advertised} bytes; fetch_media returns at most {} MiB",
+                MAX_FETCH_BYTES / (1024 * 1024)
+            );
+            let parsed: matrix_sdk::ruma::events::AnySyncTimelineEvent = event
+                .raw()
+                .deserialize()
+                .context("deserializing the event")?;
+            let matrix_sdk::ruma::events::AnySyncTimelineEvent::MessageLike(
+                matrix_sdk::ruma::events::AnySyncMessageLikeEvent::RoomMessage(
+                    matrix_sdk::ruma::events::room::message::SyncRoomMessageEvent::Original(ev),
+                ),
+            ) = parsed
+            else {
+                anyhow::bail!("that event is not a message");
+            };
+            // `use_cache: false`, as for voice notes: no decrypted copy is
+            // left in the media store for a one-shot read.
+            let media = client.media();
+            use matrix_sdk::ruma::events::room::message::MessageType;
+            let data = match &ev.content.msgtype {
+                MessageType::Image(c) => media.get_file(c, false).await,
+                MessageType::File(c) => media.get_file(c, false).await,
+                _ => anyhow::bail!("fetch_media serves images and files only"),
+            }
+            .context("downloading the attachment")?
+            .context("the event carries no media source")?;
+            let claimed = attachment
+                .get("mimetype")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let content_type = fetch_media_type(claimed, &data)?;
+            let name = attachment
+                .get("name")
+                .cloned()
+                .unwrap_or(json!("attachment"));
+            use base64::Engine as _;
+            Ok(json!({
+                "ok": true,
+                "event_id": event_id.as_str(),
+                "content_type": content_type,
+                "name": name,
+                "size": data.len(),
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(&data),
+            }))
+        }
         "create_room" => {
             let name = req
                 .get("name")
@@ -762,6 +827,11 @@ async fn handle_op(
                     "ts": parsed.get("origin_server_ts"),
                 });
                 let obj = message.as_object_mut().expect("json object literal");
+                // Described, never fetched: an agent asks for the bytes with
+                // `fetch_media` when it needs them.
+                if let Some(a) = envelope::attachment_from_content(&content) {
+                    obj.insert("attachment".into(), a);
+                }
                 // §5.2: resolve the thread agent the same way the live
                 // dispatch path does, so a replayed thread reply synthesizes
                 // the same envelope it would have gotten in real time.
@@ -957,6 +1027,56 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<OutboundSend> {
         },
         degraded_from,
     })
+}
+
+/// Largest attachment `fetch_media` returns. matrix-sdk 0.18 buffers the
+/// whole download, so the advertised size is checked before it and the real
+/// size after.
+const MAX_FETCH_BYTES: usize = 10 * 1024 * 1024;
+
+/// The content type `fetch_media` reports, decided by the bytes where they
+/// can say (images, PDF), never by the sender's claim alone. Anything outside
+/// these types is refused: an agent gets pictures, documents and text, not
+/// executables or archives.
+fn fetch_media_type(claimed: &str, data: &[u8]) -> Result<&'static str> {
+    anyhow::ensure!(!data.is_empty(), "the attachment is empty");
+    anyhow::ensure!(
+        data.len() <= MAX_FETCH_BYTES,
+        "attachment is {} bytes; fetch_media returns at most {} MiB",
+        data.len(),
+        MAX_FETCH_BYTES / (1024 * 1024)
+    );
+    let sniffed = if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if data.len() > 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if data.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else {
+        None
+    };
+    if let Some(t) = sniffed {
+        return Ok(t);
+    }
+    let textual = matches!(
+        claimed,
+        "text/plain"
+            | "text/csv"
+            | "text/markdown"
+            | "application/json"
+            | "text/x-log"
+            | "application/x-ndjson"
+            | ""
+    ) || claimed.starts_with("text/");
+    anyhow::ensure!(
+        textual && std::str::from_utf8(data).is_ok(),
+        "attachment type {claimed:?} isn't served: images (png/jpeg/gif/webp), PDF and UTF-8 text only"
+    );
+    Ok("text/plain")
 }
 
 /// Largest image `send_image` accepts, decoded. matrix.org's upload limit is
@@ -2637,5 +2757,45 @@ mod tests {
             super::parse_send_image(&json!({"image_base64": huge, "content_type": "image/png"}))
                 .unwrap_err();
         assert!(err.to_string().contains("larger than"), "{err}");
+    }
+
+    // ---- fetch_media type decision ----
+
+    #[test]
+    fn fetch_media_trusts_bytes_not_claims() {
+        assert_eq!(
+            super::fetch_media_type("text/plain", b"\x89PNG\r\n\x1a\nx").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            super::fetch_media_type("image/png", b"%PDF-1.7 x").unwrap(),
+            "application/pdf"
+        );
+        assert_eq!(
+            super::fetch_media_type("text/csv", b"a,b\n1,2\n").unwrap(),
+            "text/plain"
+        );
+        assert_eq!(
+            super::fetch_media_type("", b"just a log line\n").unwrap(),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn fetch_media_refuses_what_it_does_not_serve() {
+        for (claimed, data) in [
+            ("application/zip", &b"PK\x03\x04zz"[..]),
+            ("image/png", &b"<svg onload=x>"[..]),
+            ("text/plain", &b"\xff\xfe\x00bad utf8 \xc3"[..]),
+            ("application/octet-stream", &b"\x7fELF..."[..]),
+            ("text/plain", &b""[..]),
+        ] {
+            assert!(
+                super::fetch_media_type(claimed, data).is_err(),
+                "{claimed} {data:?}"
+            );
+        }
+        let big = vec![b'a'; super::MAX_FETCH_BYTES + 1];
+        assert!(super::fetch_media_type("text/plain", &big).is_err());
     }
 }
