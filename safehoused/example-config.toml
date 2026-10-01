@@ -166,6 +166,77 @@ recovery_passphrase = "change-me-as-well"
 # Ignored when sink_url is set.
 # sink_path = "/var/lib/safehoused/completions.jsonl"
 
+# --- Local voice-note transcription (issue #200) ------------------------
+
+# Opt-in. People send voice notes; in Matrix that is an `m.audio` event whose
+# `body` is just a file name, so an agent behind the socket sees "Voice
+# message.ogg" and nothing it can act on. With this block present the daemon
+# downloads and decrypts the attachment (it holds the room keys — no other
+# component can), pipes it to the configured local command, and synthesizes
+# the envelope from the transcript instead: `🎙 (voice note, 0:42) <text>`.
+# Leaving the [transcribe] table out entirely means no `m.audio` event is
+# ever downloaded, decrypted, or piped anywhere — behavior is exactly as it
+# was before this feature existed.
+#
+# LOCAL ONLY, DELIBERATELY. The audio arrived end-to-end encrypted; handing
+# it to a hosted transcription API would undo that. `command` is executed as
+# a local subprocess with the decrypted bytes on stdin, and
+# safehoused/src/transcribe.rs opens no network connection of its own. If you
+# ever do want a hosted backend, that must be your own wrapper script, chosen
+# explicitly — never something the daemon reaches for implicitly.
+#
+# Boot-time fail-safe guards
+# (safehoused/src/transcribe.rs::validate_transcribe_config): `command` must
+# be non-empty and `command[0]` must be an ABSOLUTE path (what runs against
+# decrypted E2EE audio must not depend on whatever PATH resolves), and none
+# of the three bounds may be 0 — otherwise the daemon refuses to start.
+#
+# [transcribe]
+#
+# argv of the local transcriber. It receives the raw decrypted media bytes on
+# stdin and writes the transcript to stdout; a non-zero exit (with its first
+# stderr line) becomes the visible failure note. Container/codec handling is
+# the command's business: a Matrix voice note is typically Opus-in-Ogg, which
+# `whisper-cli` cannot read directly, so in practice this points at a small
+# wrapper that pipes stdin through ffmpeg into whisper.cpp, e.g.
+#
+#   #!/bin/sh
+#   # /usr/local/bin/whisper-wrapper
+#   ffmpeg -loglevel quiet -i pipe:0 -ar 16000 -ac 1 -f wav pipe:1 \
+#     | whisper-cli -m /opt/whisper/ggml-base.en.bin -nt -f - "$@"
+#
+# Model choice: `base.en` (~142 MB) is the recommended starting point on a
+# small 2-vCPU host — `small.en` (~466 MB) is noticeably more accurate but
+# several times slower per minute of audio, and transcription is
+# single-flight here, so a slow model turns a burst of voice notes into a
+# queue. Measure on your own host before moving up; `timeout_seconds` is the
+# backstop either way.
+# command = ["/usr/local/bin/whisper-wrapper", "-d", "{max_millis}"]
+#
+# Duration cap. Audio longer than this is NEVER silently transcribed in
+# part: if `command` contains a `{max_seconds}`/`{max_millis}` placeholder
+# (substituted into argv — whisper.cpp's `-d <ms>`) the transcriber trims and
+# the body says "first 10:00 transcribed"; without a placeholder the daemon
+# cannot trim an encoded Opus stream itself, so over-long audio is not
+# transcribed at all and the body says why. Defaults to 600 (10 minutes).
+# max_seconds = 600
+#
+# Wall-clock cap on the transcriber subprocess (it is killed on expiry), on
+# the media download, and on how long a queued voice note waits for the
+# single-flight slot. Defaults to 120.
+# timeout_seconds = 120
+#
+# Size cap, checked against the event's advertised `info.size` BEFORE
+# downloading and against the real byte count after (the advertised size is
+# sender-controlled). Defaults to 26214400 (25 MiB).
+# max_bytes = 26214400
+#
+# Also post the transcript back into the room as a threaded `m.notice` under
+# the voice note, so the humans see what the agents saw. Addressed at the
+# voice note's sender, so it reaches no agent mailbox — the agents already
+# have the transcript as the message body. Defaults to false.
+# post_transcript = true
+
 # --- Config schema version (issue #101, provisioning parity) ------------
 
 # Which config schema this file was written against. Purely advisory: the
@@ -182,4 +253,4 @@ recovery_passphrase = "change-me-as-well"
 # entirely") — every config that existed before this field was introduced.
 # scripts/install.sh writes this automatically for every config it
 # generates; hand-written configs may set it explicitly or leave it out.
-# schema_version = 3
+# schema_version = 4

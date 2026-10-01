@@ -10,7 +10,19 @@ members = ["safehoused", "safehouse-mcp", "spikes/create-claims-room", "spikes/p
 # fails to link with "unable to find library -lsqlite3" unless libsqlite3-dev is
 # installed (see README "Running it" > Prerequisites).
 matrix-sdk = { version = "0.18", features = ["e2e-encryption", "bundled-sqlite"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+# "process" + "io-util" are for the optional local transcriber (#200,
+# safehoused/src/transcribe.rs): it pipes decrypted voice-note audio into a
+# configured local subprocess over stdin. "time" bounds that subprocess (and
+# the media download) with `tokio::time::timeout`, the same primitive the
+# sync-loop backoff already relies on.
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "process",
+    "io-util",
+    "time",
+] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
