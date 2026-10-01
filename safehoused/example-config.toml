@@ -218,9 +218,31 @@ recovery_passphrase = "change-me-as-well"
 # wrapper that pipes stdin through ffmpeg into whisper.cpp, e.g.
 #
 #   #!/bin/sh
-#   # /usr/local/bin/whisper-wrapper
-#   ffmpeg -loglevel quiet -i pipe:0 -ar 16000 -ac 1 -f wav pipe:1 \
-#     | whisper-cli -m /opt/whisper/ggml-base.en.bin -nt -f - "$@"
+#   # /usr/local/bin/whisper-wrapper — invoked as: whisper-wrapper <max-seconds>
+#   set -eu
+#   # Apply the duration cap HERE, in ffmpeg: `-t` truncates to at most that
+#   # many seconds and leaves shorter input untouched. Do NOT forward the cap
+#   # to whisper-cli's own `-d` (see below for why).
+#   ffmpeg -loglevel quiet -i pipe:0 -t "$1" -ar 16000 -ac 1 -f wav pipe:1 \
+#     | whisper-cli -m /opt/whisper/ggml-base.en.bin -nt -np -f - \
+#     | sed '/\[BLANK_AUDIO\]/d'
+#
+# The trailing `sed` drops whisper.cpp's `[BLANK_AUDIO]` silence markers, which
+# are noise in a chat message. (`sed` rather than `grep -v`: grep exits 1 when
+# it filters every line, and a non-zero exit here is reported as a
+# transcription failure.)
+#
+# Do NOT pass the cap to whisper.cpp's `-d <ms>`. Despite its "duration of
+# audio to process" wording, `-d` PADS shorter input out to that length rather
+# than capping it, so with the default `max_seconds = 600` every voice note
+# costs ten minutes of (mostly silent) inference. Measured 2026-10-01 on a
+# 2-vCPU arm64 host, whisper.cpp v1.9.4, base.en, with whisper.cpp's own 11s
+# `samples/jfk.wav` as Opus/Ogg: `-d 600000` took 69.5s wall and emitted the
+# transcript plus ~20 `[BLANK_AUDIO]` markers, while the same clip with no `-d`
+# took 4.0s. Against `timeout_seconds = 120` and a single-flight slot that
+# turns every short note into a near-timeout, and a 2-3 minute note into a
+# likely one. (Re-measure on your own host/model before relying on these
+# numbers.)
 #
 # Model choice: `base.en` (~142 MB) is the recommended starting point on a
 # small 2-vCPU host — `small.en` (~466 MB) is noticeably more accurate but
@@ -228,14 +250,19 @@ recovery_passphrase = "change-me-as-well"
 # single-flight here, so a slow model turns a burst of voice notes into a
 # queue. Measure on your own host before moving up; `timeout_seconds` is the
 # backstop either way.
-# command = ["/usr/local/bin/whisper-wrapper", "-d", "{max_millis}"]
+# command = ["/usr/local/bin/whisper-wrapper", "{max_seconds}"]
 #
 # Duration cap. Audio longer than this is NEVER silently transcribed in
 # part: if `command` contains a `{max_seconds}`/`{max_millis}` placeholder
-# (substituted into argv — whisper.cpp's `-d <ms>`) the transcriber trims and
-# the body says "first 10:00 transcribed"; without a placeholder the daemon
-# cannot trim an encoded Opus stream itself, so over-long audio is not
-# transcribed at all and the body says why. Defaults to 600 (10 minutes).
+# (substituted into argv) the transcriber trims and the body says "first 10:00
+# transcribed"; without a placeholder the daemon cannot trim an encoded Opus
+# stream itself, so over-long audio is not transcribed at all and the body says
+# why. Defaults to 600 (10 minutes).
+#
+# The placeholder is always substituted when present — the configured cap on
+# short audio, the trim length on over-long audio — so it is the wrapper's job
+# to treat the value as a true ceiling (ffmpeg `-t`, as above) rather than a
+# duration to process.
 # max_seconds = 600
 #
 # Wall-clock cap on the transcriber subprocess (it is killed on expiry), on
