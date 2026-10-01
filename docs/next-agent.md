@@ -195,8 +195,12 @@ body to `🎙 (voice note, 0:42) <transcript>` *before* `envelope::from_event_js
 synthesis, §7 routing, the mailbox and egress all stay unaware that audio exists. **Local
 subprocess only** — the audio arrived E2E encrypted and a hosted API would undo that, so
 `command[0]` must be an absolute local path and the module opens no socket of its own. Bounded by
-`max_bytes` (checked pre- and post-download), `max_seconds`, `timeout_seconds`, and a daemon-wide
-single-flight slot; every failure falls back to the file name plus a visible reason. Optional
+`max_bytes`, `max_seconds`, `timeout_seconds`, and a daemon-wide single-flight slot — with two
+caveats: `max_bytes`'s pre-download check relies on sender-controlled `info.size` (omit/understate
+it and the real memory bound is the homeserver's upload limit, as matrix-sdk 0.18 can't stream or
+cap downloads), and transcription is awaited inline in `on_message`, so it stalls the sync loop
+(no event in any room is processed) for up to ~3x `timeout_seconds` (download, slot wait,
+subprocess are sequential); the slot is effectively only observable in tests. Every failure falls back to the file name plus a visible reason. Optional
 `post_transcript` echoes the transcript into the room as a threaded `m.notice` addressed at the
 sender (so it reaches no agent mailbox). Design rationale: `design.md` §4.1.3; config:
 `safehoused/example-config.toml`. **Not yet measured on real hardware** — the `base.en` vs

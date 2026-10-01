@@ -21,11 +21,28 @@
 //!   something an operator must build deliberately (by pointing `command` at
 //!   their own wrapper), never something the daemon does implicitly. The
 //!   recommended transcriber is whisper.cpp on the host.
-//! - **Bounded, four ways.** A size cap before (and after) download
-//!   (`max_bytes`), a duration cap (`max_seconds`), a wall-clock cap on the
-//!   subprocess (`timeout_seconds`), and a single-flight slot so a burst of
-//!   voice notes can never fan out into N concurrent transcriber processes
-//!   on a 2-vCPU host.
+//! - **Bounded, four ways — with two caveats.** A size cap (`max_bytes`), a
+//!   duration cap (`max_seconds`), a wall-clock cap (`timeout_seconds`), and
+//!   a single-flight slot so a burst of voice notes can never fan out into N
+//!   concurrent transcriber processes on a 2-vCPU host. The caveats:
+//!   - *Sync-loop stall.* `on_message` awaits transcription inline, and
+//!     matrix-sdk 0.18 awaits every event-handler future to completion inside
+//!     sync-response processing (`event_handler::call_event_handlers`) before
+//!     the next `/sync` is issued. So while a voice note is transcribing the
+//!     daemon processes **no event in any room**, not merely no other voice
+//!     notes. `timeout_seconds` is applied to three *sequential* stages —
+//!     download, single-flight slot wait, subprocess — so the worst case per
+//!     voice note is up to ~3x `timeout_seconds` (6 minutes at the default
+//!     120) of daemon-wide stall. Because handler invocations are already
+//!     serialized by the sync loop, the single-flight slot is in practice only
+//!     observable in tests; it is not what bounds concurrency in production.
+//!   - *`max_bytes` is not a pre-download memory ceiling.* The pre-download
+//!     check uses the sender-controlled `info.size` and only fires when that
+//!     is present; a sender can omit or understate it. matrix-sdk 0.18's
+//!     `Media::get_file` has no streaming or size-capped variant, so the whole
+//!     attachment is buffered before the post-download `max_bytes` check can
+//!     reject it. The real memory bound in that case is the homeserver's own
+//!     media-upload size limit.
 //! - **Never a silent drop.** Every failure path — download/decrypt error,
 //!   missing binary, non-zero exit, timeout, empty output, over-cap audio —
 //!   falls back to today's behaviour (the file name) **plus a visible note
@@ -106,10 +123,21 @@ pub struct TranscribeConfig {
     /// Wall-clock cap on the transcriber subprocess, and on the media
     /// download, and on how long a queued voice note waits for the
     /// single-flight slot. A transcriber that exceeds it is killed.
+    ///
+    /// These are three *sequential* bounds, and transcription is awaited
+    /// inline in `on_message`, which blocks the matrix-sdk sync loop (no
+    /// event in any room is processed meanwhile). The worst-case stall per
+    /// voice note is therefore up to ~3x this value, not 1x. The single-flight
+    /// slot only contends in tests: the sync loop already serializes handlers.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
     /// Size cap, checked against the event's advertised `info.size` *before*
-    /// downloading and against the real byte count after.
+    /// downloading (only when the sender included it) and against the real
+    /// byte count after. `info.size` is sender-controlled and can be omitted
+    /// or understated, in which case the whole attachment is buffered in
+    /// memory first (matrix-sdk 0.18 has no streaming/size-capped download);
+    /// the real memory bound is then the homeserver's upload limit, so this is
+    /// not a hard pre-download memory ceiling.
     #[serde(default = "default_max_bytes")]
     pub max_bytes: u64,
     /// Also post the transcript back into the room as a threaded notice under

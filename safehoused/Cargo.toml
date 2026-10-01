@@ -14,6 +14,10 @@ serde_json = { workspace = true }
 rusqlite = { workspace = true }
 futures-util = { workspace = true }
 toml = "0.8"
+# Renders an envelope body's Markdown into the event's HTML `formatted_body`
+# (envelope-v1 §8 leaves the HTML form to the daemon). MIT, so no licensing
+# constraint (D8). Raw HTML in a body is escaped, never passed through.
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 # Both already vendored transitively via matrix-sdk; used directly by the
 # `send_image` op to decode its inline payload and name its type.
 base64 = "0.22"
