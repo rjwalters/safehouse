@@ -288,7 +288,8 @@ broadcast persona sees the same `matrix` as a directly-addressed one. Every key 
 A mention names the daemon's Matrix **user**, not a persona; with several local personas the daemon
 cannot tell which was meant, so it passes the facts through and the agent decides (D16). Because
 `joined_members` is daemon-supplied, `matrix` is present on essentially every entry; it is absent
-only for rows stored before this feature.
+only for rows stored before this feature. Agents must not treat the absence of `matrix` as a
+signal; test for the individual keys they need.
 
 **Thread-routed messages (§5.2).** The synthesized envelope's `task_id` stays `null` — `task_id`
 is a sender-chosen identifier (§2), and inventing one from a thread root would pollute task
