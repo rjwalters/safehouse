@@ -614,6 +614,44 @@ async fn handle_op(
                 "user": user,
             }))
         }
+        "leave" => {
+            // Getting the daemon out of a room (issue #201) without logging
+            // into the bot account by hand. Gated exactly like `invite`: by
+            // the single persona gate every op but `hello`/`status` passes
+            // through (see `handle_conn`) — there is no per-op allowlist in
+            // this protocol, and inventing one here would be a second,
+            // divergent notion of who may act.
+            //
+            // Leave *and* forget, via the same path the `leave_when_alone`
+            // watcher uses: a left-but-remembered room is the #57 stale-entry
+            // hazard — it keeps being thread-replayed at boot and stays
+            // addressable over RPC.
+            // `room` is mandatory here, unlike every other room-taking op:
+            // `resolve_room(None)` falls through to "the sole joined room"
+            // (`pick_room_index`), which is a convenience worth having for
+            // `send`/`read` and a hazard for a destructive op — on a host that
+            // happens to be in exactly one room, a `leave` that forgot its
+            // `room` field would silently leave that room. Required
+            // explicitly, so the shorthand can never apply.
+            let spec = req
+                .get("room")
+                .and_then(Value::as_str)
+                .context("`room` required for `leave`")?;
+            let room = resolve_room(client, Some(spec)).context("resolving `room`")?;
+            let room_id = room.room_id().to_string();
+            let reason = req.get("reason").and_then(Value::as_str);
+            println!(
+                "safehoused: leaving {room_id} on request from {persona}{}",
+                reason.map(|r| format!(" ({r})")).unwrap_or_default()
+            );
+            crate::leave::leave_and_forget(client, &room, reason).await?;
+            Ok(json!({
+                "ok": true,
+                "room_id": room_id,
+                "reason": reason,
+                "forgotten": true,
+            }))
+        }
         "add_to_space" => {
             let space = resolve_room(client, req.get("space").and_then(Value::as_str))
                 .context("resolving `space`")?;
@@ -1461,6 +1499,75 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("no joined room matching"));
+    }
+
+    // ---- `leave` op request-parsing (issue #201) --------------------------
+    //
+    // Same constraint as `invite` above: `resolve_room` needs a live
+    // homeserver's joined rooms, so these cover the paths that resolve (and
+    // fail) *before* any leave request would go out. The leave/forget decision
+    // logic itself is unit-tested in `leave.rs`.
+
+    #[tokio::test]
+    async fn leave_reports_unknown_room() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "leave", "room": "!nope:x"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"]
+            .as_str()
+            .unwrap()
+            .contains("no joined room matching"));
+    }
+
+    #[tokio::test]
+    async fn leave_without_a_room_field_is_rejected_rather_than_guessing() {
+        // `leave` is destructive, so the `room`-optional shorthand the other
+        // ops accept ("the sole joined room") must never resolve to a guess.
+        // The op rejects a missing `room` *before* consulting the joined-room
+        // list at all, so this holds however many rooms the daemon is in —
+        // including the one-room case the shorthand would otherwise match.
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "leave"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        // The leave-specific message, not `pick_room_index`'s "`room`
+        // required: N rooms joined" — the distinction is the point. This test
+        // runs with no joined rooms, where the shorthand would have errored
+        // anyway, so asserting the generic text would pass even if the
+        // explicit check were removed.
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("`room` required for `leave`"),
+            "{reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_requires_hello_first() {
+        // The gate the issue means by "gated like `invite`": the single
+        // persona check in `handle_conn`, not a per-op allowlist.
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(&mut write, json!({"op": "leave", "room": "!x:y"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "hello first");
     }
 
     #[tokio::test]

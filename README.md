@@ -217,6 +217,27 @@ same class of invisible-until-it-bites-you problem, just for the binary instead 
    the new host's daemon auto-joins on its next sync (even if it's still cold-starting when the
    invite is sent).
 
+   **Getting the daemon back out of a room** is the mirror image: send a `leave` op —
+   `{"op": "leave", "room": "<id|name|alias>", "reason": "..."}`, or from a shell
+   `safehouse-mcp leave --room <id|name|alias> [--reason <text>]`. It leaves *and* forgets the
+   room (a left-but-remembered room keeps being replayed at boot and stays addressable over RPC),
+   resolves `room` through the same id/name/alias path as `send`/`read`/`invite`, and is gated by
+   the same persona `hello` every op but `status` requires. `room` is mandatory here — there is no
+   "the only joined room" shorthand for a destructive op. `reason`, when given, lands on the
+   membership event the room's remaining members see.
+
+   **Leaving automatically when nobody else is left** is opt-in: `leave_when_alone = true`
+   (default `false`). The daemon watches `m.room.member` changes, and a room that has been down to
+   just this daemon for 10 minutes — measured from the event that emptied it, so a quick
+   leave-and-rejoin never pushes the bot out behind someone — is left and forgotten, logged as
+   `safehoused: leaving <room> (alone since <ts>)`. It checks once at startup too, so a room that
+   emptied while the daemon was down is left on the next boot rather than being re-synced and
+   re-replayed forever. Two rooms are never auto-left: one with a pending invite (something the
+   operator is still setting up) and a server-notices room (tagged `m.server_notice` — the
+   homeserver owns it, and it is the only channel an admin has to reach the bot account). Deciding
+   when a room that still *has* other members is finished is deliberately not here: that's an
+   agent or operator policy question, not a membership fact.
+
 ## Unattended host onboarding (issue #94)
 
 Dynamic scale-out to many hosts caps out at the rate a human can create Matrix accounts by hand.
@@ -344,6 +365,7 @@ safehouse-mcp check --limit 10                 # peek — never advances a curso
 safehouse-mcp check --consume                  # advances the operator persona's own cursor
 safehouse-mcp list-rooms
 safehouse-mcp status                           # liveness one-liner — see below
+safehouse-mcp leave --room fleet-ops           # leave AND forget a room (#201)
 ```
 
 **Diagnosing "healthy and idle" vs. "cut off" (#85):** `safehouse-mcp status` reports

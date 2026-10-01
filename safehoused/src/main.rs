@@ -9,6 +9,7 @@
 mod backoff;
 mod egress;
 mod envelope;
+mod leave;
 mod mailbox;
 mod rpc;
 #[cfg(test)]
@@ -34,7 +35,7 @@ use matrix_sdk::{
         api::client::membership::joined_rooms,
         events::room::{
             encrypted::OriginalSyncRoomEncryptedEvent,
-            member::StrippedRoomMemberEvent,
+            member::{OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
             message::{MessageType, OriginalSyncRoomMessageEvent},
             redaction::OriginalSyncRoomRedactionEvent,
         },
@@ -46,6 +47,7 @@ use serde_json::{json, Value};
 
 use crate::{
     egress::{Egress, EgressConfig},
+    leave::AloneWatch,
     mailbox::Mailbox,
     rpc::Registry,
     transcribe::{TranscribeConfig, Transcriber, Transcription},
@@ -61,6 +63,12 @@ type EgressHandle = Option<Arc<Egress>>;
 /// `transcribe.rs` executes.
 type TranscribeHandle = Option<Arc<Transcriber>>;
 
+/// `leave_when_alone` (#201) is optional the same way egress and transcription
+/// are: absent (the default) means `None` threads through the membership
+/// handler, no watcher task is spawned, and the daemon stays in every room it
+/// has joined exactly as before.
+type AloneWatchHandle = Option<Arc<AloneWatch>>;
+
 /// The current config schema version (issue #101, provisioning parity).
 /// Bump this whenever a new field is added to [`Config`] that would
 /// otherwise silently no-op on an already-provisioned host until an
@@ -73,7 +81,7 @@ type TranscribeHandle = Option<Arc<Transcriber>>;
 /// `scripts/install.sh` reads this via `safehoused --schema-version` (see
 /// `main()`) so the check has one source of truth instead of a
 /// hand-duplicated number in the shell script.
-const CONFIG_SCHEMA_VERSION: u32 = 4;
+const CONFIG_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -125,6 +133,15 @@ struct Config {
     /// falls through to a broadcast either way; only the ack is suppressed.
     #[serde(default = "default_true")]
     unknown_persona_ack: bool,
+    /// Whether to leave (and forget) a room once the daemon is its only
+    /// remaining joined member (issue #201). Default `false` — today's
+    /// behavior, in which the bot stays in a room everyone else has left,
+    /// re-syncing and re-replaying it forever. When `true`, a room that has
+    /// been down to just this daemon for [`leave::ALONE_GRACE`] is left and
+    /// forgotten; a rejoin inside that window cancels it, and a
+    /// server-notices room is never touched. See `leave.rs`.
+    #[serde(default)]
+    leave_when_alone: bool,
     /// Optional public-feed egress (#30). Absent = the egress subsystem is
     /// entirely disabled and the daemon behaves identically to before. When
     /// present with a non-empty `rooms` allowlist, `deny_patterns` MUST also be
@@ -313,8 +330,24 @@ async fn run() -> Result<()> {
         None => None,
     };
 
+    // Optional `leave_when_alone` watching (#201). Same shape again: `None`
+    // unless the operator turned it on, in which case `on_member_change`
+    // records when the daemon becomes a room's last member and the spawned
+    // enforcer acts on it once the grace period passes.
+    let alone_watch: AloneWatchHandle = if config.leave_when_alone {
+        println!(
+            "safehoused: leave_when_alone enabled (grace {:?}, re-checked every {:?})",
+            leave::ALONE_GRACE,
+            leave::ALONE_SWEEP_INTERVAL
+        );
+        Some(Arc::new(AloneWatch::new()))
+    } else {
+        None
+    };
+
     client.add_event_handler(on_invite);
     client.add_event_handler(on_message);
+    client.add_event_handler(on_member_change);
     client.add_event_handler(on_redaction);
     client.add_event_handler(on_undecryptable);
     client.add_event_handler_context(registry.clone());
@@ -322,6 +355,7 @@ async fn run() -> Result<()> {
     client.add_event_handler_context(UnknownPersonaAck(config.unknown_persona_ack));
     client.add_event_handler_context(egress.clone());
     client.add_event_handler_context(transcriber.clone());
+    client.add_event_handler_context(alone_watch.clone());
 
     // The background flush task: it polls the durable delay buffer and writes
     // due, un-retracted rows to the sink. Only spawned when egress is on.
@@ -333,6 +367,17 @@ async fn run() -> Result<()> {
     // the store's room list — otherwise the stale entries below would also be
     // thread-replayed (403 noise) and stay addressable over RPC (#57).
     reconcile_left_rooms(&client).await;
+
+    // #201: the one-time boot check, before the thread replay below — a room
+    // that emptied while this daemon was down is left here rather than having
+    // its history replayed and its threads kept alive. The sweep reads each
+    // room's own newest leave event, so a long-empty room is past the grace
+    // period immediately instead of waiting it out from startup. Then the
+    // enforcer task takes over for the life of the process.
+    if let Some(watch) = alone_watch.clone() {
+        leave::sweep_alone_rooms(&client, &watch).await;
+        tokio::spawn(leave::watch_alone_rooms(client.clone(), watch));
+    }
 
     // Rebuild §2/§5.2 thread bookkeeping from durable room history before any
     // live event can be routed. `ThreadState` is in-memory (D6: rebuildable
@@ -825,6 +870,68 @@ async fn on_invite(
     }
 }
 
+/// Membership changes in rooms the daemon is already **joined** to (#201).
+///
+/// `on_invite` above handles the *stripped* member events that arrive with an
+/// invite; this is the other half, which had no handler at all until now: joins
+/// and leaves in a room the daemon is in. Its only job is to record whether the
+/// daemon has just become the room's last joined member, stamped with the
+/// *event's* own `origin_server_ts` rather than the time this handler ran, so
+/// the grace period is measured from when the room actually emptied.
+///
+/// Acting on that record is `leave::sweep_alone_rooms`'s job, on a timer — a
+/// leave fired straight from here could not tell "they are gone" from "they are
+/// coming right back", which is exactly what the grace period exists to
+/// distinguish. With `leave_when_alone` off (the default) the context is `None`
+/// and this returns immediately after the liveness bookkeeping.
+async fn on_member_change(
+    event: OriginalSyncRoomMemberEvent,
+    room: Room,
+    client: Client,
+    Ctx(alone_watch): Ctx<AloneWatchHandle>,
+    Ctx(registry): Ctx<Arc<Registry>>,
+) {
+    // #85: counts as liveness too — see `on_message`'s doc comment.
+    registry.record_event_received();
+    let Some(watch) = alone_watch.as_ref() else {
+        return;
+    };
+    if room.state() != RoomState::Joined {
+        // Includes the daemon's own leave (automatic or via the `leave` op):
+        // stop tracking a room it is no longer in, so the watch cannot
+        // accumulate entries for rooms the sweep will never visit again.
+        watch.clear(room.room_id().as_str());
+        return;
+    }
+    let Some(own_user) = client.user_id() else {
+        return;
+    };
+    let room_id = room.room_id().to_string();
+    let alone = match leave::daemon_is_alone(&room, own_user).await {
+        Ok(alone) => alone,
+        Err(err) => {
+            eprintln!("safehoused: alone-check for {room_id} skipped: {err:#}");
+            return;
+        }
+    };
+    let was_tracked = watch.alone_since(&room_id).is_some();
+    let observation = alone.then(|| leave::systime_from_ms(event.origin_server_ts));
+    let since = watch.observe(&room_id, observation);
+    match (since, was_tracked) {
+        // Newly alone: say so now, with the deadline, rather than only
+        // reporting the leave ten minutes later.
+        (Some(since), false) => println!(
+            "safehoused: now the only member of {room_id} (alone since {}) — leaving in {:?} \
+             unless someone rejoins",
+            leave::rfc3339_utc(since),
+            watch.grace()
+        ),
+        // Someone came back inside the window; the clock is reset.
+        (None, true) => println!("safehoused: no longer alone in {room_id} — not leaving"),
+        _ => {}
+    }
+}
+
 // The arity is matrix-sdk's, not ours: every parameter is an extractor the
 // SDK fills in (the event, the room, the client, the raw JSON, and one `Ctx`
 // per registered context value). Collapsing the `Ctx`es into one struct would
@@ -1271,6 +1378,18 @@ mod config_tests {
         assert!(config.unknown_persona_ack);
         let config: Config = toml::from_str(&config_toml("unknown_persona_ack = false\n")).unwrap();
         assert!(!config.unknown_persona_ack);
+    }
+
+    #[test]
+    fn leave_when_alone_defaults_off_and_can_be_turned_on() {
+        // #201: the load-bearing default. Every config written before this key
+        // existed must keep the daemon in a room everyone else has left — the
+        // automatic leave is opt-in, never a silent behavior change on
+        // upgrade.
+        let config: Config = toml::from_str(&config_toml("")).unwrap();
+        assert!(!config.leave_when_alone);
+        let config: Config = toml::from_str(&config_toml("leave_when_alone = true\n")).unwrap();
+        assert!(config.leave_when_alone);
     }
 
     #[test]
