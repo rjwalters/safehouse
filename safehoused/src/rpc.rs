@@ -1025,12 +1025,18 @@ fn parse_send_image(req: &Value) -> Result<SendImage> {
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty())
         .map(str::to_string);
-    let to = match req.get("to").and_then(Value::as_str) {
-        Some(t) if t == "*" || t.starts_with('@') || envelope::valid_persona(t) => {
-            Some(t.to_string())
+    // A non-string `to` is refused, not ignored; and an @user can't carry a
+    // control character, which would forge a second header line in `plain`.
+    let to = match req.get("to") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t))
+            if t == "*"
+                || envelope::valid_persona(t)
+                || (t.starts_with('@') && t.len() <= 255 && !t.chars().any(char::is_control)) =>
+        {
+            Some(t.clone())
         }
-        Some(t) => anyhow::bail!("to {t:?}: a persona, `*` or an @user:server"),
-        None => None,
+        Some(t) => anyhow::bail!("to {t}: a persona, `*` or an @user:server"),
     };
     let dim = |k: &str| -> Result<Option<u32>> {
         match req.get(k) {
@@ -2605,6 +2611,18 @@ mod tests {
             (
                 json!({"image_base64": b, "content_type": "image/png", "reply_to": "nope"}),
                 "reply_to",
+            ),
+            (
+                json!({"image_base64": b, "content_type": "image/png", "to": "Not A Persona"}),
+                "to",
+            ),
+            (
+                json!({"image_base64": b, "content_type": "image/png", "to": 7}),
+                "to",
+            ),
+            (
+                json!({"image_base64": b, "content_type": "image/png", "to": "@a:x\nevil → everyone"}),
+                "to",
             ),
         ] {
             let err = format!("{:#}", super::parse_send_image(&req).unwrap_err());
