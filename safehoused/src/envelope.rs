@@ -376,6 +376,15 @@ pub fn render(env: &Envelope) -> (String, String) {
 /// body loses every line break and shows `**bold**` literally. Raw HTML in the
 /// body is escaped rather than passed through. A body can carry text an agent
 /// read from anywhere, so it must never inject markup into the room.
+///
+/// Markdown links and images are **not** passed through unconditionally
+/// (#212): `[a](javascript:alert(1))` or `![](https://tracker.example/p.gif)`
+/// would otherwise become a live `<a href="javascript:...">` / `<img src=…>`
+/// built from a URL that can carry anything an agent read from anywhere.
+/// Matrix clients are expected to sanitize `formatted_body` against an
+/// allowed-scheme list, but the daemon must not depend on every client doing
+/// that — [`sanitize_link_events`] applies the same allowlist here, at the
+/// only place that renders.
 fn markdown_html(body: &str) -> String {
     use pulldown_cmark::{html, Event, Options, Parser};
     let parser = Parser::new_ext(body, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES).map(
@@ -384,9 +393,160 @@ fn markdown_html(body: &str) -> String {
             other => other,
         },
     );
+    let events = sanitize_link_events(parser.collect());
     let mut out = String::new();
-    html::push_html(&mut out, parser);
+    html::push_html(&mut out, events.into_iter());
     out.trim_end().to_owned()
+}
+
+/// The URL schemes a rendered `<a href>` / image-turned-link may carry
+/// (case-insensitive). Deny-by-default: anything not on this list is dropped
+/// to plain text by [`sanitize_link_events`] rather than guessed at — the
+/// safe failure mode for untrusted, agent-sourced URLs.
+///
+/// `matrix` covers the `matrix:` URI scheme (MSC2312); ordinary
+/// `https://matrix.to/#/<mxid>` pills are already covered by `https` and need
+/// no special case.
+const ALLOWED_URL_SCHEMES: [&str; 4] = ["http", "https", "mailto", "matrix"];
+
+/// Extract the URI scheme from `url`, lowercased, or `None` if it has no
+/// syntactically valid scheme (relative URL, protocol-relative `//host`,
+/// opaque text with no leading `ALPHA (ALPHA / DIGIT / "+" / "-" / ".")* ":"`
+/// prefix per RFC 3986 §3.1).
+///
+/// Mirrors the WHATWG URL parser's leniency deliberately: it strips ASCII
+/// tab/newline from *anywhere* in the string and trims leading/trailing C0
+/// controls and space before looking for the scheme, so a trick like
+/// `"java\tscript:alert(1)"` or `"\u{0}javascript:alert(1)"` — built to dodge
+/// a naive `url.starts_with("javascript:")` check — is still recognized for
+/// what it is. A scheme found this way is still just text handed to
+/// [`scheme_allowed`]; nothing here rewrites or re-encodes the URL itself.
+fn url_scheme(url: &str) -> Option<String> {
+    let cleaned: String = url
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c.is_ascii_control() || c == ' ');
+    let colon = trimmed.find(':')?;
+    let scheme = &trimmed[..colon];
+    let mut chars = scheme.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+        return None;
+    }
+    Some(scheme.to_ascii_lowercase())
+}
+
+/// Whether `url` may be rendered as a live link/image source, per
+/// [`ALLOWED_URL_SCHEMES`].
+fn scheme_allowed(url: &str) -> bool {
+    url_scheme(url).is_some_and(|scheme| ALLOWED_URL_SCHEMES.contains(&scheme.as_str()))
+}
+
+/// What to do with a `Start(Tag::Link)` / `Start(Tag::Image)` once its URL has
+/// been judged, carried forward so the matching `End` event is handled the
+/// same way.
+enum LinkDecision {
+    /// Scheme allowed: pass the link through unchanged.
+    Keep,
+    /// Scheme not allowed: drop the wrapping tag; inner content (link text /
+    /// image alt text) still passes through as plain inline text.
+    Drop,
+    /// An `![alt](url)` whose scheme *is* allowed: rendered as `<a
+    /// href="url">alt</a>` rather than `<img>` (#212's "turn image tags into
+    /// a link, or into their alt text").
+    ImageToLink,
+}
+
+/// Rewrite a Markdown event stream so every `Tag::Link` / `Tag::Image` only
+/// becomes live markup when its destination URL's scheme is on
+/// [`ALLOWED_URL_SCHEMES`] — otherwise the tag is dropped and its inner
+/// content (link text, or an image's alt text) passes through as plain text.
+///
+/// An email autolink (`<user@example.com>`, `LinkType::Email`) is always
+/// kept: pulldown-cmark's own grammar already restricts its `dest_url` to a
+/// bare address (no scheme prefix at all — it's `html::push_html` that
+/// prepends `mailto:` at render time, see its `Tag::Link` match arm), so
+/// there is no attacker-controlled scheme to judge.
+///
+/// `Start`/`End` pairs are balanced per pulldown-cmark's grammar (a proper
+/// tree), so tracking only the `Link`/`Image` opens on a stack — ignoring
+/// every other tag type in between — still pairs each `End` with the correct
+/// `Start`, even when an image appears inside a link's label.
+fn sanitize_link_events(events: Vec<pulldown_cmark::Event<'_>>) -> Vec<pulldown_cmark::Event<'_>> {
+    use pulldown_cmark::{Event, LinkType, Tag, TagEnd};
+
+    let mut stack: Vec<LinkDecision> = Vec::new();
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        match event {
+            Event::Start(Tag::Link {
+                link_type: LinkType::Email,
+                dest_url,
+                title,
+                id,
+            }) => {
+                stack.push(LinkDecision::Keep);
+                out.push(Event::Start(Tag::Link {
+                    link_type: LinkType::Email,
+                    dest_url,
+                    title,
+                    id,
+                }));
+            }
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => {
+                if scheme_allowed(&dest_url) {
+                    stack.push(LinkDecision::Keep);
+                    out.push(Event::Start(Tag::Link {
+                        link_type,
+                        dest_url,
+                        title,
+                        id,
+                    }));
+                } else {
+                    stack.push(LinkDecision::Drop);
+                }
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some(LinkDecision::Keep) = stack.pop() {
+                    out.push(Event::End(TagEnd::Link));
+                }
+            }
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) => {
+                if scheme_allowed(&dest_url) {
+                    stack.push(LinkDecision::ImageToLink);
+                    out.push(Event::Start(Tag::Link {
+                        link_type,
+                        dest_url,
+                        title,
+                        id,
+                    }));
+                } else {
+                    stack.push(LinkDecision::Drop);
+                }
+            }
+            Event::End(TagEnd::Image) => {
+                if let Some(LinkDecision::ImageToLink) = stack.pop() {
+                    out.push(Event::End(TagEnd::Link));
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// D4 attribution for `send_image`: the image event carries no envelope, so
@@ -911,6 +1071,130 @@ mod tests {
         assert!(!html.contains("<script>"), "{html}");
         assert!(!html.contains("<a href"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    // ---- #212 — Markdown link/image URL-scheme allowlist ------------------
+
+    #[test]
+    fn render_strips_javascript_link_to_text() {
+        let body = "[a](javascript:alert(1))";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(!html.contains("<a "), "{html}");
+        assert!(!html.contains("javascript:"), "{html}");
+        assert!(html.contains(">a<") || html.contains("<p>a</p>"), "{html}");
+    }
+
+    #[test]
+    fn render_strips_image_tracker_to_alt_text() {
+        let body = "![](https://tracker.example/p.gif)";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(!html.contains("<img"), "{html}");
+    }
+
+    #[test]
+    fn render_image_with_allowed_scheme_becomes_link_not_img() {
+        let body = "![a cat](https://example.com/cat.png)";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(!html.contains("<img"), "{html}");
+        assert!(
+            html.contains("<a href=\"https://example.com/cat.png\">a cat</a>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn render_image_with_disallowed_scheme_becomes_alt_text() {
+        let body = "![tracked](javascript:alert(1))";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(!html.contains("<img"), "{html}");
+        assert!(!html.contains("<a "), "{html}");
+        assert!(!html.contains("javascript:"), "{html}");
+        assert!(html.contains("tracked"), "{html}");
+    }
+
+    #[test]
+    fn render_keeps_https_http_mailto_links() {
+        for (body, want_href) in [
+            (
+                "[x](https://example.com/a)",
+                "<a href=\"https://example.com/a\">x</a>",
+            ),
+            (
+                "[x](http://example.com/a)",
+                "<a href=\"http://example.com/a\">x</a>",
+            ),
+            (
+                "[x](mailto:a@example.com)",
+                "<a href=\"mailto:a@example.com\">x</a>",
+            ),
+        ] {
+            let (_, html) = render(&env("bot", "@a:x", "chat", body));
+            assert!(html.contains(want_href), "{body} -> {html}");
+        }
+    }
+
+    #[test]
+    fn render_keeps_matrix_scheme_link() {
+        let body = "[room](matrix:r/room:example.org)";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(
+            html.contains("<a href=\"matrix:r/room:example.org\">room</a>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn render_keeps_email_autolink() {
+        let body = "<a@example.com>";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(html.contains("<a href=\"mailto:a@example.com\">"), "{html}");
+    }
+
+    #[test]
+    fn render_strips_protocol_relative_link() {
+        // No scheme at all (protocol-relative) — deny by default, same as any
+        // other unrecognized/missing scheme.
+        let body = "[x](//evil.example/a)";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(!html.contains("<a "), "{html}");
+        assert!(html.contains('x'), "{html}");
+    }
+
+    #[test]
+    fn render_strips_link_with_control_char_obfuscated_scheme() {
+        // "ja\tvascript:" with an embedded tab is still recognized as the
+        // `javascript` scheme and stripped, mirroring browser URL-parser
+        // leniency.
+        let body = "[a](ja\tvascript:alert(1))";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(!html.contains("<a "), "{html}");
+    }
+
+    #[test]
+    fn render_scheme_match_is_case_insensitive() {
+        let body = "[a](JavaScript:alert(1))";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(!html.contains("<a "), "{html}");
+
+        let body_ok = "[a](HTTPS://example.com)";
+        let (_, html_ok) = render(&env("bot", "@a:x", "chat", body_ok));
+        assert!(
+            html_ok.contains("<a href=\"HTTPS://example.com\">a</a>"),
+            "{html_ok}"
+        );
+    }
+
+    #[test]
+    fn sanitize_links_in_send_image_caption() {
+        // #212: send_image captions route through the same `render` path —
+        // a malicious caption must be sanitized exactly like a chat body.
+        let (_, html) = image_caption(
+            "writer_agent",
+            Some("@alice:x"),
+            Some("see [this](javascript:alert(1))"),
+        );
+        assert!(!html.contains("<a "), "{html}");
+        assert!(!html.contains("javascript:"), "{html}");
     }
 
     #[test]
