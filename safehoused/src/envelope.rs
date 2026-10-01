@@ -367,9 +367,26 @@ pub fn render(env: &Envelope) -> (String, String) {
         html_escape(&from),
         html_escape(&to),
         html_suffix,
-        html_escape(&env.body)
+        markdown_html(&env.body)
     );
     (plain, html)
+}
+
+/// The body as HTML: agents (and people) write Markdown, and a plain-escaped
+/// body loses every line break and shows `**bold**` literally. Raw HTML in the
+/// body is escaped rather than passed through. A body can carry text an agent
+/// read from anywhere, so it must never inject markup into the room.
+fn markdown_html(body: &str) -> String {
+    use pulldown_cmark::{html, Event, Options, Parser};
+    let parser = Parser::new_ext(body, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES).map(
+        |event| match event {
+            Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
+            other => other,
+        },
+    );
+    let mut out = String::new();
+    html::push_html(&mut out, parser);
+    out.trim_end().to_owned()
 }
 
 /// Full `m.room.message` content carrying the envelope. `relates_to`, when
@@ -745,7 +762,7 @@ mod tests {
     fn render_chat_omits_type_suffix() {
         let (plain, html) = render(&env("writer_agent", "research_agent", "chat", "hi"));
         assert_eq!(plain, "writer-agent → research-agent\nhi");
-        assert_eq!(html, "<b>writer-agent → research-agent</b><br/>hi");
+        assert_eq!(html, "<b>writer-agent → research-agent</b><br/><p>hi</p>");
     }
 
     #[test]
@@ -754,8 +771,37 @@ mod tests {
         assert_eq!(plain, "writer-agent → research-agent · handoff\ngo");
         assert_eq!(
             html,
-            "<b>writer-agent → research-agent</b> · <i>handoff</i><br/>go"
+            "<b>writer-agent → research-agent</b> · <i>handoff</i><br/><p>go</p>"
         );
+    }
+
+    #[test]
+    fn render_body_markdown_to_html() {
+        // Agents answer in Markdown; escaping it flat lost every line break
+        // and showed **bold** literally in Element.
+        let body = "Hi **there**.\n\n- one\n- two\n\nSee `safehoused`.";
+        let (plain, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(
+            plain.ends_with(body),
+            "plain body stays the Markdown source"
+        );
+        assert!(html.contains("<strong>there</strong>"), "{html}");
+        assert!(
+            html.contains("<ul>\n<li>one</li>\n<li>two</li>\n</ul>"),
+            "{html}"
+        );
+        assert!(html.contains("<code>safehoused</code>"), "{html}");
+    }
+
+    #[test]
+    fn render_never_passes_raw_html_through() {
+        // A body can carry text an agent read from anywhere: markup in it must
+        // reach the room escaped, never live.
+        let body = "<script>alert(1)</script> and <a href=\"https://evil\">x</a>";
+        let (_, html) = render(&env("bot", "@a:x", "chat", body));
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(!html.contains("<a href"), "{html}");
+        assert!(html.contains("&lt;script&gt;"), "{html}");
     }
 
     #[test]
