@@ -1735,14 +1735,20 @@ mod tests {
     fn image_caption_attributes_the_persona() {
         let (plain, html) = image_caption("writer_agent", Some("@alice:x"), Some("a cat"));
         assert_eq!(plain, "writer-agent → @alice:x · image\na cat");
-        assert_eq!(
-            html,
-            "<b>writer-agent → @alice:x</b> · <i>image</i><br/>a cat"
+        // The caption's HTML is whatever `render` makes of a body (escaped
+        // text today, Markdown once #199 lands): assert the header, not that.
+        assert!(
+            html.starts_with("<b>writer-agent → @alice:x</b> · <i>image</i><br/>")
+                && html.contains("a cat"),
+            "{html}"
         );
         let (plain, html) = image_caption("writer_agent", None, None);
         assert_eq!(plain, "writer-agent → everyone · image");
         assert_eq!(html, "<b>writer-agent → everyone</b> · <i>image</i>");
         let (_, html) = image_caption("w", None, Some("<script>"));
-        assert!(html.ends_with("&lt;script&gt;"), "{html}");
+        assert!(
+            html.contains("&lt;script&gt;") && !html.contains("<script>"),
+            "{html}"
+        );
     }
 }
