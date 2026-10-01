@@ -241,11 +241,23 @@ recovery_passphrase = "change-me-as-well"
 # Wall-clock cap on the transcriber subprocess (it is killed on expiry), on
 # the media download, and on how long a queued voice note waits for the
 # single-flight slot. Defaults to 120.
+#
+# NOTE: transcription is awaited inline by the sync loop, so while a voice
+# note is being transcribed the daemon processes NO event in ANY room. These
+# are three sequential waits, so the worst case is up to ~3x this value
+# (6 minutes at the default) of daemon-wide stall per voice note. Raise it
+# with that cost in mind. (The single-flight slot rarely contends in
+# production, as the sync loop already serializes handlers.)
 # timeout_seconds = 120
 #
 # Size cap, checked against the event's advertised `info.size` BEFORE
-# downloading and against the real byte count after (the advertised size is
-# sender-controlled). Defaults to 26214400 (25 MiB).
+# downloading and against the real byte count after. The advertised size is
+# sender-controlled: a sender can omit or understate it and bypass the
+# pre-download check entirely, in which case the whole attachment is buffered
+# in memory before the post-download check can reject it (matrix-sdk has no
+# streaming/size-capped download). The real memory bound then is the
+# homeserver's own media-upload limit, so this is NOT a hard memory ceiling.
+# Defaults to 26214400 (25 MiB).
 # max_bytes = 26214400
 #
 # Also post the transcript back into the room as a threaded `m.notice` under
