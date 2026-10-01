@@ -2911,8 +2911,10 @@ name = "safehoused"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "futures-util",
  "matrix-sdk",
+ "mime",
  "reqwest",
  "rusqlite",
  "serde",

@@ -17,17 +17,22 @@ use std::{
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use matrix_sdk::{
+    attachment::{AttachmentConfig, AttachmentInfo, BaseImageInfo},
     deserialized_responses::SyncOrStrippedState,
-    room::{MessagesOptions, ParentSpace},
+    room::{
+        reply::{EnforceThread, Reply},
+        MessagesOptions, ParentSpace,
+    },
     ruma::{
         api::client::room::create_room::v3::{CreationContent, Request as CreateRoomRequest},
+        events::room::message::{AddMentions, TextMessageEventContent},
         events::{
             space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
             SyncStateEvent,
         },
         room::RoomType,
         serde::Raw,
-        OwnedServerName, OwnedUserId, RoomId,
+        OwnedServerName, OwnedUserId, RoomId, UInt,
     },
     Client, Room, RoomState,
 };
@@ -518,6 +523,36 @@ async fn handle_op(
                 degraded_from.as_deref(),
             ))
         }
+        "send_image" => {
+            let img = parse_send_image(req)?;
+            let room = resolve_room(client, req.get("room").and_then(Value::as_str))?;
+            let mut config = AttachmentConfig::new().info(AttachmentInfo::Image(BaseImageInfo {
+                width: img.width.map(UInt::from),
+                height: img.height.map(UInt::from),
+                size: UInt::new(img.data.len() as u64),
+                ..Default::default()
+            }));
+            if let Some(caption) = img.caption {
+                config = config.caption(Some(TextMessageEventContent::plain(caption)));
+            }
+            if let Some(event_id) = img.reply_to {
+                // Follow the original's thread if it had one, as a text reply would.
+                config = config.reply(Some(Reply {
+                    event_id,
+                    enforce_thread: EnforceThread::MaybeThreaded,
+                    add_mentions: AddMentions::No,
+                }));
+            }
+            let response = room
+                .send_attachment(img.filename, &img.mime, img.data, config)
+                .await
+                .context("sending image to room")?;
+            Ok(json!({
+                "ok": true,
+                "event_id": response.event_id.to_string(),
+                "room_id": room.room_id().as_str(),
+            }))
+        }
         "create_room" => {
             let name = req
                 .get("name")
@@ -930,6 +965,98 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<OutboundSend> {
 /// reply shape it has always had (purely additive `type`), while a degraded one
 /// is detectable with a single key lookup instead of by reading the daemon's
 /// stderr on another host (#95).
+/// Largest image `send_image` accepts, decoded. matrix.org's upload limit is
+/// larger, but an agent posting a 50 MB "image" is a bug, not a picture.
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// The formats every Matrix client renders inline. Anything else (SVG
+/// especially, which is a document that can carry script) is refused.
+const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+#[derive(Debug)]
+struct SendImage {
+    data: Vec<u8>,
+    mime: mime::Mime,
+    filename: String,
+    caption: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    reply_to: Option<matrix_sdk::ruma::OwnedEventId>,
+}
+
+/// `{"op":"send_image","image_base64":..., "content_type":"image/png",
+/// "filename"?, "caption"?, "width"?, "height"?, "reply_to"?: "$event", "room"?}`.
+/// The bytes travel inline, not as a path, so the daemon never opens a file an
+/// agent names.
+fn parse_send_image(req: &Value) -> Result<SendImage> {
+    use base64::Engine as _;
+    let b64 = req
+        .get("image_base64")
+        .and_then(Value::as_str)
+        .context("send_image requires `image_base64`")?;
+    // Base64 is 4/3 the size: refuse an oversized payload before decoding it.
+    anyhow::ensure!(
+        b64.len() <= MAX_IMAGE_BYTES / 3 * 4 + 4,
+        "image larger than {} MiB",
+        MAX_IMAGE_BYTES / (1024 * 1024)
+    );
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .context("`image_base64` is not valid base64")?;
+    anyhow::ensure!(!data.is_empty(), "image is empty");
+    anyhow::ensure!(
+        data.len() <= MAX_IMAGE_BYTES,
+        "image larger than {} MiB",
+        MAX_IMAGE_BYTES / (1024 * 1024)
+    );
+    let content_type = req
+        .get("content_type")
+        .and_then(Value::as_str)
+        .context("send_image requires `content_type`")?;
+    anyhow::ensure!(
+        IMAGE_TYPES.contains(&content_type),
+        "content_type {content_type:?} not one of {IMAGE_TYPES:?}"
+    );
+    let mime: mime::Mime = content_type.parse().context("content_type")?;
+    let filename = match req.get("filename").and_then(Value::as_str) {
+        Some(f) if !f.is_empty() && f.len() <= 255 && !f.contains(['/', '\\']) => f.to_string(),
+        Some(f) => anyhow::bail!("filename {f:?}: 1-255 characters, no path separators"),
+        None => format!("image.{}", mime.subtype()),
+    };
+    let caption = req
+        .get("caption")
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    let dim = |k: &str| -> Result<Option<u32>> {
+        match req.get(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .map(Some)
+                .with_context(|| format!("`{k}` must be a positive integer")),
+        }
+    };
+    let reply_to = match req.get("reply_to").and_then(Value::as_str) {
+        Some(e) => Some(
+            matrix_sdk::ruma::OwnedEventId::try_from(e)
+                .map_err(|_| anyhow::anyhow!("reply_to {e:?} is not an event id"))?,
+        ),
+        None => None,
+    };
+    Ok(SendImage {
+        data,
+        mime,
+        filename,
+        caption,
+        width: dim("width")?,
+        height: dim("height")?,
+        reply_to,
+    })
+}
+
 fn send_reply(event_id: &str, room_id: &str, kind: &str, degraded_from: Option<&str>) -> Value {
     let mut reply = json!({
         "ok": true,
@@ -2382,5 +2509,90 @@ mod tests {
         assert_eq!(reply["messages"].as_array().unwrap().len(), 10);
         assert_eq!(reply["more_available"], false);
         assert_eq!(reply["remaining"], 0);
+    }
+
+    // ---- send_image payload parsing ----
+
+    fn png_b64() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfake")
+    }
+
+    #[test]
+    fn send_image_parses_a_full_request() {
+        let img = super::parse_send_image(&json!({
+            "image_base64": png_b64(), "content_type": "image/png", "filename": "cat.png",
+            "caption": "a cat", "width": 1024, "height": 768, "reply_to": "$abc:example.org",
+        }))
+        .unwrap();
+        assert_eq!(img.data, b"\x89PNG\r\n\x1a\nfake");
+        assert_eq!(img.mime.essence_str(), "image/png");
+        assert_eq!(img.filename, "cat.png");
+        assert_eq!(img.caption.as_deref(), Some("a cat"));
+        assert_eq!((img.width, img.height), (Some(1024), Some(768)));
+        assert_eq!(img.reply_to.unwrap().as_str(), "$abc:example.org");
+    }
+
+    #[test]
+    fn send_image_defaults_the_filename_from_the_type() {
+        let img = super::parse_send_image(
+            &json!({"image_base64": png_b64(), "content_type": "image/webp"}),
+        )
+        .unwrap();
+        assert_eq!(img.filename, "image.webp");
+        assert!(img.caption.is_none() && img.reply_to.is_none() && img.width.is_none());
+    }
+
+    #[test]
+    fn send_image_refuses_bad_payloads() {
+        let b = png_b64();
+        for (req, why) in [
+            (json!({"content_type": "image/png"}), "image_base64"),
+            (
+                json!({"image_base64": "!!!", "content_type": "image/png"}),
+                "base64",
+            ),
+            (
+                json!({"image_base64": "", "content_type": "image/png"}),
+                "empty",
+            ),
+            (
+                json!({"image_base64": b, "content_type": "image/svg+xml"}),
+                "content_type",
+            ),
+            (
+                json!({"image_base64": b, "content_type": "text/html"}),
+                "content_type",
+            ),
+            (json!({"image_base64": b}), "content_type"),
+            (
+                json!({"image_base64": b, "content_type": "image/png", "filename": "../x.png"}),
+                "filename",
+            ),
+            (
+                json!({"image_base64": b, "content_type": "image/png", "width": -1}),
+                "width",
+            ),
+            (
+                json!({"image_base64": b, "content_type": "image/png", "height": "9"}),
+                "height",
+            ),
+            (
+                json!({"image_base64": b, "content_type": "image/png", "reply_to": "nope"}),
+                "reply_to",
+            ),
+        ] {
+            let err = format!("{:#}", super::parse_send_image(&req).unwrap_err());
+            assert!(err.contains(why), "{req}: {err}");
+        }
+    }
+
+    #[test]
+    fn send_image_refuses_an_oversized_payload_before_decoding() {
+        let huge = "A".repeat(super::MAX_IMAGE_BYTES / 3 * 4 + 8);
+        let err =
+            super::parse_send_image(&json!({"image_base64": huge, "content_type": "image/png"}))
+                .unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
     }
 }
