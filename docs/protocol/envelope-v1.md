@@ -39,7 +39,7 @@ ignore the prose. This is the same idiom Matrix bridges use.
   // Human-facing. Element renders this. MUST be legible on its own.
   "body": "writer-agent → research-agent · handoff\nNeed the source list confirmed before I can close chapter 3.",
   "format": "org.matrix.custom.html",
-  "formatted_body": "<b>writer-agent → research-agent</b> · <i>handoff</i><br/>Need the source list confirmed before I can close chapter 3.",
+  "formatted_body": "<b>writer-agent → research-agent</b> · <i>handoff</i><br/><p>Need the source list confirmed before I can close chapter 3.</p>",
 
   // Machine-facing.
   "org.safehouse.envelope": {
