@@ -532,9 +532,11 @@ async fn handle_op(
                 size: UInt::new(img.data.len() as u64),
                 ..Default::default()
             }));
-            if let Some(caption) = img.caption {
-                config = config.caption(Some(TextMessageEventContent::plain(caption)));
-            }
+            // D4: one Matrix account speaks for every persona, so the caption
+            // always names the sender, as send's header does over a body.
+            let (plain, html) =
+                envelope::image_caption(persona, img.to.as_deref(), img.caption.as_deref());
+            config = config.caption(Some(TextMessageEventContent::html(plain, html)));
             if let Some(event_id) = img.reply_to {
                 // Follow the original's thread if it had one, as a text reply would.
                 config = config.reply(Some(Reply {
@@ -957,14 +959,6 @@ fn build_send_envelope(persona: &str, req: &Value) -> Result<OutboundSend> {
     })
 }
 
-/// The `"send"` success reply.
-///
-/// `type` is always present — it is what actually went on the wire, which is
-/// not necessarily what the caller asked for (§9 degrade). `degraded_from`
-/// appears **only** when the two differ, so an honored send keeps exactly the
-/// reply shape it has always had (purely additive `type`), while a degraded one
-/// is detectable with a single key lookup instead of by reading the daemon's
-/// stderr on another host (#95).
 /// Largest image `send_image` accepts, decoded. matrix.org's upload limit is
 /// larger, but an agent posting a 50 MB "image" is a bug, not a picture.
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
@@ -979,13 +973,16 @@ struct SendImage {
     mime: mime::Mime,
     filename: String,
     caption: Option<String>,
+    to: Option<String>,
     width: Option<u32>,
     height: Option<u32>,
     reply_to: Option<matrix_sdk::ruma::OwnedEventId>,
 }
 
 /// `{"op":"send_image","image_base64":..., "content_type":"image/png",
-/// "filename"?, "caption"?, "width"?, "height"?, "reply_to"?: "$event", "room"?}`.
+/// "filename"?, "caption"?, "to"?, "width"?, "height"?, "reply_to"?: "$event", "room"?}`.
+/// `to` (a persona, `*` or an `@user:server`) only shapes the attribution
+/// header over the caption; it addresses nothing.
 /// The bytes travel inline, not as a path, so the daemon never opens a file an
 /// agent names.
 fn parse_send_image(req: &Value) -> Result<SendImage> {
@@ -1028,6 +1025,13 @@ fn parse_send_image(req: &Value) -> Result<SendImage> {
         .and_then(Value::as_str)
         .filter(|c| !c.is_empty())
         .map(str::to_string);
+    let to = match req.get("to").and_then(Value::as_str) {
+        Some(t) if t == "*" || t.starts_with('@') || envelope::valid_persona(t) => {
+            Some(t.to_string())
+        }
+        Some(t) => anyhow::bail!("to {t:?}: a persona, `*` or an @user:server"),
+        None => None,
+    };
     let dim = |k: &str| -> Result<Option<u32>> {
         match req.get(k) {
             None | Some(Value::Null) => Ok(None),
@@ -1051,12 +1055,21 @@ fn parse_send_image(req: &Value) -> Result<SendImage> {
         mime,
         filename,
         caption,
+        to,
         width: dim("width")?,
         height: dim("height")?,
         reply_to,
     })
 }
 
+/// The `"send"` success reply.
+///
+/// `type` is always present — it is what actually went on the wire, which is
+/// not necessarily what the caller asked for (§9 degrade). `degraded_from`
+/// appears **only** when the two differ, so an honored send keeps exactly the
+/// reply shape it has always had (purely additive `type`), while a degraded one
+/// is detectable with a single key lookup instead of by reading the daemon's
+/// stderr on another host (#95).
 fn send_reply(event_id: &str, room_id: &str, kind: &str, degraded_from: Option<&str>) -> Value {
     let mut reply = json!({
         "ok": true,
@@ -2540,7 +2553,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(img.filename, "image.webp");
-        assert!(img.caption.is_none() && img.reply_to.is_none() && img.width.is_none());
+        assert!(
+            img.caption.is_none()
+                && img.reply_to.is_none()
+                && img.width.is_none()
+                && img.to.is_none()
+        );
+        for to in ["research_agent", "*", "@alice:example.org"] {
+            let img = super::parse_send_image(
+                &json!({"image_base64": png_b64(), "content_type": "image/png", "to": to}),
+            )
+            .unwrap();
+            assert_eq!(img.to.as_deref(), Some(to));
+        }
     }
 
     #[test]

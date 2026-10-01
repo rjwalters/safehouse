@@ -372,6 +372,33 @@ pub fn render(env: &Envelope) -> (String, String) {
     (plain, html)
 }
 
+/// D4 attribution for `send_image`: the image event carries no envelope, so
+/// its caption carries the same `<from> → <to> · image` header [`render`]
+/// puts over a text body, letting a human or agent in the room tell which
+/// persona posted it. Returns (plain, html).
+pub fn image_caption(from: &str, to: Option<&str>, caption: Option<&str>) -> (String, String) {
+    let env = Envelope {
+        v: 1,
+        from: from.to_owned(),
+        to: to.unwrap_or("*").to_owned(),
+        kind: "image".to_owned(),
+        task_id: None,
+        body: caption.unwrap_or("").to_owned(),
+        wake: None,
+        meta: None,
+    };
+    let (plain, html) = render(&env);
+    if caption.is_some() {
+        (plain, html)
+    } else {
+        // No caption: the header alone, without render's trailing newline/break.
+        (
+            plain.trim_end_matches('\n').to_owned(),
+            html.trim_end_matches("<br/>").to_owned(),
+        )
+    }
+}
+
 /// Full `m.room.message` content carrying the envelope. `relates_to`, when
 /// present, is native Matrix `m.thread` threading (§2) — see
 /// [`thread_relation`]. Callers that never thread (daemon-generated notices)
@@ -1702,5 +1729,20 @@ mod tests {
         assert!(!is_rfc3339("2026/07/29T10:00:00Z"));
         assert!(!is_rfc3339("2026-07-29T10:00:00.Z")); // dot, no digits
         assert!(!is_rfc3339("last tuesday"));
+    }
+
+    #[test]
+    fn image_caption_attributes_the_persona() {
+        let (plain, html) = image_caption("writer_agent", Some("@alice:x"), Some("a cat"));
+        assert_eq!(plain, "writer-agent → @alice:x · image\na cat");
+        assert_eq!(
+            html,
+            "<b>writer-agent → @alice:x</b> · <i>image</i><br/>a cat"
+        );
+        let (plain, html) = image_caption("writer_agent", None, None);
+        assert_eq!(plain, "writer-agent → everyone · image");
+        assert_eq!(html, "<b>writer-agent → everyone</b> · <i>image</i>");
+        let (_, html) = image_caption("w", None, Some("<script>"));
+        assert!(html.ends_with("&lt;script&gt;"), "{html}");
     }
 }
