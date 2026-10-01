@@ -110,7 +110,9 @@ recovery_passphrase = "change-me-as-well"
 # invite the bot, so `invite_allowlist` above stops being optional hardening:
 # the daemon REFUSES TO BOOT unless it is set to a non-empty list. Any other
 # value is a config parse error, not a silent fallback to "sealed".
-# homeserver_mode = "sealed" (envelope-v1 §5.1, issue #195). When a human
+# homeserver_mode = "sealed"
+
+# Visible "unknown persona" ack (envelope-v1 §5.1, issue #195). When a human
 # message starts with @token and token is no local persona, the daemon posts
 # an ack so a typo isn't silently misdelivered. That's right in an agent room
 # and noise in a room where people address each other ("@alice can you look"),
