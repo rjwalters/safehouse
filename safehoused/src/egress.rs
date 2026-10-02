@@ -63,11 +63,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
-use crate::envelope::{validate_completion_meta, Envelope};
+use crate::{
+    config_secrets,
+    envelope::{validate_completion_meta, Envelope},
+};
 
 /// How often the background publisher wakes to flush rows whose delay has
 /// elapsed. The delay itself is per-completion (`delay_seconds`); this is just
@@ -89,7 +92,11 @@ const MAX_PUBLISH_ATTEMPTS: i64 = 5;
 /// The optional egress block on the daemon [`Config`](crate::Config). Absent =
 /// the whole egress subsystem is disabled (zero behavior change). Matches the
 /// repo's flat, explicit-config style (`#[serde(deny_unknown_fields)]`).
-#[derive(Clone, Debug, Deserialize)]
+///
+/// `Debug` is implemented by hand (below) rather than derived: `sink_url`
+/// usually carries an ingest secret in its query string (#215), and a derived
+/// `Debug` would print it verbatim.
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressConfig {
     /// Room-id allowlist — only completions observed in one of these rooms are
@@ -116,8 +123,49 @@ pub struct EgressConfig {
     /// `{"room_id", "event_id", "payload"}` JSON. Takes priority over
     /// `sink_path` when both are configured. Strictly outbound — the daemon
     /// never listens on this or any address (D8).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sink_url: Option<String>,
+    /// A path to a file holding the `sink_url` (#215), as an alternative to the
+    /// literal — the URL usually embeds an ingest secret. Mutually exclusive
+    /// with `sink_url`; read once at boot by [`resolve_sink_url`] (one trailing
+    /// newline stripped, must not be group/world-accessible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink_url_file: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for EgressConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EgressConfig")
+            .field("rooms", &self.rooms)
+            .field("deny_patterns", &self.deny_patterns)
+            .field("delay_seconds", &self.delay_seconds)
+            .field("sink_path", &self.sink_path)
+            .field(
+                "sink_url",
+                &self.sink_url.as_deref().map(config_secrets::redact_url),
+            )
+            .field("sink_url_file", &self.sink_url_file)
+            .finish()
+    }
+}
+
+/// Resolve `sink_url_file` into `sink_url` (#215), once, before boot. Both set
+/// is an error naming the fields (never the value); neither is fine here —
+/// `sink_path` may be the sink, and [`validate_egress_config`] still requires
+/// at least one target. A relative path resolves against `config_dir`.
+pub fn resolve_sink_url(
+    mut cfg: EgressConfig,
+    config_dir: &Path,
+) -> std::result::Result<EgressConfig, String> {
+    let resolved = config_secrets::resolve_secret(
+        "egress.sink_url",
+        cfg.sink_url.as_deref(),
+        cfg.sink_url_file.as_deref(),
+        config_dir,
+    )?;
+    cfg.sink_url = resolved;
+    cfg.sink_url_file = None;
+    Ok(cfg)
 }
 
 /// Boot-time fail-safe guards.
@@ -138,10 +186,16 @@ pub fn validate_egress_config(cfg: &EgressConfig) -> std::result::Result<(), Str
                 .to_owned(),
         );
     }
-    if cfg.sink_path.is_none() && cfg.sink_url.is_none() {
+    if cfg.sink_url.is_some() && cfg.sink_url_file.is_some() {
         return Err(
-            "egress is configured but neither sink_path nor sink_url is set — configure at \
-             least one publish target"
+            "both `egress.sink_url` and `egress.sink_url_file` are set — set exactly one of them"
+                .to_owned(),
+        );
+    }
+    if cfg.sink_path.is_none() && cfg.sink_url.is_none() && cfg.sink_url_file.is_none() {
+        return Err(
+            "egress is configured but neither sink_path nor sink_url (or sink_url_file) is \
+             set — configure at least one publish target"
                 .to_owned(),
         );
     }
@@ -356,6 +410,13 @@ impl Egress {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
 
+        // `resolve_sink_url` turns a `sink_url_file` into `sink_url` before the
+        // daemon gets here; an unresolved one must not silently fall back to
+        // `sink_path`.
+        anyhow::ensure!(
+            config.sink_url_file.is_none(),
+            "egress.sink_url_file was not resolved before opening egress (resolve_sink_url)"
+        );
         let sink = match config.sink_url {
             Some(url) => Sink::Http {
                 url,
@@ -611,7 +672,16 @@ impl Egress {
                     // A transport-level failure (DNS, connection refused,
                     // timeout, TLS handshake failure, ...) is always treated
                     // as transient — the operator's network/sink may recover.
-                    Err(err) => Err(SinkError::Retryable(err.to_string())),
+                    //
+                    // `without_url()`: reqwest's error Display appends
+                    // ` for url (<the full URL>)`, which would write the
+                    // sink's query-string secret into the log (#215). The
+                    // redacted form keeps the host/path for diagnosis.
+                    Err(err) => Err(SinkError::Retryable(format!(
+                        "{} (sink {})",
+                        err.without_url(),
+                        config_secrets::redact_url(url)
+                    ))),
                 }
             }
         }
@@ -733,6 +803,7 @@ mod tests {
             delay_seconds,
             sink_path: Some(sink),
             sink_url: None,
+            sink_url_file: None,
         }
     }
 
@@ -743,6 +814,7 @@ mod tests {
             delay_seconds,
             sink_path: None,
             sink_url: Some(url),
+            sink_url_file: None,
         }
     }
 
@@ -985,8 +1057,28 @@ mod tests {
             delay_seconds: 0,
             sink_path: None,
             sink_url: None,
+            sink_url_file: None,
         };
         assert!(validate_egress_config(&cfg).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_does_not_log_the_sink_url_secret() {
+        // #215: reqwest's error Display appends the full request URL, and the
+        // sink URL usually carries an ingest secret as `?key=`. Point the sink
+        // at a port nothing listens on so the POST fails at the transport.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/ingest?key=transport-secret&x=1");
+        let egress = Egress::open_in_memory(http_config(&["!r:x"], &["nothing"], 0, url)).unwrap();
+        let Err(err) = egress.publish_to_sink("!r:x", "$e", &json!({})).await else {
+            panic!("nothing listens there, the POST must fail");
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains("transport-secret"), "{msg}");
+        assert!(msg.contains("/ingest?key=REDACTED&x=1"), "{msg}");
     }
 
     #[test]

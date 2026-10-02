@@ -12,6 +12,32 @@
 
 # --- Mandatory fields --------------------------------------------------
 
+# Secrets: literal or file reference (issue #215). Each of the three secrets
+# below (password, store_passphrase, recovery_passphrase) — and
+# [egress].sink_url further down — may instead be given as `<name>_file`, a
+# path to a file holding the value, so this config carries no secret literal
+# and can be shared or reviewed:
+#
+#   password_file = "/run/credentials/safehoused/password"
+#
+# Exactly ONE of `<name>` / `<name>_file` must be set: both, or neither, is a
+# boot error naming the field (never the value). The file is read once at
+# boot; one trailing newline (\n or \r\n) is stripped, so `echo secret > file`
+# works; an empty, missing, unreadable, or group/world-accessible file
+# (anything looser than 0600/0400) refuses to boot. A relative path resolves
+# against this config file's directory. This is the form that composes with
+# an age/SOPS-decrypting wrapper or a secret manager without the daemon
+# knowing about either. There is deliberately no `*_env` / `*_command` form:
+# an environment variable in a service unit is readable via `systemctl show`
+# and inherited by every child, so it only moves the plaintext.
+#
+# To view this file safely (e.g. in an agent session), use
+#   safehoused --print-config config.toml
+# which prints the effective config with secrets redacted by key name
+# (including `passphrase`), by value, and inside URLs. A hand-rolled
+# `grep -vE "password|token|secret|key"` does NOT catch `passphrase`, and no
+# key-name filter can catch the secret inside sink_url's query string.
+
 # The homeserver's client-server API base URL. Point this at your own
 # instance — see docs/research/2026-07-26-homeserver.md for the tuwunel
 # setup this project targets.
@@ -22,17 +48,22 @@ homeserver = "https://matrix.example.com"
 # This is a login, not a Matrix user ID: no "@" prefix, no ":server" suffix.
 username = "safehouse-bot"
 password = "change-me"
+# password_file = "/run/credentials/safehoused/password"
 
 # Where the daemon keeps its persistent state: the encrypted sqlite crypto
 # store (state_dir/store) and the session blob (state_dir/session.json).
 # Created on first (cold) start. Must persist across restarts — losing it
 # means the daemon shows up as a brand-new, unverified device next boot.
+# NOTE: session.json holds the device's live Matrix access token in
+# cleartext, so this config is not the only secret on disk — keep state_dir
+# owner-only too.
 state_dir = "/var/lib/safehoused"
 
 # Passphrase used to encrypt the sqlite store at rest. Distinct from
 # recovery_passphrase below: this one only protects the on-disk database
 # file and never leaves the host.
 store_passphrase = "change-me-too"
+# store_passphrase_file = "/run/credentials/safehoused/store_passphrase"
 
 # The ONLY headless way back after losing the crypto store (disk failure,
 # state_dir wiped, etc). This is mandatory config, not optional — the
@@ -44,6 +75,7 @@ store_passphrase = "change-me-too"
 # up as an unverified stranger. Treat it like the recovery phrase for a
 # hardware wallet: write it down somewhere durable, off this host.
 recovery_passphrase = "change-me-as-well"
+# recovery_passphrase_file = "/run/credentials/safehoused/recovery_passphrase"
 
 # --- Optional fields (all have safe defaults) ---------------------------
 
@@ -154,7 +186,7 @@ recovery_passphrase = "change-me-as-well"
 # (safehoused/src/egress.rs::validate_egress_config): if `rooms` is
 # non-empty, `deny_patterns` must also be non-empty (the daemon refuses to
 # publish unredacted content), and at least one of `sink_url` / `sink_path`
-# must be set — otherwise the daemon refuses to start.
+# (or `sink_url_file`) must be set — otherwise the daemon refuses to start.
 #
 # [egress]
 #
@@ -175,8 +207,13 @@ recovery_passphrase = "change-me-as-well"
 # Outbound HTTP sink (#31): every published record is POSTed here as
 # {"room_id", "event_id", "payload"} JSON, with bounded retry. Strictly
 # outbound — the daemon never listens on this or any address (D8). Takes
-# priority over sink_path when both are set.
+# priority over sink_path when both are set. If the URL embeds an ingest
+# secret (e.g. `?key=...`), prefer `sink_url_file` (same rules as the
+# `*_file` references at the top: exactly one of sink_url / sink_url_file).
+# Logs and `--print-config` show this URL with userinfo and secret-looking
+# query parameters redacted.
 # sink_url = "https://feed.example.com/completions"
+# sink_url_file = "/run/credentials/safehoused/sink_url"
 #
 # Local JSON-lines sink file (#30) — kept for backward compatibility with
 # existing configs; a config written from scratch should prefer sink_url.
@@ -309,4 +346,4 @@ recovery_passphrase = "change-me-as-well"
 # entirely") — every config that existed before this field was introduced.
 # scripts/install.sh writes this automatically for every config it
 # generates; hand-written configs may set it explicitly or leave it out.
-# schema_version = 5
+# schema_version = 6
