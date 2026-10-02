@@ -221,6 +221,20 @@ sender (so it reaches no agent mailbox). Design rationale: `design.md` §4.1.3; 
   `systemd --user` on Linux), and prints the loom-daemon handoff block. Pure host orchestration — zero
   Matrix logic; the login/cross-sign/recovery it "does" is just the daemon's `boot`. Bot-account
   creation on the homeserver stays an admin action (non-goal; the script points at the #25 docs).
+- **Config secrets (#215, `safehoused/src/config_secrets.rs`):** a host's `config.toml` holds four
+  cleartext secrets: `password`, `store_passphrase`, `recovery_passphrase`, and the ingest key that
+  rides in `[egress].sink_url`'s query string. Each can instead be a `<name>_file` reference, read
+  once at boot before any homeserver I/O. One trailing newline is stripped, and a file that is
+  missing, empty, or group/world-accessible refuses the boot. Exactly one of each pair must be set.
+  This was schema bump 5 → 6. **Never `cat`/`grep` a config into a transcript**; use
+  `safehoused --print-config` (redacts by key name incl. `passphrase`, by value, and inside URLs;
+  `--no-redact` to opt out). The secret-field list is `SECRET_FIELDS` next to `Config`. A unit test
+  fails if a secret-looking field is added without it, and `Config` deliberately has no `Debug`.
+  Config parse errors no longer echo the offending line, and egress transport errors log the sink
+  URL redacted (reqwest's error text used to carry the full URL). `<state_dir>/session.json` holds
+  the access token in cleartext, so it is a secret on disk too. Still open: Matrix access-token
+  auth instead of a password (Ask 1b on #215). It needs a spike first, because the cold start
+  relies on `AuthData::Password` for the headless cross-signing bootstrap (D10).
 - **EC2 homeserver backups (#23, done 2026-07-29):** DLM policy `policy-08f914ca7a876a175`
   (us-west-2) snapshots the homeserver root volume daily at 09:00 UTC, 7-day retention, targeted
   by the volume tag `Backup=safehouse-homeserver`. Restore path live-tested once: volume from

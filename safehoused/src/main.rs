@@ -7,6 +7,7 @@
 //! stdout. No agents, no unix socket yet — that's the next step.
 
 mod backoff;
+mod config_secrets;
 mod egress;
 mod envelope;
 mod leave;
@@ -42,7 +43,7 @@ use matrix_sdk::{
     },
     Client, Error as MatrixError, Room, RoomState,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
@@ -81,19 +82,51 @@ type AloneWatchHandle = Option<Arc<AloneWatch>>;
 /// `scripts/install.sh` reads this via `safehoused --schema-version` (see
 /// `main()`) so the check has one source of truth instead of a
 /// hand-duplicated number in the shell script.
-const CONFIG_SCHEMA_VERSION: u32 = 5;
+///
+/// `6` (issue #215): `password_file`, `store_passphrase_file`,
+/// `recovery_passphrase_file` and `[egress].sink_url_file` credential
+/// references.
+const CONFIG_SCHEMA_VERSION: u32 = 6;
 
-#[derive(Deserialize)]
+/// The daemon's config file.
+///
+/// **No `Debug` derive, on purpose** — it would put `{:?}` one keystroke away
+/// from printing every secret below. `Serialize` exists only for
+/// `--print-config`, which always goes through
+/// [`config_secrets::render_document`]'s redaction (unless the operator asks
+/// for `--no-redact` explicitly). Secret-bearing fields are listed once, in
+/// [`SECRET_FIELDS`] right below.
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
     homeserver: String,
     username: String,
-    password: String,
+    /// The bot account's password. Exactly one of `password` /
+    /// `password_file` must be set (#215) — checked at boot by
+    /// [`BootSecrets::resolve`], not here, so `--print-config` can still show
+    /// a config with neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password: Option<String>,
+    /// Path to a file holding the password (one trailing newline stripped,
+    /// must not be group/world-accessible). Relative paths resolve against
+    /// the config file's directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    password_file: Option<PathBuf>,
     state_dir: PathBuf,
-    store_passphrase: String,
-    /// The only headless path back after a crypto-store loss. Mandatory, not
-    /// Option — a daemon without it cannot survive its own disk (D10).
-    recovery_passphrase: String,
+    /// Unlocks the sqlite crypto store; one of this or
+    /// `store_passphrase_file` is mandatory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_passphrase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store_passphrase_file: Option<PathBuf>,
+    /// The only headless path back after a crypto-store loss. Mandatory (as
+    /// this or `recovery_passphrase_file`) — a daemon without it cannot
+    /// survive its own disk (D10). Optional in the *type* only so the
+    /// literal-vs-file choice can be reported by name at boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_passphrase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_passphrase_file: Option<PathBuf>,
     /// The reset path orphans every room key in backup. Off unless explicitly
     /// enabled by the operator.
     #[serde(default)]
@@ -167,6 +200,151 @@ struct Config {
     schema_version: u32,
 }
 
+/// Every secret-bearing config field, **defined once** (issue #215). Each
+/// also accepts a `<name>_file` credential reference. `--print-config` uses
+/// this list for value-based redaction (on top of its key-name rule), and
+/// `config_tests::every_sensitive_looking_field_is_a_declared_secret` fails if
+/// a field whose name looks secret is added to [`Config`] (or a nested block)
+/// without being listed here.
+const SECRET_FIELDS: &[config_secrets::SecretField] = &[
+    config_secrets::SecretField {
+        path: "password",
+        kind: config_secrets::SecretKind::Whole,
+    },
+    config_secrets::SecretField {
+        path: "store_passphrase",
+        kind: config_secrets::SecretKind::Whole,
+    },
+    config_secrets::SecretField {
+        path: "recovery_passphrase",
+        kind: config_secrets::SecretKind::Whole,
+    },
+    // In practice an ingest secret rides in this URL's query string, which no
+    // key-name rule can see — hence `Url`: userinfo and sensitive query
+    // parameters are secret, the rest stays readable.
+    config_secrets::SecretField {
+        path: "egress.sink_url",
+        kind: config_secrets::SecretKind::Url,
+    },
+];
+
+/// The three boot secrets, resolved once from their literal or `*_file` form
+/// (issue #215). Deliberately no `Debug`, like [`Config`].
+struct BootSecrets {
+    password: String,
+    store_passphrase: String,
+    recovery_passphrase: String,
+}
+
+impl BootSecrets {
+    /// Resolve each secret before any homeserver I/O. Both forms set, neither
+    /// set, or an unreadable/over-permissive file is an error naming the field
+    /// and file — never the value.
+    fn resolve(config: &Config, config_dir: &std::path::Path) -> Result<Self> {
+        let get = |name: &str, literal: &Option<String>, file: &Option<PathBuf>| {
+            config_secrets::require_secret(name, literal.as_deref(), file.as_deref(), config_dir)
+                .map_err(|err| anyhow::anyhow!(err))
+        };
+        Ok(Self {
+            password: get("password", &config.password, &config.password_file)?,
+            store_passphrase: get(
+                "store_passphrase",
+                &config.store_passphrase,
+                &config.store_passphrase_file,
+            )?,
+            recovery_passphrase: get(
+                "recovery_passphrase",
+                &config.recovery_passphrase,
+                &config.recovery_passphrase_file,
+            )?,
+        })
+    }
+}
+
+/// Every key name a config file may contain (top level plus the nested
+/// blocks), for keeping names readable in a sanitized parse error.
+fn config_field_names() -> Vec<String> {
+    let mut names = config_secrets::struct_field_names::<Config>();
+    names.extend(config_secrets::struct_field_names::<EgressConfig>());
+    names.extend(config_secrets::struct_field_names::<TranscribeConfig>());
+    // Enum values are not secrets either; keep them readable in "unknown
+    // variant" errors.
+    names.extend(["sealed".to_owned(), "federated".to_owned()]);
+    names
+}
+
+/// Parse a config file's contents, with an error that never echoes a value
+/// from the file (see [`config_secrets::sanitized_parse_error`]).
+fn parse_config(raw: &str) -> std::result::Result<Config, String> {
+    toml::from_str(raw)
+        .map_err(|err| config_secrets::sanitized_parse_error(raw, &err, &config_field_names()))
+}
+
+/// `safehoused --print-config [--no-redact] [<config.toml>]` (issue #215):
+/// print the effective config (defaults filled in) to stdout, redacted by
+/// default. Runs before any homeserver I/O and never reads a `*_file`
+/// reference — those print as their path, redacted or not.
+fn print_config(args: &[String]) -> ExitCode {
+    let mut redact = true;
+    let mut path: Option<String> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--redact" => redact = true,
+            "--no-redact" => redact = false,
+            flag if flag.starts_with("--") => {
+                eprintln!("safehoused: --print-config: unknown flag {flag}");
+                eprintln!("usage: safehoused --print-config [--no-redact] [<config.toml>]");
+                return ExitCode::FAILURE;
+            }
+            other if path.is_none() => path = Some(other.to_owned()),
+            _ => {
+                eprintln!("usage: safehoused --print-config [--no-redact] [<config.toml>]");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let Some(path) = path.or_else(|| env::var("SAFEHOUSED_CONFIG").ok()) else {
+        eprintln!(
+            "usage: safehoused --print-config [--no-redact] [<config.toml>] \
+             (or set SAFEHOUSED_CONFIG)"
+        );
+        return ExitCode::FAILURE;
+    };
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            eprintln!("safehoused: reading {path}: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match render_config(&raw, redact) {
+        Ok(rendered) => {
+            if !redact {
+                eprintln!("safehoused: warning: printing the config UNREDACTED (--no-redact)");
+            }
+            let note = if redact {
+                "secrets redacted"
+            } else {
+                "NOT redacted"
+            };
+            println!("# safehoused --print-config: effective config from {path} ({note})");
+            print!("{rendered}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("safehoused: {path}: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The testable core of [`print_config`].
+fn render_config(raw: &str, redact: bool) -> std::result::Result<String, String> {
+    let config = parse_config(raw)?;
+    let doc = toml::Value::try_from(&config).map_err(|err| format!("rendering config: {err}"))?;
+    config_secrets::render_document(doc, SECRET_FIELDS, redact)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -184,7 +362,7 @@ fn default_true() -> bool {
 /// `deny_unknown_fields`, and a typo'd *value* should be a deserialize-time
 /// error ("unknown variant `federeted`"), never a silent fallback to the
 /// permissive mode.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum HomeserverMode {
     /// Federation off, registration off. Every account is the operator's, so
@@ -231,13 +409,21 @@ fn validate_homeserver_mode(
 #[derive(Clone, Copy)]
 struct UnknownPersonaAck(bool);
 
-fn load_config() -> Result<Config> {
+/// Load the config and return it with the directory its relative `*_file`
+/// references resolve against.
+fn load_config() -> Result<(Config, PathBuf)> {
     let path = env::args()
         .nth(1)
         .or_else(|| env::var("SAFEHOUSED_CONFIG").ok())
         .context("usage: safehoused <config.toml> (or set SAFEHOUSED_CONFIG)")?;
     let raw = fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
-    toml::from_str(&raw).with_context(|| format!("parsing {path}"))
+    // Not `toml`'s own error Display: it quotes the offending source line,
+    // which can be a secret, straight into the journal (#215).
+    let config = parse_config(&raw).map_err(|err| anyhow::anyhow!("parsing {path}: {err}"))?;
+    Ok((
+        config,
+        config_secrets::config_dir(std::path::Path::new(&path)),
+    ))
 }
 
 #[tokio::main]
@@ -250,6 +436,12 @@ async fn main() -> ExitCode {
         println!("{CONFIG_SCHEMA_VERSION}");
         return ExitCode::SUCCESS;
     }
+    // Same precedent (#215): a redaction-safe view of the config, with no
+    // homeserver I/O and no `*_file` reads.
+    if env::args().nth(1).as_deref() == Some("--print-config") {
+        let rest: Vec<String> = env::args().skip(2).collect();
+        return print_config(&rest);
+    }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -260,7 +452,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<()> {
-    let config = load_config()?;
+    let (config, config_dir) = load_config()?;
     // Advisory only — boot continues either way. A stale schema means a
     // field like `egress` (#30) may exist that this config predates and
     // never picked up automatically, since `scripts/install.sh` is
@@ -278,7 +470,17 @@ async fn run() -> Result<()> {
     // otherwise come up accepting invites from anyone on any server (#198).
     validate_homeserver_mode(config.homeserver_mode, &config.invite_allowlist)
         .map_err(|err| anyhow::anyhow!(err))?;
-    let client = boot(&config).await?;
+    // #215: every secret — literal or `*_file` — is resolved here, once,
+    // before any homeserver I/O, so a missing/ambiguous/over-permissive
+    // reference fails the boot by name instead of halfway through login.
+    let secrets = BootSecrets::resolve(&config, &config_dir)?;
+    let egress_config = config
+        .egress
+        .clone()
+        .map(|cfg| egress::resolve_sink_url(cfg, &config_dir))
+        .transpose()
+        .map_err(|err| anyhow::anyhow!("invalid egress config: {err}"))?;
+    let client = boot(&config, &secrets).await?;
 
     for persona in &config.personas {
         anyhow::ensure!(
@@ -301,7 +503,7 @@ async fn run() -> Result<()> {
     // Optional public-feed egress (#30). Built (and its boot guard enforced)
     // only when configured; otherwise `None` threads through every handler as a
     // no-op, so the daemon runs exactly as it did before this feature existed.
-    let egress: EgressHandle = match config.egress.clone() {
+    let egress: EgressHandle = match egress_config {
         Some(cfg) => {
             let db_path = config.state_dir.join("egress.sqlite3");
             let egress = Egress::open(cfg, &db_path).context("initializing egress")?;
@@ -721,7 +923,7 @@ async fn replay_thread_events(threads: &rpc::ThreadState, personas: &[String], e
 /// encrypted sqlite store, login or restore, wait for the E2EE init tasks
 /// (cross-signing bootstrap via MSC3967), then reconcile recovery state with
 /// the mandatory passphrase.
-async fn boot(config: &Config) -> Result<Client> {
+async fn boot(config: &Config, secrets: &BootSecrets) -> Result<Client> {
     let store_dir = config.state_dir.join("store");
     let session_path = config.state_dir.join("session.json");
 
@@ -737,7 +939,7 @@ async fn boot(config: &Config) -> Result<Client> {
 
     let client = Client::builder()
         .homeserver_url(&config.homeserver)
-        .sqlite_store(&store_dir, Some(&config.store_passphrase))
+        .sqlite_store(&store_dir, Some(&secrets.store_passphrase))
         // All three default to off; a daemon missing them silently breaks when
         // Element's insecure-device exclusion lands (~Oct 2026).
         .with_encryption_settings(EncryptionSettings {
@@ -757,7 +959,7 @@ async fn boot(config: &Config) -> Result<Client> {
         // the cross-signing bootstrap, so we don't depend solely on MSC3967.
         client
             .matrix_auth()
-            .login_username(&config.username, &config.password)
+            .login_username(&config.username, &secrets.password)
             .initial_device_display_name("safehoused")
             .await?;
         let session = client
@@ -789,14 +991,14 @@ async fn boot(config: &Config) -> Result<Client> {
             // the passphrase is the operator's handle.
             recovery
                 .enable()
-                .with_passphrase(&config.recovery_passphrase)
+                .with_passphrase(&secrets.recovery_passphrase)
                 .await?;
             println!("safehoused: recovery enabled with configured passphrase");
         }
         state @ (RecoveryState::Incomplete | RecoveryState::Unknown) => {
             println!("safehoused: recovery state {state:?}, recovering with passphrase");
             recovery
-                .recover(&config.recovery_passphrase)
+                .recover(&secrets.recovery_passphrase)
                 .await
                 .context(
                     "recovery failed — wrong passphrase? \
@@ -1610,6 +1812,395 @@ mod config_tests {
     fn config_parses_an_explicit_schema_version() {
         let config: Config = toml::from_str(&config_toml("schema_version = 1\n")).unwrap();
         assert_eq!(config.schema_version, 1);
+    }
+
+    // ---- #215: credential references and --print-config ------------------
+
+    #[test]
+    fn schema_version_is_bumped_for_credential_references() {
+        assert_eq!(CONFIG_SCHEMA_VERSION, 6);
+    }
+
+    #[test]
+    fn the_example_config_parses_and_documents_the_current_schema() {
+        let raw = include_str!("../example-config.toml");
+        assert!(parse_config(raw).is_ok());
+        assert!(
+            raw.contains(&format!("# schema_version = {CONFIG_SCHEMA_VERSION}\n")),
+            "example-config.toml should show schema_version = {CONFIG_SCHEMA_VERSION}"
+        );
+        for key in [
+            "password_file",
+            "store_passphrase_file",
+            "recovery_passphrase_file",
+            "sink_url_file",
+        ] {
+            assert!(raw.contains(&format!("# {key} = ")), "{key} undocumented");
+        }
+    }
+
+    /// A config exactly as written before #215 — literal secrets, schema 5,
+    /// a `sink_url` egress block — must keep parsing and resolving unchanged.
+    #[test]
+    fn a_pre_215_literal_config_still_parses_and_resolves() {
+        let raw = "homeserver = \"https://matrix.example.com\"\n\
+                   username = \"safehouse-bot\"\n\
+                   password = \"change-me\"\n\
+                   state_dir = \"/var/lib/safehoused\"\n\
+                   store_passphrase = \"change-me-too\"\n\
+                   recovery_passphrase = \"change-me-as-well\"\n\
+                   personas = [\"writer_agent\"]\n\
+                   schema_version = 5\n\
+                   [egress]\n\
+                   rooms = [\"!feed:example\"]\n\
+                   deny_patterns = [\"secret\"]\n\
+                   sink_url = \"https://feed.example.com/ingest?key=abc\"\n";
+        let config = parse_config(raw).unwrap();
+        let secrets = BootSecrets::resolve(&config, std::path::Path::new("/")).unwrap();
+        assert_eq!(secrets.password, "change-me");
+        assert_eq!(secrets.store_passphrase, "change-me-too");
+        assert_eq!(secrets.recovery_passphrase, "change-me-as-well");
+        let egress =
+            egress::resolve_sink_url(config.egress.unwrap(), std::path::Path::new("/")).unwrap();
+        assert_eq!(
+            egress.sink_url.as_deref(),
+            Some("https://feed.example.com/ingest?key=abc")
+        );
+        assert!(egress::validate_egress_config(&egress).is_ok());
+    }
+
+    /// A self-cleaning temp dir holding 0600 secret files.
+    struct SecretDir(PathBuf);
+
+    impl SecretDir {
+        fn new(tag: &str) -> Self {
+            let dir = env::temp_dir().join(format!("safehoused-215-{tag}-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            SecretDir(dir)
+        }
+        fn write(&self, name: &str, contents: &str, mode: u32) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join(name);
+            fs::write(&path, contents).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            path
+        }
+    }
+
+    impl Drop for SecretDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn file_config(dir: &SecretDir, extra: &str) -> String {
+        format!(
+            "homeserver = \"https://hs.example\"\n\
+             username = \"safehoused\"\n\
+             password_file = \"{}\"\n\
+             state_dir = \"/tmp/safehoused\"\n\
+             store_passphrase_file = \"store\"\n\
+             recovery_passphrase_file = \"{}\"\n\
+             {extra}",
+            dir.0.join("password").display(),
+            dir.0.join("recovery").display(),
+        )
+    }
+
+    #[test]
+    fn file_references_resolve_once_with_a_trailing_newline_stripped() {
+        let dir = SecretDir::new("valid");
+        dir.write("password", "pw-from-file\n", 0o600);
+        dir.write("store", "sp-from-file\r\n", 0o600);
+        dir.write("recovery", "rp-from-file", 0o400);
+        let config = parse_config(&file_config(&dir, "")).unwrap();
+        // `store_passphrase_file = "store"` is relative: it resolves against
+        // the config file's directory.
+        let secrets = BootSecrets::resolve(&config, &dir.0).unwrap();
+        assert_eq!(secrets.password, "pw-from-file");
+        assert_eq!(secrets.store_passphrase, "sp-from-file");
+        assert_eq!(secrets.recovery_passphrase, "rp-from-file");
+    }
+
+    #[test]
+    fn both_literal_and_file_set_is_a_boot_error_naming_the_field() {
+        let dir = SecretDir::new("both");
+        dir.write("password", "pw-from-file\n", 0o600);
+        dir.write("store", "sp\n", 0o600);
+        dir.write("recovery", "rp\n", 0o600);
+        let config = parse_config(&file_config(&dir, "password = \"literal-pw-value\"\n")).unwrap();
+        let err = BootSecrets::resolve(&config, &dir.0)
+            .err()
+            .expect("both set must fail")
+            .to_string();
+        assert!(
+            err.contains("`password`") && err.contains("`password_file`"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("literal-pw-value") && !err.contains("pw-from-file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn neither_literal_nor_file_set_is_a_boot_error_naming_the_field() {
+        // Parses (so `--print-config` can still show it), but cannot boot.
+        let config = parse_config(
+            "homeserver = \"https://hs.example\"\n\
+             username = \"safehoused\"\n\
+             password = \"pw\"\n\
+             state_dir = \"/tmp/safehoused\"\n\
+             store_passphrase = \"sp\"\n",
+        )
+        .unwrap();
+        let err = BootSecrets::resolve(&config, std::path::Path::new("/"))
+            .err()
+            .expect("missing recovery passphrase must fail")
+            .to_string();
+        assert!(err.contains("recovery_passphrase"), "{err}");
+        assert!(err.contains("recovery_passphrase_file"), "{err}");
+    }
+
+    #[test]
+    fn a_missing_or_over_permissive_secret_file_fails_by_name() {
+        let dir = SecretDir::new("bad");
+        // `password` file missing entirely.
+        dir.write("store", "sp\n", 0o600);
+        dir.write("recovery", "rp\n", 0o600);
+        let config = parse_config(&file_config(&dir, "")).unwrap();
+        let err = BootSecrets::resolve(&config, &dir.0)
+            .err()
+            .expect("missing file must fail")
+            .to_string();
+        assert!(err.contains("password_file"), "{err}");
+        assert!(
+            err.contains(&dir.0.join("password").display().to_string()),
+            "{err}"
+        );
+
+        // Present but world-readable: refused, contents never echoed.
+        dir.write("password", "world-readable-pw\n", 0o644);
+        let err = BootSecrets::resolve(&config, &dir.0)
+            .err()
+            .expect("0644 must fail")
+            .to_string();
+        assert!(err.contains("chmod 600"), "{err}");
+        assert!(!err.contains("world-readable-pw"), "{err}");
+    }
+
+    #[test]
+    fn egress_sink_url_file_resolves_and_conflicts_with_sink_url() {
+        let dir = SecretDir::new("sink");
+        let file = dir.write("sink", "https://h/ingest?key=from-file\n", 0o600);
+        let block = format!(
+            "[egress]\nrooms = [\"!feed:example\"]\ndeny_patterns = [\"x\"]\nsink_url_file = \"{}\"\n",
+            file.display()
+        );
+        let config: Config = toml::from_str(&config_toml(&block)).unwrap();
+        let egress = config.egress.unwrap();
+        // An unresolved `sink_url_file` still counts as a target.
+        assert!(egress::validate_egress_config(&egress).is_ok());
+        let resolved = egress::resolve_sink_url(egress, &dir.0).unwrap();
+        assert_eq!(
+            resolved.sink_url.as_deref(),
+            Some("https://h/ingest?key=from-file")
+        );
+        assert!(resolved.sink_url_file.is_none());
+
+        let both = format!("{block}sink_url = \"https://h/literal?key=literal-secret\"\n");
+        let config: Config = toml::from_str(&config_toml(&both)).unwrap();
+        let egress = config.egress.unwrap();
+        let err = egress::validate_egress_config(&egress).unwrap_err();
+        assert!(err.contains("sink_url_file"), "{err}");
+        let err = egress::resolve_sink_url(egress, &dir.0).err().unwrap();
+        assert!(err.contains("egress.sink_url_file"), "{err}");
+        assert!(
+            !err.contains("literal-secret") && !err.contains("from-file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn egress_config_debug_does_not_print_the_sink_url_secret() {
+        let config: Config = toml::from_str(&config_toml(
+            "[egress]\nsink_url = \"https://u:pw-in-url@h/i?key=debug-secret\"\n",
+        ))
+        .unwrap();
+        let shown = format!("{:?}", config.egress.unwrap());
+        assert!(!shown.contains("debug-secret"), "{shown}");
+        assert!(!shown.contains("pw-in-url"), "{shown}");
+        assert!(
+            shown.contains("https://REDACTED@h/i?key=REDACTED"),
+            "{shown}"
+        );
+    }
+
+    /// The drift guard the issue asks for: a field whose *name* looks secret
+    /// (the same key-name rule `--print-config` applies) must be declared in
+    /// `SECRET_FIELDS` — directly, or as the `_file` reference of a declared
+    /// one — so value-based redaction can never silently miss it. And every
+    /// declared secret must exist, with its `_file` sibling.
+    #[test]
+    fn every_sensitive_looking_field_is_a_declared_secret() {
+        let mut fields: Vec<String> = config_secrets::struct_field_names::<Config>();
+        assert!(fields.contains(&"homeserver".to_owned()), "{fields:?}");
+        fields.extend(
+            config_secrets::struct_field_names::<EgressConfig>()
+                .into_iter()
+                .map(|f| format!("egress.{f}")),
+        );
+        fields.extend(
+            config_secrets::struct_field_names::<TranscribeConfig>()
+                .into_iter()
+                .map(|f| format!("transcribe.{f}")),
+        );
+        assert!(fields.contains(&"egress.sink_url".to_owned()), "{fields:?}");
+        let declared: Vec<&str> = SECRET_FIELDS.iter().map(|f| f.path).collect();
+        for field in &fields {
+            let leaf = field.rsplit('.').next().unwrap();
+            if !config_secrets::is_sensitive_name(leaf) {
+                continue;
+            }
+            let base = field.strip_suffix("_file").unwrap_or(field);
+            assert!(
+                declared.contains(&base),
+                "config field `{field}` looks secret but `{base}` is not in SECRET_FIELDS"
+            );
+        }
+        for path in declared {
+            assert!(fields.iter().any(|f| f == path), "{path} is not a field");
+            let file = format!("{path}_file");
+            assert!(fields.contains(&file), "{path} has no `{file}` reference");
+        }
+    }
+
+    const ALL_FOUR_SECRETS: &str = "homeserver = \"https://matrix.example.com\"\n\
+        username = \"safehouse-bot\"\n\
+        password = \"Fixture-Password-1\"\n\
+        state_dir = \"/var/lib/safehoused\"\n\
+        store_passphrase = \"Fixture-Store-Passphrase-2\"\n\
+        recovery_passphrase = \"Fixture-Recovery-Passphrase-3\"\n\
+        personas = [\"writer_agent\"]\n\
+        [egress]\n\
+        rooms = [\"!feed:example\"]\n\
+        deny_patterns = [\"secret\"]\n\
+        sink_url = \"https://ingest.example.com/v1?key=Fixture-Ingest-Key-4&x=1\"\n";
+
+    const FIXTURE_SECRETS: [&str; 4] = [
+        "Fixture-Password-1",
+        "Fixture-Store-Passphrase-2",
+        "Fixture-Recovery-Passphrase-3",
+        "Fixture-Ingest-Key-4",
+    ];
+
+    #[test]
+    fn print_config_redacts_all_four_secrets_and_keeps_the_rest_readable() {
+        let out = render_config(ALL_FOUR_SECRETS, true).unwrap();
+        for secret in FIXTURE_SECRETS {
+            assert!(!out.contains(secret), "{secret} leaked:\n{out}");
+        }
+        assert!(out.contains("store_passphrase = \"REDACTED\""), "{out}");
+        assert!(out.contains("recovery_passphrase = \"REDACTED\""), "{out}");
+        assert!(out.contains("password = \"REDACTED\""), "{out}");
+        assert!(
+            out.contains("sink_url = \"https://ingest.example.com/v1?key=REDACTED&x=1\""),
+            "{out}"
+        );
+        assert!(out.contains("username = \"safehouse-bot\""), "{out}");
+        // Effective config: defaults are filled in.
+        assert!(out.contains("homeserver_mode = \"sealed\""), "{out}");
+        assert!(out.contains("[egress]"), "{out}");
+        // And the redacted output is itself valid TOML.
+        assert!(toml::from_str::<toml::Value>(&out).is_ok(), "{out}");
+    }
+
+    #[test]
+    fn the_issues_grep_filter_finds_nothing_in_redacted_output() {
+        // The filter that leaked two passphrases on 2026-08-09, applied to the
+        // redacted output: whatever survives it must contain no secret.
+        let out = render_config(ALL_FOUR_SECRETS, true).unwrap();
+        let filtered: Vec<&str> = out
+            .lines()
+            .filter(|l| {
+                !["password", "token", "secret", "key"]
+                    .iter()
+                    .any(|w| l.contains(w))
+            })
+            .collect();
+        let filtered = filtered.join("\n");
+        for secret in FIXTURE_SECRETS {
+            assert!(!filtered.contains(secret), "{secret} leaked:\n{filtered}");
+        }
+        assert!(!filtered.contains("passphrase = \"Fixture"), "{filtered}");
+    }
+
+    #[test]
+    fn print_config_no_redact_is_explicit_and_verbatim() {
+        let out = render_config(ALL_FOUR_SECRETS, false).unwrap();
+        for secret in FIXTURE_SECRETS {
+            assert!(out.contains(secret), "{secret} missing:\n{out}");
+        }
+    }
+
+    #[test]
+    fn print_config_shows_file_references_as_paths_and_never_reads_them() {
+        // The files do not exist: `--print-config` must not try to read them,
+        // redacted or not.
+        let raw = "homeserver = \"https://hs.example\"\n\
+                   username = \"u\"\n\
+                   password_file = \"/nonexistent/password\"\n\
+                   state_dir = \"/tmp/s\"\n\
+                   store_passphrase_file = \"/nonexistent/store\"\n\
+                   recovery_passphrase_file = \"/nonexistent/recovery\"\n\
+                   [egress]\n\
+                   sink_url_file = \"/nonexistent/sink\"\n";
+        for redact in [true, false] {
+            let out = render_config(raw, redact).unwrap();
+            assert!(
+                out.contains("password_file = \"/nonexistent/password\""),
+                "{out}"
+            );
+            assert!(
+                out.contains("store_passphrase_file = \"/nonexistent/store\""),
+                "{out}"
+            );
+            assert!(
+                out.contains("recovery_passphrase_file = \"/nonexistent/recovery\""),
+                "{out}"
+            );
+            assert!(
+                out.contains("sink_url_file = \"/nonexistent/sink\""),
+                "{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parse_error_does_not_echo_the_offending_value() {
+        // A secret pasted where a number/enum belongs: serde quotes the value,
+        // toml's Display quotes the whole source line. Neither may surface.
+        for raw in [
+            format!("{ALL_FOUR_SECRETS}schema_version = \"Leaky-Value-9\"\n"),
+            ALL_FOUR_SECRETS.replace(
+                "personas = [\"writer_agent\"]",
+                "homeserver_mode = \"Leaky-Value-9\"",
+            ),
+            // Not even valid TOML: an unterminated string.
+            "password = \"Leaky-Value-9\n".to_owned(),
+        ] {
+            let err = render_config(&raw, true).unwrap_err();
+            assert!(!err.contains("Leaky-Value-9"), "{err}");
+            for secret in FIXTURE_SECRETS {
+                assert!(!err.contains(secret), "{err}");
+            }
+            assert!(err.contains("line "), "{err}");
+        }
+        // Field names stay readable, so the error is still actionable.
+        let err = render_config(&config_toml("bogus_key = true\n"), true).unwrap_err();
+        assert!(err.contains("`bogus_key`"), "{err}");
+        let err = render_config(&config_toml("homeserver_mode = \"typo\"\n"), true).unwrap_err();
+        assert!(err.contains("`sealed`"), "{err}");
     }
 }
 

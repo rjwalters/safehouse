@@ -77,7 +77,7 @@
 use std::{future::Future, process::Stdio, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{io::AsyncWriteExt as _, process::Command, sync::Mutex, time::timeout};
 
@@ -106,7 +106,7 @@ fn default_max_bytes() -> u64 {
 /// The optional `[transcribe]` block on the daemon [`Config`](crate::Config).
 /// Absent = the whole subsystem is disabled (zero behavior change). Same flat,
 /// explicit, `deny_unknown_fields` style as [`EgressConfig`](crate::egress::EgressConfig).
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TranscribeConfig {
     /// argv of the local transcriber. `command[0]` must be an **absolute

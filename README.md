@@ -177,7 +177,27 @@ same class of invisible-until-it-bites-you problem, just for the binary instead 
    ```bash
    cp safehoused/example-config.toml config.toml
    $EDITOR config.toml   # fill in homeserver, username/password, state_dir, passphrases
+   chmod 600 config.toml
    ```
+
+   **Secrets can live outside the config (#215).** `password`, `store_passphrase`,
+   `recovery_passphrase` and `[egress].sink_url` each accept a `<name>_file = "/path"` alternative
+   (`password_file`, `store_passphrase_file`, `recovery_passphrase_file`, `sink_url_file`): the
+   daemon reads the file once at boot, strips one trailing newline, and refuses to start if the
+   file is missing, empty, or readable by group/other. Exactly one of each pair must be set. That
+   lets `config.toml` itself be shared and reviewed, and composes with an age/SOPS-decrypting
+   wrapper or a secret manager. There is deliberately no env-var form: a variable in a service
+   unit is readable via `systemctl show` and inherited by every child process.
+
+   **To look at a config, use `safehoused --print-config [config.toml]`**, never `cat` or a
+   `grep -v` filter. It prints the effective config (defaults filled in) with secrets redacted by
+   key name, by value, and inside URLs (`sink_url`'s `?key=` and any `user:pw@`), and shows a
+   `*_file` reference as its path without reading it. `--no-redact` is the explicit opt-out. A
+   filter like `grep -vE "password|token|secret|key"` does **not** catch `passphrase`, and no
+   key-name filter can catch a secret inside a URL's query string.
+
+   **`config.toml` is not the only secret on disk:** `<state_dir>/session.json` holds the
+   device's live Matrix access token in cleartext. Keep `state_dir` owner-only as well.
 
 3. **Run the daemon:**
 
@@ -280,6 +300,15 @@ server's actual behavior if you rely on that for more than tidiness.
 Both scripts read admin credentials from the environment at runtime only — never committed, never
 baked into a binary, never ambient on a worker host. See
 [`spikes/provision-host`](spikes/provision-host) for the implementation.
+
+**Do not write the config and launch the daemon from one inline command (#215).** A provisioning
+one-liner shaped like `bash -c 'cat > config.toml <<EOF … EOF; safehoused config.toml'` puts the
+whole credential set in that parent shell's argv, and it stays in the process table, readable by any
+local process, for as long as the parent lives. One host had it there for about three weeks. Write
+the config over stdin or `scp` instead (for example `ssh host 'umask 077; cat > config.toml' <
+config.toml`, or `scp` and then `chmod 600`), and start the daemon as a separate step, ideally via
+the supervised service `scripts/install.sh` registers. Better still, keep the secrets out of the
+config entirely with the `*_file` references described in "Running it" step 2.
 
 ## Claims room (unencrypted, D6 carve-out)
 
