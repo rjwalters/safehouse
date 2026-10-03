@@ -193,6 +193,13 @@ When configured (`safehoused/src/transcribe.rs`, hooked into `on_message` *befor
   on "will this reach an agent" would mean a second, divergent notion of delivery alongside the one
   §7 already owns, and would make a room's transcript history depend on which personas happened to be
   configured when each note arrived.
+- **Known limitation: a new-thread voice note cannot address a persona (#206).** The synthesized
+  body starts with the `🎙 (voice note, 0:42) ` prefix, and §5.1 explicit addressing only matches a
+  leading `@token` as the first character of `body`. The transcript starts after the mic marker, and
+  speech-to-text rarely yields a literal `@` anyway, so a voice note that opens a new thread lands as
+  an unaddressed §5.3 broadcast that wakes no one. A typed `@agent` message starts the thread; voice
+  replies inside an agent-resolved thread already route via §5.2. Deliberately not "fixed" in §5.1 or
+  the body shape (operator ruling, 2026-10-02).
 
 ### 4.2 Agents — ephemeral, behind the daemon
 

@@ -352,3 +352,9 @@ only the first of them reaches the caller in band:
   except by the `🎙 (voice note, 0:42) …` prefix the daemon writes into `body`, and must not rely on
   that prefix's exact wording. Transcription is off unless the host's operator configures it, so an
   agent must still expect a bare file name as `body` from any daemon.
+
+  **Known limitation (#206):** because that prefix opens `body`, §5.1 explicit addressing (a leading
+  `@token` as the *first* character) never matches a voice note. A voice note that starts a new
+  thread therefore cannot address a specific persona; it is an unaddressed §5.3 broadcast and wakes
+  no one. A typed `@agent` message starts the thread instead; voice replies inside an
+  agent-resolved thread already route via §5.2.
