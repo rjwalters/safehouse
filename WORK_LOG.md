@@ -3,6 +3,49 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-10-03
+
+- **PR #217**: docs: new-thread voice notes cannot address a persona (#206)
+- **Issue #206** (closed): envelope §5.1: a transcribed voice note can never explicitly address a persona (the 🎙 prefix defeats the leading-@token match)
+- **Issue #192** (closed): Guard friction: worktree-write-confinement/rm-scope-unresolved-var deny a function-scoped mktemp+rm/redirect idiom (read_ci_checks, PR #102, 2026-08-18..20)
+
+### 2026-10-02
+
+- **PR #216**: safehoused: *_file credential references and redacting --print-config (#215)
+- **Issue #215** (closed): config.toml holds four cleartext secrets with no credential-reference or token-auth option, and no redaction-safe way to read it
+
+### 2026-10-01
+
+- **PR #214**: feat(safehoused): describe attachments; fetch_media serves one on request
+- **PR #213**: Sanitize Markdown link/image URL schemes in envelope rendering
+- **PR #207**: feat(safehoused): send_image op — post an image as m.image
+- **PR #211**: docs(config): trim with ffmpeg -t in the whisper wrapper example, not whisper-cli -d
+- **PR #199**: feat(safehoused): render envelope bodies' Markdown into formatted_body, escaped
+- **PR #210**: docs(safehoused): state transcription's real resource bounds
+- **PR #208**: feat(safehoused): leave a room when alone; add a leave socket op (#201)
+- **PR #203**: feat(safehoused): transcribe m.audio voice notes locally before envelope synthesis
+- **PR #202**: feat: refuse to boot a federated homeserver without an invite allowlist
+- **PR #197**: feat: surface Matrix addressing metadata on check; send thread_root (#194)
+- **PR #196**: feat(safehoused): make the unknown-persona ack switchable (#195)
+- **Issue #212** (closed): markdown_html: filter link and image URLs (javascript:, remote <img>) instead of relying on clients
+- **Issue #209** (closed): transcribe: whisper.cpp -d pads short audio — the documented '-d {max_millis}' makes every note cost max_seconds
+- **Issue #205** (closed): safehoused: transcription's resource bounds are weaker than documented (sync-loop stall, post-hoc size cap)
+- **Issue #201** (closed): Leave a room when the daemon is its only member; add a leave socket op
+- **Issue #200** (closed): Transcribe voice notes (m.audio) to text for agents, locally (whisper.cpp)
+- **Issue #198** (closed): Add `homeserver_mode` config (sealed/federated): mandatory invite_allowlist + configurable persona-ack
+- **Issue #194** (closed): Surface Matrix addressing metadata on mailbox entries (mentions, pills, reply-to, thread root)
+
+### 2026-09-30
+
+- **PR #182**: skills: portable safehouse agent skill + installer (#181)
+
+### 2026-09-29
+
+- **PR #191**: fix: bound safehouse_check replies by size, not just row count (#190)
+- **PR #189**: fix: cap safehouse_check backlog by default, signal more_available
+- **Issue #190** (closed): safehouse_check default cap is count-based, not size-based — 200 envelopes may still exceed a bounded client's tool-output budget
+- **Issue #188** (closed): safehouse_check with no --limit returns unbounded backlog that exceeds MCP client token limits
+
 ### 2026-09-27
 
 - **PR #186**: fix(shim): mark and flatten remote-authored room name in list_rooms
@@ -20,9 +63,17 @@ triage agent. Newest first.
 
 ### 2026-09-15
 
+- **Issue #94** (closed): Host onboarding needs a human on the homeserver, which caps the fleet at the rate an operator can mint Matrix accounts — blocks dynamic scale-out to hundreds of hosts
+- **Issue #112** (closed): Guard decision: 'worktree-write-confinement' denies a read-only python heredoc (no writes at all)
+- **Issue #24** (closed): Retire the Studio rollback backup once the EC2 homeserver is proven stable
+- **Issue #108** (closed): Guard decision: 'worktree-write-confinement-unresolved-var' denies rm -rf on a mktemp-scoped tempdir
 - **PR #177**: feat: unattended host onboarding via Matrix admin-room automation (#94)
 - **PR #174**: chore(repo-skills): update installed Repo Skills to 0.11.12
 - **Issue #159** (closed): verdict-staleness-guard.sh errors on every run: gh pr view has no 'merged' JSON field
+
+### 2026-09-11
+
+- **Issue #101** (closed): Unencrypted claims room + client-side provisioning parity — E2EE black-holed the fleet's peer-claim channel
 
 ### 2026-09-09
 

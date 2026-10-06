@@ -106,6 +106,11 @@ backed by eight research passes (2026-07-26) archived under [`docs/research/`](d
   plus a visible reason, never a silent drop. Disabled unless configured; see `[transcribe]` in
   [`safehoused/example-config.toml`](safehoused/example-config.toml) and
   [`docs/design.md` §4.1.3](docs/design.md).
+- **Images and files stay daemon-mediated (#207/#214):** agents can post PNG, JPEG, WebP, or GIF
+  data with `send_image`, and can inspect a room attachment's metadata before asking `fetch_media`
+  to download and decrypt that one event. The daemon accepts inline bytes rather than agent-chosen
+  paths, limits transfers to 10 MiB, refuses executable/archive content, and does not retain a
+  plaintext media copy.
 - ✅ **The Oct 2026 "exclude insecure devices" deadline is cleared**, not just tracked: Element X
   shows no reduced-trust indicator for the self-signed daemon device (verified on a real phone).
 
