@@ -46,6 +46,9 @@ Issues carrying `loom:curated`.
 
 - **#178**: Verify Tuwunel/Synapse users-deactivate actually force-leaves rooms (follow-up to #94/#177) *(curated)*
 - **#181**: Ship a portable safehouse skill so Claude, Codex, pi and opencode can post/read rooms *(curated)*
+- **#184**: Live cross-agent verification: Claude Code, Codex, pi and opencode read+reply using only the installed safehouse skill *(curated)*
+- **#195**: Run safehoused against a federated homeserver (matrix.org or an org's server) *(curated)*
+- **#204**: Live-verify voice-note transcription end to end (and measure whisper.cpp model latency) *(curated)*
 
 ## Proposed (Architect / Hermit)
 
@@ -65,7 +68,7 @@ _None._
 | In Progress (`loom:building`) | 0 |
 | PRs awaiting review | 0 |
 | Approved PRs awaiting merge | 0 |
-| Curated | 2 |
+| Curated | 5 |
 | Architect / Hermit proposals | 0 |
 | Active epics | 0 |
 <!-- guide:plan-body:end -->
