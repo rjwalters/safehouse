@@ -297,6 +297,14 @@ threading. The thread is identified by `matrix.thread_root` instead. To answer i
 value as `thread_root` on `send`: it threads the outgoing message under that event, taking
 precedence over `task_id`-based thread resolution.
 
+**`read` rows (top-level `thread_root`).** Unlike `check`, the `read` RPC does not carry a `matrix`
+object. Each `read` message instead gets a single top-level `thread_root` key (sibling of `event_id`,
+`sender`, `own`, `ts`, `envelope`), set to the thread-root event id when the event has an `m.thread`
+relation with a string root id (including `is_falling_back: true` replies, and for attachment and
+`unsupported_version` rows). It is **absent** (never `null`, never the event's own id) for
+main-timeline events, thread roots themselves, plain `m.in_reply_to` replies, other relation types,
+and malformed thread relations. Purely additive; clients that ignore it see no change.
+
 ## 8. Rendering rules
 
 The event `body` MUST be legible standing alone, because that is all a human sees. Format:

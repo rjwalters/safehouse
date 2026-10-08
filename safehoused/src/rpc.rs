@@ -924,53 +924,9 @@ async fn handle_op(
                 let Ok(parsed) = serde_json::from_str::<Value>(event.raw().json().get()) else {
                     continue;
                 };
-                if parsed.get("type").and_then(Value::as_str) != Some("m.room.message") {
-                    continue;
+                if let Some(message) = build_read_row(registry, &parsed, &own).await? {
+                    messages.push(message);
                 }
-                let sender = parsed
-                    .get("sender")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let content = parsed.get("content").cloned().unwrap_or(Value::Null);
-                let mut message = json!({
-                    "event_id": parsed.get("event_id"),
-                    "sender": sender,
-                    "own": sender == own,
-                    "ts": parsed.get("origin_server_ts"),
-                });
-                let obj = message.as_object_mut().expect("json object literal");
-                // Described, never fetched: an agent asks for the bytes with
-                // `fetch_media` when it needs them.
-                if let Some(a) = envelope::attachment_from_content(&content) {
-                    obj.insert("attachment".into(), a);
-                }
-                // §5.2: resolve the thread agent the same way the live
-                // dispatch path does, so a replayed thread reply synthesizes
-                // the same envelope it would have gotten in real time.
-                let event_id = parsed.get("event_id").and_then(Value::as_str);
-                let thread_root = envelope::thread_root_from_content(&content)
-                    .or_else(|| event_id.map(str::to_owned));
-                let thread_agent = match &thread_root {
-                    Some(root) => registry.threads.target_for_thread(root).await,
-                    None => None,
-                };
-                // §7.2: never hand an agent a guessed envelope for a version we
-                // don't support — mark it so the agent can surface, not act.
-                match envelope::from_event_json(
-                    &content,
-                    &sender,
-                    &registry.personas,
-                    thread_agent.as_deref(),
-                ) {
-                    envelope::Inbound::Envelope(env, _unknown_persona) => {
-                        obj.insert("envelope".into(), serde_json::to_value(env)?);
-                    }
-                    envelope::Inbound::UnsupportedVersion(v) => {
-                        obj.insert("unsupported_version".into(), json!(v));
-                    }
-                }
-                messages.push(message);
             }
             Ok(json!({"ok": true, "room_id": room.room_id(), "messages": messages}))
         }
@@ -1024,6 +980,68 @@ async fn handle_op(
         }
         other => anyhow::bail!("unknown op {other:?}"),
     }
+}
+
+/// Build one `read` row from a raw Matrix event, or `None` if it isn't an
+/// `m.room.message`. A top-level `thread_root` (#224) is emitted only when the
+/// event carries an `m.thread` relation with a string root id; the event-id
+/// fallback below is for thread-agent lookup only and is never exposed, so a
+/// thread root / main-timeline event never looks threaded.
+async fn build_read_row(
+    registry: &Registry,
+    parsed: &Value,
+    own: &str,
+) -> anyhow::Result<Option<Value>> {
+    if parsed.get("type").and_then(Value::as_str) != Some("m.room.message") {
+        return Ok(None);
+    }
+    let sender = parsed
+        .get("sender")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let content = parsed.get("content").cloned().unwrap_or(Value::Null);
+    let mut message = json!({
+        "event_id": parsed.get("event_id"),
+        "sender": sender,
+        "own": sender == own,
+        "ts": parsed.get("origin_server_ts"),
+    });
+    let obj = message.as_object_mut().expect("json object literal");
+    // Described, never fetched: an agent asks for the bytes with
+    // `fetch_media` when it needs them.
+    if let Some(a) = envelope::attachment_from_content(&content) {
+        obj.insert("attachment".into(), a);
+    }
+    // §5.2: resolve the thread agent the same way the live dispatch path
+    // does, so a replayed thread reply synthesizes the same envelope it
+    // would have gotten in real time.
+    let event_id = parsed.get("event_id").and_then(Value::as_str);
+    let relation_root = envelope::thread_root_from_content(&content);
+    if let Some(root) = &relation_root {
+        obj.insert("thread_root".into(), json!(root));
+    }
+    let routing_root = relation_root.or_else(|| event_id.map(str::to_owned));
+    let thread_agent = match &routing_root {
+        Some(root) => registry.threads.target_for_thread(root).await,
+        None => None,
+    };
+    // §7.2: never hand an agent a guessed envelope for a version we don't
+    // support — mark it so the agent can surface, not act.
+    match envelope::from_event_json(
+        &content,
+        &sender,
+        &registry.personas,
+        thread_agent.as_deref(),
+    ) {
+        envelope::Inbound::Envelope(env, _unknown_persona) => {
+            obj.insert("envelope".into(), serde_json::to_value(env)?);
+        }
+        envelope::Inbound::UnsupportedVersion(v) => {
+            obj.insert("unsupported_version".into(), json!(v));
+        }
+    }
+    Ok(Some(message))
 }
 
 /// Resolve the thread a `send` belongs to: `(root, m.relates_to)`. An
@@ -2689,6 +2707,120 @@ mod tests {
         let req = json!({"to": "*", "body": "hi"});
         let (root, relates) = resolve_send_thread(&registry, &req, &env).await;
         assert!(root.is_none() && relates.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_row_thread_root_only_for_thread_relations() {
+        let (_w, _r, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        let own = "@bot:x";
+        let row = |ev: Value| {
+            let registry = &registry;
+            async move { build_read_row(registry, &ev, own).await.unwrap().unwrap() }
+        };
+        let ev = |id: &str, content: Value| {
+            json!({"type": "m.room.message", "event_id": id, "sender": "@h:x",
+                   "origin_server_ts": 5, "content": content})
+        };
+        let thread = |root: Value, fallback: bool| {
+            json!({"rel_type": "m.thread", "event_id": root, "is_falling_back": fallback,
+                   "m.in_reply_to": {"event_id": "$prev"}})
+        };
+
+        // Threaded human message (fallback reply pointer included).
+        let r = row(ev(
+            "$h1",
+            json!({"msgtype": "m.text", "body": "yes",
+                   "m.relates_to": thread(json!("$root"), true)}),
+        ))
+        .await;
+        assert_eq!(r["thread_root"], "$root");
+        assert_eq!(r["event_id"], "$h1");
+        assert_eq!(r["sender"], "@h:x");
+        assert_eq!(r["own"], false);
+        assert_eq!(r["ts"], 5);
+        assert_eq!(r["envelope"]["body"], "yes");
+
+        // Threaded native envelope.
+        let r = row(ev(
+            "$n1",
+            json!({"msgtype": "m.text", "body": "x",
+                   "m.relates_to": thread(json!("$root2"), false),
+                   envelope::ENVELOPE_KEY: {"v": 1, "from": "writer_agent", "to": "*",
+                                            "type": "chat", "body": "hello"}}),
+        ))
+        .await;
+        assert_eq!(r["thread_root"], "$root2");
+        assert_eq!(r["envelope"]["body"], "hello");
+
+        // Threaded attachment and unsupported envelope version keep the key.
+        let r = row(ev(
+            "$a1",
+            json!({"msgtype": "m.file", "body": "f.txt",
+                   "m.relates_to": thread(json!("$root"), false)}),
+        ))
+        .await;
+        assert_eq!(r["thread_root"], "$root");
+        assert_eq!(r["attachment"]["name"], "f.txt");
+        let r = row(ev(
+            "$u1",
+            json!({"msgtype": "m.text", "body": "x",
+                   "m.relates_to": thread(json!("$root"), false),
+                   envelope::ENVELOPE_KEY: {"v": 99}}),
+        ))
+        .await;
+        assert_eq!(r["thread_root"], "$root");
+        assert_eq!(r["unsupported_version"], 99);
+
+        // Negatives: key absent entirely.
+        let plain = json!({"msgtype": "m.text", "body": "hi"});
+        let reply = json!({"msgtype": "m.text", "body": "hi",
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$p"}}});
+        let other_rel = json!({"msgtype": "m.text", "body": "hi",
+            "m.relates_to": {"rel_type": "m.annotation", "event_id": "$p"}});
+        let no_id = json!({"msgtype": "m.text", "body": "hi",
+            "m.relates_to": {"rel_type": "m.thread"}});
+        let bad_id = json!({"msgtype": "m.text", "body": "hi",
+            "m.relates_to": thread(json!(42), false)});
+        for (i, c) in [plain, reply, other_rel, no_id, bad_id]
+            .into_iter()
+            .enumerate()
+        {
+            let r = row(ev(&format!("$neg{i}"), c)).await;
+            assert!(r.get("thread_root").is_none(), "case {i}: {r}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_row_routing_fallback_independent_of_exposed_root() {
+        let (_w, _r, registry) =
+            spawn_conn(vec!["writer_agent".to_owned(), "research_agent".to_owned()]).await;
+        let env = thread_env("research_agent", None);
+        registry.threads.observe("$root", "$root", &env).await;
+        // The root event itself: routed via its own id, but no thread_root key.
+        let ev = json!({"type": "m.room.message", "event_id": "$root", "sender": "@h:x",
+            "content": {"msgtype": "m.text", "body": "start"}});
+        let r = build_read_row(&registry, &ev, "@bot:x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(r.get("thread_root").is_none());
+        assert_eq!(r["envelope"]["to"], "research_agent");
+        // A thread reply routes to the same agent and exposes the root.
+        let ev = json!({"type": "m.room.message", "event_id": "$r1", "sender": "@h:x",
+            "content": {"msgtype": "m.text", "body": "yes",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}}});
+        let r = build_read_row(&registry, &ev, "@bot:x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r["thread_root"], "$root");
+        assert_eq!(r["envelope"]["to"], "research_agent");
+        // Non-message events are skipped.
+        let ev = json!({"type": "m.reaction", "event_id": "$z", "content": {}});
+        assert!(build_read_row(&registry, &ev, "@bot:x")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
