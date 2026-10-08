@@ -84,9 +84,10 @@ const OPS: &[&str] = &[
 /// (18 bytes) is over it.
 const MAX_REACTION_KEY_BYTES: usize = 16;
 
-/// The `error` a `redact` of someone else's event gets (#220), verbatim: the
-/// one error string of the op that clients are expected to match on.
-const NOT_OWN_EVENT: &str = "not_own_event";
+/// The `error` a `redact` gets for any target that is not one of this
+/// daemon's own reactions (#220), verbatim: the one error string of the op
+/// that clients are expected to match on.
+const NOT_OWN_REACTION: &str = "not_own_reaction";
 
 use crate::{
     envelope::{self, Envelope},
@@ -680,22 +681,27 @@ async fn handle_op(
             }))
         }
         "redact" => {
-            // #220: take back something *this daemon* said — a reaction from
-            // `react`, typically. Fetch the target first and refuse unless
-            // its sender is our own user id, so a persona can never use the
-            // bot account's moderation power on anyone else's message.
-            // Redactions themselves are never encrypted (the spec keeps
-            // `m.room.redaction` in the clear), so this works unchanged in an
-            // encrypted room; `Room::event` decrypts the target if it can,
-            // and its `sender` is outside the ciphertext either way.
+            // #220: take back a reaction this daemon put on with `react` —
+            // and nothing else. Fetch the target first and refuse unless it
+            // is an `m.reaction`, not a state event, sent by our own user id
+            // (`ensure_own_reaction`). Sender alone is not enough: the
+            // daemon's account also sent the state of every room it built
+            // (encryption, name, power levels, space links, its membership),
+            // which `GET /event` returns too and a redaction would strip,
+            // and — every persona sharing one account (D4) — other personas'
+            // messages. Redactions themselves are never encrypted (the spec
+            // keeps `m.room.redaction` in the clear), so this works unchanged
+            // in an encrypted room; `Room::event` decrypts the target, so an
+            // encrypted reaction is checked by its real type, and one it
+            // cannot decrypt stays `m.room.encrypted` and is refused.
             let target = parse_redact(req)?;
             let room = resolve_room(client, Some(required_room("redact", req)?))?;
             let event = room
                 .event(&target.event_id, None)
                 .await
                 .context("fetching the event")?;
-            let sender = event.raw().get_field::<String>("sender").ok().flatten();
-            ensure_own_event(sender.as_deref(), client.user_id())?;
+            let fetched: Option<Value> = serde_json::from_str(event.raw().json().get()).ok();
+            ensure_own_reaction(fetched.as_ref(), client.user_id())?;
             room.redact(&target.event_id, target.reason.as_deref(), None)
                 .await
                 .context("redacting the event")?;
@@ -1347,16 +1353,26 @@ fn validate_reaction_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-/// `redact` only touches the daemon's own events (#220). Fails closed: an
-/// event with no readable `sender`, or a client with no user id, is not
-/// provably ours, so it is refused like anyone else's. The error is exactly
-/// [`NOT_OWN_EVENT`] (no context wrapped around it), so the reply's `error`
-/// is the bare token a client matches on.
-fn ensure_own_event(sender: Option<&str>, own: Option<&UserId>) -> Result<()> {
-    match (sender, own) {
-        (Some(sender), Some(own)) if sender == own.as_str() => Ok(()),
-        _ => anyhow::bail!(NOT_OWN_EVENT),
-    }
+/// `redact` only touches the daemon's own reactions (#220): the fetched
+/// event must have `type` `m.reaction`, carry no `state_key` at all (a state
+/// event is room configuration, never a reaction), and have this daemon's
+/// user id as its `sender`. Fails closed: an event that did not parse, a
+/// missing or non-string `type`/`sender`, or a client with no user id is not
+/// provably one of ours and is refused like anyone else's. The error is
+/// exactly [`NOT_OWN_REACTION`] (no context wrapped around it), so the
+/// reply's `error` is the bare token a client matches on.
+fn ensure_own_reaction(event: Option<&Value>, own: Option<&UserId>) -> Result<()> {
+    let Some(event) = event.and_then(Value::as_object) else {
+        anyhow::bail!(NOT_OWN_REACTION);
+    };
+    let is_reaction = event.get("type").and_then(Value::as_str) == Some("m.reaction");
+    let is_state = event.contains_key("state_key");
+    let is_own = match (event.get("sender").and_then(Value::as_str), own) {
+        (Some(sender), Some(own)) => sender == own.as_str(),
+        _ => false,
+    };
+    anyhow::ensure!(is_reaction && !is_state && is_own, NOT_OWN_REACTION);
+    Ok(())
 }
 
 /// The `"send"` success reply.
@@ -3035,19 +3051,77 @@ mod tests {
     }
 
     #[test]
-    fn ensure_own_event_accepts_only_the_daemons_own_user() {
+    fn ensure_own_reaction_accepts_only_the_daemons_own_reactions() {
         let own = matrix_sdk::ruma::user_id!("@bot:example.org");
-        assert!(ensure_own_event(Some("@bot:example.org"), Some(own)).is_ok());
-        for (sender, me) in [
-            (Some("@alice:example.org"), Some(own)),
+        let reaction = |sender: &str| {
+            json!({
+                "type": "m.reaction", "sender": sender, "event_id": "$r",
+                "content": {"m.relates_to": {
+                    "rel_type": "m.annotation", "event_id": "$t", "key": "🤖",
+                }},
+            })
+        };
+        assert!(ensure_own_reaction(Some(&reaction("@bot:example.org")), Some(own)).is_ok());
+
+        let mut own_state_reaction = reaction("@bot:example.org");
+        own_state_reaction["state_key"] = json!("");
+        let mut null_state_key = reaction("@bot:example.org");
+        null_state_key["state_key"] = Value::Null;
+        let mut untyped = reaction("@bot:example.org");
+        untyped.as_object_mut().unwrap().remove("type");
+        let mut unsent = reaction("@bot:example.org");
+        unsent.as_object_mut().unwrap().remove("sender");
+        let refused = [
+            (
+                Some(reaction("@alice:example.org")),
+                Some(own),
+                "another sender",
+            ),
             // Same localpart, other server: not us.
-            (Some("@bot:evil.example"), Some(own)),
-            // Fails closed when either side is unknown.
-            (None, Some(own)),
-            (Some("@bot:example.org"), None),
-        ] {
-            let err = ensure_own_event(sender, me).unwrap_err();
-            assert_eq!(format!("{err:#}"), NOT_OWN_EVENT, "{sender:?}");
+            (
+                Some(reaction("@bot:evil.example")),
+                Some(own),
+                "lookalike sender",
+            ),
+            (
+                Some(
+                    json!({"type": "m.room.message", "sender": "@bot:example.org",
+                    "content": {"msgtype": "m.text", "body": "hi"}}),
+                ),
+                Some(own),
+                "own message",
+            ),
+            (
+                Some(
+                    json!({"type": "m.room.name", "state_key": "", "sender": "@bot:example.org",
+                    "content": {"name": "fleet"}}),
+                ),
+                Some(own),
+                "own state event",
+            ),
+            (
+                Some(
+                    json!({"type": "m.room.encrypted", "sender": "@bot:example.org",
+                    "content": {"algorithm": "m.megolm.v1.aes-sha2"}}),
+                ),
+                Some(own),
+                "undecryptable own event",
+            ),
+            (
+                Some(own_state_reaction),
+                Some(own),
+                "reaction type with a state_key",
+            ),
+            (Some(null_state_key), Some(own), "null state_key"),
+            (Some(untyped), Some(own), "no type"),
+            (Some(unsent), Some(own), "no sender"),
+            (Some(json!("not an object")), Some(own), "not an object"),
+            (None, Some(own), "unparseable event"),
+            (Some(reaction("@bot:example.org")), None, "no own user id"),
+        ];
+        for (event, me, why) in refused {
+            let err = ensure_own_reaction(event.as_ref(), me).unwrap_err();
+            assert_eq!(format!("{err:#}"), NOT_OWN_REACTION, "{why}");
         }
     }
 
@@ -3173,10 +3247,37 @@ mod tests {
 
     const FAKE_ROOM: &str = "!room:example.org";
     const FAKE_BOT: &str = "@bot:example.org";
-    /// An event `GET /event` reports as sent by the daemon's own account.
-    const FAKE_OWN_EVENT: &str = "$own-reaction";
-    /// An event `GET /event` reports as sent by someone else.
+    /// Events `GET /event` knows, by who sent them and what they are — see
+    /// `fake_event`.
+    const FAKE_OWN_REACTION: &str = "$own-reaction";
+    const FAKE_OTHER_REACTION: &str = "$alice-reaction";
+    const FAKE_OWN_MESSAGE: &str = "$own-message";
     const FAKE_OTHER_EVENT: &str = "$alice-message";
+    const FAKE_OWN_STATE: &str = "$own-room-name";
+
+    /// The event `GET /event/{event_id}` answers with, if any.
+    fn fake_event(event_id: &str) -> Option<Value> {
+        let reaction = json!({"m.relates_to": {
+            "rel_type": "m.annotation", "event_id": FAKE_OTHER_EVENT, "key": "🤖",
+        }});
+        let message = json!({"msgtype": "m.text", "body": "hi"});
+        let (kind, sender, state_key, content) = match event_id {
+            FAKE_OWN_REACTION => ("m.reaction", FAKE_BOT, None, reaction),
+            FAKE_OTHER_REACTION => ("m.reaction", "@alice:example.org", None, reaction),
+            FAKE_OWN_MESSAGE => ("m.room.message", FAKE_BOT, None, message),
+            FAKE_OTHER_EVENT => ("m.room.message", "@alice:example.org", None, message),
+            FAKE_OWN_STATE => ("m.room.name", FAKE_BOT, Some(""), json!({"name": "fleet"})),
+            _ => return None,
+        };
+        let mut event = json!({
+            "type": kind, "room_id": FAKE_ROOM, "sender": sender,
+            "event_id": event_id, "origin_server_ts": 3, "content": content,
+        });
+        if let Some(state_key) = state_key {
+            event["state_key"] = json!(state_key);
+        }
+        Some(event)
+    }
     const FAKE_REACTION_ID: &str = "$new-reaction";
 
     fn percent_decode(s: &str) -> String {
@@ -3240,21 +3341,10 @@ mod tests {
                 } else if m == "PUT" && rest.starts_with("redact/") {
                     (200, json!({"event_id": "$redaction"}))
                 } else if m == "GET" && rest.starts_with("event/") {
-                    let sender = match &rest["event/".len()..] {
-                        FAKE_OWN_EVENT => FAKE_BOT,
-                        FAKE_OTHER_EVENT => "@alice:example.org",
-                        _ => return (404, not_found),
-                    };
-                    let event_id = &rest["event/".len()..];
-                    (
-                        200,
-                        json!({
-                            "type": "m.room.message", "room_id": FAKE_ROOM,
-                            "sender": sender, "event_id": event_id,
-                            "origin_server_ts": 3,
-                            "content": {"msgtype": "m.text", "body": "hi"},
-                        }),
-                    )
+                    match fake_event(&rest["event/".len()..]) {
+                        Some(event) => (200, event),
+                        None => (404, not_found),
+                    }
                 } else {
                     (404, not_found)
                 }
@@ -3434,39 +3524,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redact_of_the_daemons_own_event_redacts_it() {
+    async fn redact_of_the_daemons_own_reaction_redacts_it() {
         let hs = FakeHomeserver::start().await;
         let (mut write, mut read) = spawn_live_conn(&hs).await;
         send(
             &mut write,
-            json!({"op": "redact", "room": FAKE_ROOM, "event_id": FAKE_OWN_EVENT, "reason": "done"}),
+            json!({"op": "redact", "room": FAKE_ROOM, "event_id": FAKE_OWN_REACTION, "reason": "done"}),
         )
         .await;
         let reply = recv(&mut read).await;
         assert_eq!(
             reply,
-            json!({"ok": true, "id": null, "event_id": FAKE_OWN_EVENT, "room_id": FAKE_ROOM})
+            json!({"ok": true, "id": null, "event_id": FAKE_OWN_REACTION, "room_id": FAKE_ROOM})
         );
-        let redactions = hs.requests_matching("PUT", &format!("/redact/{FAKE_OWN_EVENT}/"));
+        let redactions = hs.requests_matching("PUT", &format!("/redact/{FAKE_OWN_REACTION}/"));
         assert_eq!(redactions.len(), 1, "{redactions:?}");
         assert_eq!(redactions[0].body, json!({"reason": "done"}));
     }
 
-    #[tokio::test]
-    async fn redact_of_another_senders_event_is_refused_and_sends_nothing() {
+    /// Drive one `redact` that must be refused with `not_own_reaction`, and
+    /// check that no redaction went out.
+    async fn assert_redact_refused(event_id: &str) {
         let hs = FakeHomeserver::start().await;
         let (mut write, mut read) = spawn_live_conn(&hs).await;
         send(
             &mut write,
-            json!({"op": "redact", "room": FAKE_ROOM, "event_id": FAKE_OTHER_EVENT}),
+            json!({"op": "redact", "room": FAKE_ROOM, "event_id": event_id}),
         )
         .await;
         let reply = recv(&mut read).await;
         assert_eq!(
             reply,
-            json!({"ok": false, "id": null, "error": "not_own_event"})
+            json!({"ok": false, "id": null, "error": "not_own_reaction"}),
+            "{event_id}"
         );
-        assert!(hs.requests_matching("PUT", "/redact/").is_empty());
+        // The target was fetched, so the refusal is the own-reaction rule
+        // and not an earlier failure.
+        assert_eq!(
+            hs.requests_matching("GET", "/event/").len(),
+            1,
+            "{event_id}"
+        );
+        assert!(
+            hs.requests_matching("PUT", "/redact/").is_empty(),
+            "{event_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redact_of_the_daemons_own_state_event_is_refused_and_sends_nothing() {
+        assert_redact_refused(FAKE_OWN_STATE).await;
+    }
+
+    #[tokio::test]
+    async fn redact_of_the_daemons_own_message_is_refused_and_sends_nothing() {
+        // Every persona shares the daemon's account (D4): an own message may
+        // be another persona's, so only reactions are redactable.
+        assert_redact_refused(FAKE_OWN_MESSAGE).await;
+    }
+
+    #[tokio::test]
+    async fn redact_of_another_senders_reaction_is_refused_and_sends_nothing() {
+        assert_redact_refused(FAKE_OTHER_REACTION).await;
+    }
+
+    #[tokio::test]
+    async fn redact_of_another_senders_message_is_refused_and_sends_nothing() {
+        assert_redact_refused(FAKE_OTHER_EVENT).await;
     }
 
     #[tokio::test]

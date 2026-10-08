@@ -444,12 +444,20 @@ room), and work in encrypted rooms. Neither is logged.
 {"op": "react", "room": "!room:example.org", "event_id": "$target", "key": "🤖"}
 {"ok": true, "event_id": "$the-reaction", "room_id": "!room:example.org"}
 
-// Take it back. Only events this daemon's own account sent can be redacted;
-// anything else is refused with exactly "not_own_event". `reason` is optional.
+// Take it back. Only the daemon's own reactions can be redacted; anything else
+// is refused with exactly "not_own_reaction". `reason` is optional.
 {"op": "redact", "room": "!room:example.org", "event_id": "$the-reaction", "reason": "done"}
 {"ok": true, "event_id": "$the-reaction", "room_id": "!room:example.org"}
-{"ok": false, "error": "not_own_event"}
+{"ok": false, "error": "not_own_reaction"}
 ```
+
+`redact` fetches the target and redacts it only if it is an `m.reaction`, is not a state event (has
+no `state_key`), and was sent by the daemon's own user id. A sender check alone would not be enough,
+for two reasons. The daemon's account also sent the state of every room it created (encryption, name,
+power levels, space links, its own membership), and redacting that state would quietly break the
+room. And every persona shares that one account, so the daemon's "own" messages include other
+personas' messages. A target the daemon can't decrypt is refused too, because its real type can't be
+checked.
 
 As with every op, a request `id` is echoed back on the reply, and any failure (bad key, unknown
 room, unknown event) is `{"ok": false, "error": "<reason>"}`.
