@@ -430,6 +430,30 @@ it across a fleet (`safehouse-mcp status` on each host) to spot a host still run
 binary, the same class of silent skew that let one host drift onto a config predating the current
 schema (see "Provisioning parity" above) go undiagnosed.
 
+**Which ops a daemon answers (#220):** `status` and `hello` also carry `ops`, the list of socket ops
+this build answers. Probe it before using an op added after a host may have been provisioned: a
+daemon without the `ops` field predates it, and has neither `react` nor `redact`.
+
+**Reactions: `react` and `redact` (#220).** Both act as the daemon's own Matrix account, pass the
+same persona gate as `send` (`hello` first), take a mandatory `room` (id, name or alias of a joined
+room), and work in encrypted rooms. Neither is logged.
+
+```jsonc
+// Put a reaction (an m.reaction with an m.annotation relation) on an event.
+// `key` is an emoji or short string: 1-16 bytes of UTF-8, no control characters.
+{"op": "react", "room": "!room:example.org", "event_id": "$target", "key": "🤖"}
+{"ok": true, "event_id": "$the-reaction", "room_id": "!room:example.org"}
+
+// Take it back. Only events this daemon's own account sent can be redacted;
+// anything else is refused with exactly "not_own_event". `reason` is optional.
+{"op": "redact", "room": "!room:example.org", "event_id": "$the-reaction", "reason": "done"}
+{"ok": true, "event_id": "$the-reaction", "room_id": "!room:example.org"}
+{"ok": false, "error": "not_own_event"}
+```
+
+As with every op, a request `id` is echoed back on the reply, and any failure (bad key, unknown
+room, unknown event) is `{"ok": false, "error": "<reason>"}`.
+
 Run `safehouse-mcp --help` for the full flag list. With no subcommand (or on a bare TTY), the
 binary keeps its original behavior unchanged: a stdio MCP server for an MCP client to launch.
 
