@@ -412,6 +412,15 @@ daemon shows both climbing together with `connected: false` and a growing `retry
 every other op, `status` requires no `hello` — it's queryable even against a daemon stuck before
 persona auth, which is exactly the scenario a liveness check needs to survive.
 
+**Room health in `status` (#222):** the `status` reply also carries an additive `rooms` array, one
+entry per joined room: `{"room_id": "!abc:example.org", "joined_member_count": 3}`; `"rooms": []`
+when the daemon has joined none. Values come from the Matrix SDK's local cache only — serving
+`status` never makes a network request or waits for a sync — so they are point-in-time and cached:
+`joined_member_count` can lag the homeserver and may be `0` before the SDK has populated a room
+summary. It complements `last_sync_completed_secs_ago`: that field says whether the daemon is still
+syncing; `rooms` says what it currently believes about each room's membership (e.g. a room it
+thinks is empty or missing). Older clients can ignore `rooms`; all other `status` keys are unchanged.
+
 **Diagnosing envelope-type skew (#95):** `status` (and the `hello` reply) also carries
 `known_types`, the envelope `type` vocabulary this build understands. A sender newer than the daemon
 it's talking to can compare lists up front instead of inferring the gap from behavior — and nothing
