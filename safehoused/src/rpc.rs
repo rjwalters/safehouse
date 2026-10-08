@@ -399,6 +399,18 @@ impl Registry {
     }
 }
 
+/// Serialize `(room_id, joined_member_count)` pairs as the `status` reply's
+/// additive `rooms` array. Counts are the SDK's cached values and may be 0
+/// when no room summary has been populated yet.
+fn rooms_json(rooms: &[(String, u64)]) -> Value {
+    Value::Array(
+        rooms
+            .iter()
+            .map(|(id, n)| json!({"room_id": id, "joined_member_count": n}))
+            .collect(),
+    )
+}
+
 pub async fn serve(client: Client, registry: Arc<Registry>, socket_path: PathBuf) -> Result<()> {
     let _ = std::fs::remove_file(&socket_path);
     let listener = UnixListener::bind(&socket_path)
@@ -495,7 +507,17 @@ async fn handle_conn(stream: UnixStream, client: Client, registry: Arc<Registry>
                     // `status` carries no persona-specific data to protect —
                     // it's daemon-wide liveness, safe for any local caller
                     // that can open the unix socket at all.
-                    registry.status()
+                    //
+                    // `rooms` is read from the SDK's local cache only — no
+                    // network request, no wait for a sync.
+                    let mut status = registry.status();
+                    let summaries: Vec<(String, u64)> = client
+                        .joined_rooms()
+                        .iter()
+                        .map(|r| (r.room_id().to_string(), r.joined_members_count()))
+                        .collect();
+                    status["rooms"] = rooms_json(&summaries);
+                    status
                 } else if persona.is_none() {
                     json!({"ok": false, "error": "hello first"})
                 } else {
@@ -1777,6 +1799,43 @@ mod tests {
         send(&mut write, json!({"op": "status"})).await;
         let reply = recv(&mut read).await;
         assert_eq!(reply["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn status_before_hello_keeps_existing_fields_and_has_empty_rooms() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(&mut write, json!({"op": "status"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], true);
+        for k in [
+            "connected",
+            "last_event_received_secs_ago",
+            "last_sync_completed_secs_ago",
+            "retry_attempt",
+            "retry_backoff_secs",
+            "known_types",
+            "version",
+            "ops",
+        ] {
+            assert!(reply.get(k).is_some(), "missing existing key {k}");
+        }
+        assert_eq!(reply["rooms"], json!([]));
+    }
+
+    #[test]
+    fn rooms_json_serializes_ids_and_counts_including_zero() {
+        assert_eq!(rooms_json(&[]), json!([]));
+        let v = rooms_json(&[
+            ("!a:example.org".to_owned(), 3),
+            ("!b:example.org".to_owned(), 0),
+        ]);
+        assert_eq!(
+            v,
+            json!([
+                {"room_id": "!a:example.org", "joined_member_count": 3},
+                {"room_id": "!b:example.org", "joined_member_count": 0},
+            ])
+        );
     }
 
     #[tokio::test]
