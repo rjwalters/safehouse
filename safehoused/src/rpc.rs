@@ -1099,9 +1099,18 @@ async fn read_messages(events: &[Value], own: &str, registry: &Registry) -> Resu
         // §5.2: resolve the thread agent the same way the live
         // dispatch path does, so a replayed thread reply synthesizes
         // the same envelope it would have gotten in real time.
-        let thread_root =
-            envelope::thread_root_from_content(&content).or_else(|| event_id.map(str::to_owned));
-        let thread_agent = match &thread_root {
+        //
+        // #224: a top-level `thread_root` is emitted only when the event
+        // carries an `m.thread` relation with a string root id; the event-id
+        // fallback below is for thread-agent lookup only and is never
+        // exposed, so a thread root / main-timeline event never looks
+        // threaded.
+        let relation_root = envelope::thread_root_from_content(&content);
+        if let Some(root) = &relation_root {
+            obj.insert("thread_root".into(), json!(root));
+        }
+        let routing_root = relation_root.or_else(|| event_id.map(str::to_owned));
+        let thread_agent = match &routing_root {
             Some(root) => registry.threads.target_for_thread(root).await,
             None => None,
         };
@@ -2790,6 +2799,120 @@ mod tests {
         assert!(root.is_none() && relates.is_none());
     }
 
+    /// The single `read` row for one raw event, or `None` if it is skipped.
+    async fn read_row(registry: &Registry, ev: &Value, own: &str) -> Option<Value> {
+        read_messages(std::slice::from_ref(ev), own, registry)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+    }
+
+    #[tokio::test]
+    async fn read_row_thread_root_only_for_thread_relations() {
+        let (_w, _r, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        let own = "@bot:x";
+        let row = |ev: Value| {
+            let registry = &registry;
+            async move { read_row(registry, &ev, own).await.unwrap() }
+        };
+        let ev = |id: &str, content: Value| {
+            json!({"type": "m.room.message", "event_id": id, "sender": "@h:x",
+                   "origin_server_ts": 5, "content": content})
+        };
+        let thread = |root: Value, fallback: bool| {
+            json!({"rel_type": "m.thread", "event_id": root, "is_falling_back": fallback,
+                   "m.in_reply_to": {"event_id": "$prev"}})
+        };
+
+        // Threaded human message (fallback reply pointer included).
+        let r = row(ev(
+            "$h1",
+            json!({"msgtype": "m.text", "body": "yes",
+                   "m.relates_to": thread(json!("$root"), true)}),
+        ))
+        .await;
+        assert_eq!(r["thread_root"], "$root");
+        assert_eq!(r["event_id"], "$h1");
+        assert_eq!(r["sender"], "@h:x");
+        assert_eq!(r["own"], false);
+        assert_eq!(r["ts"], 5);
+        assert_eq!(r["envelope"]["body"], "yes");
+
+        // Threaded native envelope.
+        let r = row(ev(
+            "$n1",
+            json!({"msgtype": "m.text", "body": "x",
+                   "m.relates_to": thread(json!("$root2"), false),
+                   envelope::ENVELOPE_KEY: {"v": 1, "from": "writer_agent", "to": "*",
+                                            "type": "chat", "body": "hello"}}),
+        ))
+        .await;
+        assert_eq!(r["thread_root"], "$root2");
+        assert_eq!(r["envelope"]["body"], "hello");
+
+        // Threaded attachment and unsupported envelope version keep the key.
+        let r = row(ev(
+            "$a1",
+            json!({"msgtype": "m.file", "body": "f.txt",
+                   "m.relates_to": thread(json!("$root"), false)}),
+        ))
+        .await;
+        assert_eq!(r["thread_root"], "$root");
+        assert_eq!(r["attachment"]["name"], "f.txt");
+        let r = row(ev(
+            "$u1",
+            json!({"msgtype": "m.text", "body": "x",
+                   "m.relates_to": thread(json!("$root"), false),
+                   envelope::ENVELOPE_KEY: {"v": 99}}),
+        ))
+        .await;
+        assert_eq!(r["thread_root"], "$root");
+        assert_eq!(r["unsupported_version"], 99);
+
+        // Negatives: key absent entirely.
+        let plain = json!({"msgtype": "m.text", "body": "hi"});
+        let reply = json!({"msgtype": "m.text", "body": "hi",
+            "m.relates_to": {"m.in_reply_to": {"event_id": "$p"}}});
+        let other_rel = json!({"msgtype": "m.text", "body": "hi",
+            "m.relates_to": {"rel_type": "m.annotation", "event_id": "$p"}});
+        let no_id = json!({"msgtype": "m.text", "body": "hi",
+            "m.relates_to": {"rel_type": "m.thread"}});
+        let bad_id = json!({"msgtype": "m.text", "body": "hi",
+            "m.relates_to": thread(json!(42), false)});
+        for (i, c) in [plain, reply, other_rel, no_id, bad_id]
+            .into_iter()
+            .enumerate()
+        {
+            let r = row(ev(&format!("$neg{i}"), c)).await;
+            assert!(r.get("thread_root").is_none(), "case {i}: {r}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_row_routing_fallback_independent_of_exposed_root() {
+        let (_w, _r, registry) =
+            spawn_conn(vec!["writer_agent".to_owned(), "research_agent".to_owned()]).await;
+        let env = thread_env("research_agent", None);
+        registry.threads.observe("$root", "$root", &env).await;
+        // The root event itself: routed via its own id, but no thread_root key.
+        let ev = json!({"type": "m.room.message", "event_id": "$root", "sender": "@h:x",
+            "content": {"msgtype": "m.text", "body": "start"}});
+        let r = read_row(&registry, &ev, "@bot:x").await.unwrap();
+        assert!(r.get("thread_root").is_none());
+        assert_eq!(r["envelope"]["to"], "research_agent");
+        // A thread reply routes to the same agent and exposes the root.
+        let ev = json!({"type": "m.room.message", "event_id": "$r1", "sender": "@h:x",
+            "content": {"msgtype": "m.text", "body": "yes",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"}}});
+        let r = read_row(&registry, &ev, "@bot:x").await.unwrap();
+        assert_eq!(r["thread_root"], "$root");
+        assert_eq!(r["envelope"]["to"], "research_agent");
+        // Non-message events are skipped.
+        let ev = json!({"type": "m.reaction", "event_id": "$z", "content": {}});
+        assert!(read_row(&registry, &ev, "@bot:x").await.is_none());
+    }
+
     #[tokio::test]
     async fn check_surfaces_matrix_metadata_only_when_present() {
         let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
@@ -3986,6 +4109,34 @@ mod tests {
         // The attachment is still described from the original event.
         assert!(rows[0].get("attachment").is_some(), "{}", rows[0]);
         assert!(rx.try_recv().is_err(), "a stored note is not queued");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_threaded_voice_note_gets_transcript_and_thread_root() {
+        let dir = crate::test_support::tempdir("safehoused-read-voice-thread");
+        let (registry, voice, _rx) = voice_registry(&dir.join("runs"), 2).await;
+        voice
+            .persist(
+                "$tv",
+                &crate::transcribe::Transcription::Transcribed {
+                    body: "🎙 (voice note, 0:42) ship it".into(),
+                    transcript: "ship it".into(),
+                },
+            )
+            .await;
+        let mut ev = voice_event("$tv");
+        ev["content"]["m.relates_to"] = json!({"rel_type": "m.thread", "event_id": "$root",
+            "is_falling_back": true, "m.in_reply_to": {"event_id": "$prev"}});
+        let rows = read_messages(&[ev, voice_event("$plain")], "", &registry)
+            .await
+            .unwrap();
+        // #232 transcript and #224 thread_root on the same threaded row.
+        assert_eq!(body_of(&rows[0]), "🎙 (voice note, 0:42) ship it");
+        assert_eq!(rows[0]["thread_root"], "$root");
+        assert!(rows[0].get("attachment").is_some(), "{}", rows[0]);
+        // A main-timeline voice note has no thread_root key at all.
+        assert!(rows[1].get("thread_root").is_none(), "{}", rows[1]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
