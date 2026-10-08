@@ -25,6 +25,8 @@ use matrix_sdk::{
     },
     ruma::{
         api::client::room::create_room::v3::{CreationContent, Request as CreateRoomRequest},
+        events::reaction::ReactionEventContent,
+        events::relation::Annotation,
         events::room::message::{AddMentions, TextMessageEventContent},
         events::{
             space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
@@ -32,7 +34,7 @@ use matrix_sdk::{
         },
         room::RoomType,
         serde::Raw,
-        OwnedServerName, OwnedUserId, RoomId, UInt,
+        OwnedEventId, OwnedServerName, OwnedUserId, RoomId, UInt, UserId,
     },
     Client, Room, RoomState,
 };
@@ -50,6 +52,42 @@ use tokio::{
 /// envelope type". A local socket affordance only; nothing on the Matrix
 /// wire changes.
 const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Every op this build answers, advertised as `ops` in the `hello` and
+/// `status` replies (#220) — the op-level counterpart of `known_types`. A
+/// client probes for an op it needs (`"react" in ops`) instead of sending it
+/// and parsing an `unknown op` error; a daemon predating this field simply
+/// has no `ops` key, which a client reads as "no `react`/`redact`". Kept in
+/// step with `handle_op` by the `advertised_ops_are_all_dispatched` test.
+const OPS: &[&str] = &[
+    "hello",
+    "status",
+    "send",
+    "send_image",
+    "fetch_media",
+    "react",
+    "redact",
+    "create_room",
+    "invite",
+    "leave",
+    "add_to_space",
+    "list_rooms",
+    "read",
+    "check",
+];
+
+/// The longest reaction `key` the `react` op accepts, in UTF-8 bytes (#220):
+/// room for a single emoji — including multi-codepoint ones like a flag or a
+/// skin-toned hand (8 bytes each) — or a short word, and nothing that could
+/// carry a message body through the annotation side door. The limit is the
+/// issue's, fixed by the protocol: a long ZWJ sequence such as a family emoji
+/// (18 bytes) is over it.
+const MAX_REACTION_KEY_BYTES: usize = 16;
+
+/// The `error` a `redact` gets for any target that is not one of this
+/// daemon's own reactions (#220), verbatim: the one error string of the op
+/// that clients are expected to match on.
+const NOT_OWN_REACTION: &str = "not_own_reaction";
 
 use crate::{
     envelope::{self, Envelope},
@@ -252,6 +290,8 @@ impl Registry {
             // vocabulary — lets a healthcheck answer "is this host on a
             // stale build" without needing `hello` first.
             "version": DAEMON_VERSION,
+            // #220: the ops this build answers, as in the `hello` reply.
+            "ops": OPS,
         })
     }
 
@@ -436,6 +476,9 @@ async fn handle_conn(stream: UnixStream, client: Client, registry: Arc<Registry>
                                 // #101: the running binary's own version —
                                 // see `DAEMON_VERSION`'s doc comment.
                                 "version": DAEMON_VERSION,
+                                // #220: the ops this build answers — see
+                                // `OPS`'s doc comment.
+                                "ops": OPS,
                             })
                         }
                         Some(p) => json!({
@@ -618,6 +661,54 @@ async fn handle_op(
                 "name": name,
                 "size": data.len(),
                 "data_base64": base64::engine::general_purpose::STANDARD.encode(&data),
+            }))
+        }
+        "react" => {
+            // #220: an `m.annotation` reaction, sent as the daemon's own
+            // account (D4 — one Matrix account speaks for every persona; the
+            // persona gate in `handle_conn` is the access check, as for
+            // `send`). `Room::send` encrypts in an encrypted room exactly as
+            // `send`'s `send_raw` does. The request is validated before the
+            // room is resolved, so a bad key is reported on its own terms.
+            let target = parse_react(req)?;
+            let room = resolve_room(client, Some(required_room("react", req)?))?;
+            let content = ReactionEventContent::new(Annotation::new(target.event_id, target.key));
+            let response = room.send(content).await.context("sending reaction")?;
+            Ok(json!({
+                "ok": true,
+                "event_id": response.response.event_id.to_string(),
+                "room_id": room.room_id().as_str(),
+            }))
+        }
+        "redact" => {
+            // #220: take back a reaction this daemon put on with `react` —
+            // and nothing else. Fetch the target first and refuse unless it
+            // is an `m.reaction`, not a state event, sent by our own user id
+            // (`ensure_own_reaction`). Sender alone is not enough: the
+            // daemon's account also sent the state of every room it built
+            // (encryption, name, power levels, space links, its membership),
+            // which `GET /event` returns too and a redaction would strip,
+            // and — every persona sharing one account (D4) — other personas'
+            // messages. Redactions themselves are never encrypted (the spec
+            // keeps `m.room.redaction` in the clear), so this works unchanged
+            // in an encrypted room; `Room::event` decrypts the target, so an
+            // encrypted reaction is checked by its real type, and one it
+            // cannot decrypt stays `m.room.encrypted` and is refused.
+            let target = parse_redact(req)?;
+            let room = resolve_room(client, Some(required_room("redact", req)?))?;
+            let event = room
+                .event(&target.event_id, None)
+                .await
+                .context("fetching the event")?;
+            let fetched: Option<Value> = serde_json::from_str(event.raw().json().get()).ok();
+            ensure_own_reaction(fetched.as_ref(), client.user_id())?;
+            room.redact(&target.event_id, target.reason.as_deref(), None)
+                .await
+                .context("redacting the event")?;
+            Ok(json!({
+                "ok": true,
+                "event_id": target.event_id.as_str(),
+                "room_id": room.room_id().as_str(),
             }))
         }
         "create_room" => {
@@ -1186,6 +1277,102 @@ fn parse_send_image(req: &Value) -> Result<SendImage> {
         height: dim("height")?,
         reply_to,
     })
+}
+
+/// A validated `react` request (#220): the event to annotate and the key.
+#[derive(Debug)]
+struct ReactRequest {
+    event_id: OwnedEventId,
+    key: String,
+}
+
+/// A validated `redact` request (#220).
+#[derive(Debug)]
+struct RedactRequest {
+    event_id: OwnedEventId,
+    reason: Option<String>,
+}
+
+fn parse_react(req: &Value) -> Result<ReactRequest> {
+    let event_id = parse_event_id("react", req)?;
+    let key = req
+        .get("key")
+        .and_then(Value::as_str)
+        .context("react requires `key`")?;
+    validate_reaction_key(key)?;
+    Ok(ReactRequest {
+        event_id,
+        key: key.to_owned(),
+    })
+}
+
+fn parse_redact(req: &Value) -> Result<RedactRequest> {
+    let event_id = parse_event_id("redact", req)?;
+    let reason = match req.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(r)) => Some(r.clone()),
+        Some(_) => anyhow::bail!("redact `reason` must be a string"),
+    };
+    Ok(RedactRequest { event_id, reason })
+}
+
+/// The `event_id` of a `react`/`redact` request, parsed as a Matrix event id.
+fn parse_event_id(op: &str, req: &Value) -> Result<OwnedEventId> {
+    let event_id = req
+        .get("event_id")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{op} requires `event_id`"))?;
+    OwnedEventId::try_from(event_id)
+        .map_err(|_| anyhow::anyhow!("event_id {event_id:?} is not an event id"))
+}
+
+/// The `room` of a `react`/`redact` request. Mandatory, unlike `send`'s: an
+/// event id only means something inside its room, so `resolve_room`'s "the
+/// sole joined room" shorthand could only ever guess — and for `redact`, as
+/// for `leave`, a guess is a hazard.
+fn required_room<'a>(op: &str, req: &'a Value) -> Result<&'a str> {
+    req.get("room")
+        .and_then(Value::as_str)
+        .with_context(|| format!("`room` required for `{op}`"))
+}
+
+/// A reaction key is a single emoji or a short string (#220): non-empty, at
+/// most [`MAX_REACTION_KEY_BYTES`] bytes of UTF-8, and free of control
+/// characters (newline, tab, NUL, DEL and the rest of C0/C1: `char::is_control`).
+fn validate_reaction_key(key: &str) -> Result<()> {
+    anyhow::ensure!(!key.is_empty(), "reaction key must not be empty");
+    anyhow::ensure!(
+        key.len() <= MAX_REACTION_KEY_BYTES,
+        "reaction key is {} bytes; at most {MAX_REACTION_KEY_BYTES} allowed",
+        key.len()
+    );
+    anyhow::ensure!(
+        !key.chars().any(char::is_control),
+        "reaction key must not contain control characters"
+    );
+    Ok(())
+}
+
+/// `redact` only touches the daemon's own reactions (#220): the fetched
+/// event must have `type` `m.reaction`, carry no `state_key` at all (a state
+/// event is room configuration, never a reaction), and have this daemon's
+/// user id as its `sender`. Fails closed: an event that did not parse, a
+/// missing or non-string `type`/`sender`, or a client with no user id is not
+/// provably one of ours and is refused like anyone else's. The error is
+/// exactly [`NOT_OWN_REACTION`] (no context wrapped around it), so the
+/// reply's `error` is the bare token a client matches on.
+fn ensure_own_reaction(event: Option<&Value>, own: Option<&UserId>) -> Result<()> {
+    let Some(event) = event.and_then(Value::as_object) else {
+        anyhow::bail!(NOT_OWN_REACTION);
+    };
+    let is_reaction = event.get("type").and_then(Value::as_str) == Some("m.reaction");
+    let is_state = event.contains_key("state_key");
+    let is_own = match (event.get("sender").and_then(Value::as_str), own) {
+        (Some(sender), Some(own)) => sender == own.as_str(),
+        _ => false,
+    };
+    anyhow::ensure!(is_reaction && !is_state && is_own, NOT_OWN_REACTION);
+    Ok(())
 }
 
 /// The `"send"` success reply.
@@ -2797,5 +2984,671 @@ mod tests {
         }
         let big = vec![b'a'; super::MAX_FETCH_BYTES + 1];
         assert!(super::fetch_media_type("text/plain", &big).is_err());
+    }
+
+    // ---- `react` / `redact` (issue #220) ----------------------------------
+    //
+    // Parsing, key validation and the own-event rule are pure and tested
+    // directly. The ops themselves are driven over the socket exactly like
+    // `send`'s neighbors above, first against the offline client (failures
+    // that happen before any Matrix request), then against `FakeHomeserver`
+    // below: a logged-in client with one joined room, so the full path —
+    // gating, resolution, the matrix-sdk call, the reply — runs for real.
+
+    #[test]
+    fn reaction_key_accepts_emoji_and_short_strings() {
+        for key in ["🤖", "👍🏽", "🇺🇸", "❤️", "busy", "ok!", "x"] {
+            validate_reaction_key(key).unwrap_or_else(|e| panic!("{key:?}: {e:#}"));
+        }
+        // Exactly at the limit is fine.
+        validate_reaction_key(&"a".repeat(MAX_REACTION_KEY_BYTES)).unwrap();
+    }
+
+    #[test]
+    fn reaction_key_refuses_empty_long_and_control_characters() {
+        assert!(validate_reaction_key("").is_err());
+        // 17 bytes of ASCII, and a 20-byte emoji sequence that is only a few
+        // visible characters: the limit is bytes, not chars.
+        assert!(validate_reaction_key(&"a".repeat(MAX_REACTION_KEY_BYTES + 1)).is_err());
+        assert!(validate_reaction_key("🤖🤖🤖🤖🤖").is_err());
+        assert!(validate_reaction_key("👨\u{200d}👩\u{200d}👧").is_err());
+        for key in ["a\nb", "\t", "a\0", "\u{7f}", "\u{85}x", "\u{1b}[31m"] {
+            let err = validate_reaction_key(key).unwrap_err();
+            assert!(format!("{err:#}").contains("control"), "{key:?}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn parse_react_reads_event_id_and_key() {
+        let r =
+            parse_react(&json!({"op": "react", "room": "!r:x", "event_id": "$abc", "key": "🤖"}))
+                .unwrap();
+        assert_eq!(r.event_id.as_str(), "$abc");
+        assert_eq!(r.key, "🤖");
+    }
+
+    #[test]
+    fn parse_react_refuses_missing_or_bad_fields() {
+        let err = |req: Value| format!("{:#}", parse_react(&req).unwrap_err());
+        assert!(err(json!({"key": "🤖"})).contains("requires `event_id`"));
+        assert!(err(json!({"event_id": "abc", "key": "🤖"})).contains("not an event id"));
+        assert!(err(json!({"event_id": "$abc"})).contains("requires `key`"));
+        assert!(err(json!({"event_id": "$abc", "key": 7})).contains("requires `key`"));
+        assert!(err(json!({"event_id": "$abc", "key": "a\nb"})).contains("control"));
+    }
+
+    #[test]
+    fn parse_redact_reads_an_optional_reason() {
+        let r = parse_redact(&json!({"event_id": "$abc"})).unwrap();
+        assert_eq!(r.event_id.as_str(), "$abc");
+        assert_eq!(r.reason, None);
+        let r = parse_redact(&json!({"event_id": "$abc", "reason": null})).unwrap();
+        assert_eq!(r.reason, None);
+        let r = parse_redact(&json!({"event_id": "$abc", "reason": "done"})).unwrap();
+        assert_eq!(r.reason.as_deref(), Some("done"));
+        assert!(parse_redact(&json!({"event_id": "$abc", "reason": 1})).is_err());
+        assert!(parse_redact(&json!({})).is_err());
+    }
+
+    #[test]
+    fn ensure_own_reaction_accepts_only_the_daemons_own_reactions() {
+        let own = matrix_sdk::ruma::user_id!("@bot:example.org");
+        let reaction = |sender: &str| {
+            json!({
+                "type": "m.reaction", "sender": sender, "event_id": "$r",
+                "content": {"m.relates_to": {
+                    "rel_type": "m.annotation", "event_id": "$t", "key": "🤖",
+                }},
+            })
+        };
+        assert!(ensure_own_reaction(Some(&reaction("@bot:example.org")), Some(own)).is_ok());
+
+        let mut own_state_reaction = reaction("@bot:example.org");
+        own_state_reaction["state_key"] = json!("");
+        let mut null_state_key = reaction("@bot:example.org");
+        null_state_key["state_key"] = Value::Null;
+        let mut untyped = reaction("@bot:example.org");
+        untyped.as_object_mut().unwrap().remove("type");
+        let mut unsent = reaction("@bot:example.org");
+        unsent.as_object_mut().unwrap().remove("sender");
+        let refused = [
+            (
+                Some(reaction("@alice:example.org")),
+                Some(own),
+                "another sender",
+            ),
+            // Same localpart, other server: not us.
+            (
+                Some(reaction("@bot:evil.example")),
+                Some(own),
+                "lookalike sender",
+            ),
+            (
+                Some(
+                    json!({"type": "m.room.message", "sender": "@bot:example.org",
+                    "content": {"msgtype": "m.text", "body": "hi"}}),
+                ),
+                Some(own),
+                "own message",
+            ),
+            (
+                Some(
+                    json!({"type": "m.room.name", "state_key": "", "sender": "@bot:example.org",
+                    "content": {"name": "fleet"}}),
+                ),
+                Some(own),
+                "own state event",
+            ),
+            (
+                Some(
+                    json!({"type": "m.room.encrypted", "sender": "@bot:example.org",
+                    "content": {"algorithm": "m.megolm.v1.aes-sha2"}}),
+                ),
+                Some(own),
+                "undecryptable own event",
+            ),
+            (
+                Some(own_state_reaction),
+                Some(own),
+                "reaction type with a state_key",
+            ),
+            (Some(null_state_key), Some(own), "null state_key"),
+            (Some(untyped), Some(own), "no type"),
+            (Some(unsent), Some(own), "no sender"),
+            (Some(json!("not an object")), Some(own), "not an object"),
+            (None, Some(own), "unparseable event"),
+            (Some(reaction("@bot:example.org")), None, "no own user id"),
+        ];
+        for (event, me, why) in refused {
+            let err = ensure_own_reaction(event.as_ref(), me).unwrap_err();
+            assert_eq!(format!("{err:#}"), NOT_OWN_REACTION, "{why}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_and_status_advertise_react_and_redact() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(&mut write, json!({"op": "status"})).await;
+        let status = recv(&mut read).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        let hello = recv(&mut read).await;
+        for reply in [&status, &hello] {
+            let ops: Vec<&str> = reply["ops"]
+                .as_array()
+                .expect("`ops` is an array")
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert!(ops.contains(&"react") && ops.contains(&"redact"), "{ops:?}");
+            assert!(ops.contains(&"send"), "{ops:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn react_and_redact_require_hello_first() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        for op in ["react", "redact"] {
+            send(
+                &mut write,
+                json!({"op": op, "room": "!r:x", "event_id": "$e", "key": "🤖"}),
+            )
+            .await;
+            let reply = recv(&mut read).await;
+            assert_eq!(reply["ok"], false);
+            assert_eq!(reply["error"], "hello first");
+        }
+    }
+
+    #[tokio::test]
+    async fn react_and_redact_validate_before_resolving_the_room() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+        for (req, expected) in [
+            (
+                json!({"op": "react", "room": "!nope:x", "event_id": "$e", "key": "way too long a key"}),
+                "at most 16",
+            ),
+            (
+                json!({"op": "react", "event_id": "$e", "key": "🤖"}),
+                "`room` required for `react`",
+            ),
+            (
+                json!({"op": "redact", "event_id": "$e"}),
+                "`room` required for `redact`",
+            ),
+            (
+                json!({"op": "redact", "room": "!nope:x"}),
+                "redact requires `event_id`",
+            ),
+        ] {
+            send(&mut write, req.clone()).await;
+            let reply = recv(&mut read).await;
+            assert_eq!(reply["ok"], false, "{req}");
+            assert!(
+                reply["error"].as_str().unwrap().contains(expected),
+                "{req}: {reply}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn react_and_redact_report_an_unknown_room() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+        for req in [
+            json!({"op": "react", "room": "!nope:x", "event_id": "$e", "key": "🤖"}),
+            json!({"op": "redact", "room": "!nope:x", "event_id": "$e"}),
+        ] {
+            send(&mut write, req.clone()).await;
+            let reply = recv(&mut read).await;
+            assert_eq!(reply["ok"], false, "{req}");
+            assert!(
+                reply["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no joined room matching"),
+                "{req}: {reply}"
+            );
+        }
+    }
+
+    /// A minimal stand-in for a homeserver: plain HTTP/1.1 on a loopback
+    /// port (this is the daemon's *outbound* Matrix client talking to its
+    /// homeserver — the agent socket stays AF_UNIX, D8), one request per
+    /// connection, canned client-server API answers for the handful of
+    /// endpoints `react`/`redact` touch, and a log of every request so a
+    /// test can assert what actually went over the wire.
+    struct FakeHomeserver {
+        url: String,
+        requests: Arc<std::sync::Mutex<Vec<FakeRequest>>>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeRequest {
+        method: String,
+        /// Percent-decoded, without the query string.
+        path: String,
+        body: Value,
+    }
+
+    const FAKE_ROOM: &str = "!room:example.org";
+    const FAKE_BOT: &str = "@bot:example.org";
+    /// Events `GET /event` knows, by who sent them and what they are — see
+    /// `fake_event`.
+    const FAKE_OWN_REACTION: &str = "$own-reaction";
+    const FAKE_OTHER_REACTION: &str = "$alice-reaction";
+    const FAKE_OWN_MESSAGE: &str = "$own-message";
+    const FAKE_OTHER_EVENT: &str = "$alice-message";
+    const FAKE_OWN_STATE: &str = "$own-room-name";
+
+    /// The event `GET /event/{event_id}` answers with, if any.
+    fn fake_event(event_id: &str) -> Option<Value> {
+        let reaction = json!({"m.relates_to": {
+            "rel_type": "m.annotation", "event_id": FAKE_OTHER_EVENT, "key": "🤖",
+        }});
+        let message = json!({"msgtype": "m.text", "body": "hi"});
+        let (kind, sender, state_key, content) = match event_id {
+            FAKE_OWN_REACTION => ("m.reaction", FAKE_BOT, None, reaction),
+            FAKE_OTHER_REACTION => ("m.reaction", "@alice:example.org", None, reaction),
+            FAKE_OWN_MESSAGE => ("m.room.message", FAKE_BOT, None, message),
+            FAKE_OTHER_EVENT => ("m.room.message", "@alice:example.org", None, message),
+            FAKE_OWN_STATE => ("m.room.name", FAKE_BOT, Some(""), json!({"name": "fleet"})),
+            _ => return None,
+        };
+        let mut event = json!({
+            "type": kind, "room_id": FAKE_ROOM, "sender": sender,
+            "event_id": event_id, "origin_server_ts": 3, "content": content,
+        });
+        if let Some(state_key) = state_key {
+            event["state_key"] = json!(state_key);
+        }
+        Some(event)
+    }
+    const FAKE_REACTION_ID: &str = "$new-reaction";
+
+    fn percent_decode(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8(out).expect("utf-8 path")
+    }
+
+    fn fake_route(method: &str, path: &str) -> (u16, Value) {
+        let not_found = json!({"errcode": "M_NOT_FOUND", "error": "not found"});
+        let room_prefix = format!("/_matrix/client/v3/rooms/{FAKE_ROOM}/");
+        match (method, path) {
+            ("GET", "/_matrix/client/versions") => (
+                200,
+                json!({"versions": ["v1.1", "v1.11"], "unstable_features": {}}),
+            ),
+            ("POST", "/_matrix/client/v3/keys/upload") => (
+                200,
+                json!({"one_time_key_counts": {"signed_curve25519": 50}}),
+            ),
+            ("POST", "/_matrix/client/v3/keys/query") => (200, json!({"device_keys": {}})),
+            ("GET", "/_matrix/client/v3/sync") => (
+                200,
+                json!({
+                    "next_batch": "s1",
+                    "rooms": {"join": {FAKE_ROOM: {
+                        "state": {"events": [
+                            {
+                                "type": "m.room.create", "state_key": "",
+                                "sender": FAKE_BOT, "event_id": "$create",
+                                "origin_server_ts": 1,
+                                "content": {"room_version": "10", "creator": FAKE_BOT},
+                            },
+                            {
+                                "type": "m.room.member", "state_key": FAKE_BOT,
+                                "sender": FAKE_BOT, "event_id": "$join",
+                                "origin_server_ts": 2,
+                                "content": {"membership": "join"},
+                            },
+                        ]},
+                        "timeline": {"events": [], "limited": false},
+                    }}},
+                }),
+            ),
+            (m, p) if p.starts_with(&room_prefix) => {
+                let rest = &p[room_prefix.len()..];
+                if m == "PUT" && rest.starts_with("send/m.reaction/") {
+                    (200, json!({"event_id": FAKE_REACTION_ID}))
+                } else if m == "PUT" && rest.starts_with("redact/") {
+                    (200, json!({"event_id": "$redaction"}))
+                } else if m == "GET" && rest.starts_with("event/") {
+                    match fake_event(&rest["event/".len()..]) {
+                        Some(event) => (200, event),
+                        None => (404, not_found),
+                    }
+                } else {
+                    (404, not_found)
+                }
+            }
+            _ => (
+                404,
+                json!({"errcode": "M_UNRECOGNIZED", "error": "unrecognized"}),
+            ),
+        }
+    }
+
+    impl FakeHomeserver {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = requests.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let log = log.clone();
+                    tokio::spawn(async move {
+                        let _ = Self::serve_one(stream, log).await;
+                    });
+                }
+            });
+            FakeHomeserver { url, requests }
+        }
+
+        async fn serve_one(
+            stream: tokio::net::TcpStream,
+            log: Arc<std::sync::Mutex<Vec<FakeRequest>>>,
+        ) -> std::io::Result<()> {
+            use tokio::io::AsyncReadExt;
+            let mut stream = BufReader::new(stream);
+            let mut request_line = String::new();
+            stream.read_line(&mut request_line).await?;
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_owned();
+            let target = parts.next().unwrap_or("");
+            let path = percent_decode(target.split('?').next().unwrap_or(""));
+            let mut content_length = 0usize;
+            loop {
+                let mut header = String::new();
+                stream.read_line(&mut header).await?;
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = header.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            let mut body = vec![0; content_length];
+            stream.read_exact(&mut body).await?;
+            let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let (status, reply) = fake_route(&method, &path);
+            log.lock().unwrap().push(FakeRequest { method, path, body });
+            let reply = reply.to_string();
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            stream.get_mut().write_all(response.as_bytes()).await?;
+            stream.get_mut().shutdown().await
+        }
+
+        /// A client logged in as `FAKE_BOT` that has synced once, so
+        /// `FAKE_ROOM` is a joined room `resolve_room` can find.
+        async fn logged_in_client(&self) -> Client {
+            let client = Client::builder()
+                .homeserver_url(&self.url)
+                .request_config(matrix_sdk::config::RequestConfig::new().disable_retry())
+                .build()
+                .await
+                .expect("client");
+            let session: matrix_sdk::authentication::matrix::MatrixSession =
+                serde_json::from_value(json!({
+                    "user_id": FAKE_BOT,
+                    "device_id": "BOTDEVICE",
+                    "access_token": "token",
+                }))
+                .expect("session json");
+            client.restore_session(session).await.expect("restore");
+            client
+                .sync_once(matrix_sdk::config::SyncSettings::default())
+                .await
+                .expect("sync once");
+            client
+        }
+
+        fn requests_matching(&self, method: &str, path_contains: &str) -> Vec<FakeRequest> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.method == method && r.path.contains(path_contains))
+                .cloned()
+                .collect()
+        }
+    }
+
+    /// `spawn_conn` against a `FakeHomeserver`-backed client, already past
+    /// `hello` as `writer_agent`.
+    async fn spawn_live_conn(
+        hs: &FakeHomeserver,
+    ) -> (
+        tokio::net::unix::OwnedWriteHalf,
+        BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) {
+        let (server, client_side) = UnixStream::pair().expect("socketpair");
+        let mailbox = Mailbox::open_in_memory().expect("in-memory mailbox for tests");
+        let registry = Registry::new(vec!["writer_agent".to_owned()], mailbox);
+        let client = hs.logged_in_client().await;
+        tokio::spawn(async move {
+            let _ = handle_conn(server, client, registry).await;
+        });
+        let (read_half, mut write) = client_side.into_split();
+        let mut read = BufReader::new(read_half);
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        let hello = recv(&mut read).await;
+        assert_eq!(hello["ok"], true, "{hello}");
+        assert_eq!(hello["user_id"], FAKE_BOT);
+        (write, read)
+    }
+
+    #[tokio::test]
+    async fn react_sends_an_annotation_and_returns_its_event_id() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(
+            &mut write,
+            json!({"op": "react", "id": 7, "room": FAKE_ROOM, "event_id": FAKE_OTHER_EVENT, "key": "🤖"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(
+            reply,
+            json!({"ok": true, "id": 7, "event_id": FAKE_REACTION_ID, "room_id": FAKE_ROOM})
+        );
+        let sent = hs.requests_matching("PUT", "/send/m.reaction/");
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            sent[0].body,
+            json!({"m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": FAKE_OTHER_EVENT,
+                "key": "🤖",
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn react_with_an_invalid_key_sends_nothing() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(
+            &mut write,
+            json!({"op": "react", "room": FAKE_ROOM, "event_id": FAKE_OTHER_EVENT, "key": "a\u{0}"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert!(reply["error"].as_str().unwrap().contains("control"));
+        assert!(hs.requests_matching("PUT", "/send/").is_empty());
+    }
+
+    #[tokio::test]
+    async fn redact_of_the_daemons_own_reaction_redacts_it() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(
+            &mut write,
+            json!({"op": "redact", "room": FAKE_ROOM, "event_id": FAKE_OWN_REACTION, "reason": "done"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(
+            reply,
+            json!({"ok": true, "id": null, "event_id": FAKE_OWN_REACTION, "room_id": FAKE_ROOM})
+        );
+        let redactions = hs.requests_matching("PUT", &format!("/redact/{FAKE_OWN_REACTION}/"));
+        assert_eq!(redactions.len(), 1, "{redactions:?}");
+        assert_eq!(redactions[0].body, json!({"reason": "done"}));
+    }
+
+    /// Drive one `redact` that must be refused with `not_own_reaction`, and
+    /// check that no redaction went out.
+    async fn assert_redact_refused(event_id: &str) {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(
+            &mut write,
+            json!({"op": "redact", "room": FAKE_ROOM, "event_id": event_id}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(
+            reply,
+            json!({"ok": false, "id": null, "error": "not_own_reaction"}),
+            "{event_id}"
+        );
+        // The target was fetched, so the refusal is the own-reaction rule
+        // and not an earlier failure.
+        assert_eq!(
+            hs.requests_matching("GET", "/event/").len(),
+            1,
+            "{event_id}"
+        );
+        assert!(
+            hs.requests_matching("PUT", "/redact/").is_empty(),
+            "{event_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redact_of_the_daemons_own_state_event_is_refused_and_sends_nothing() {
+        assert_redact_refused(FAKE_OWN_STATE).await;
+    }
+
+    #[tokio::test]
+    async fn redact_of_the_daemons_own_message_is_refused_and_sends_nothing() {
+        // Every persona shares the daemon's account (D4): an own message may
+        // be another persona's, so only reactions are redactable.
+        assert_redact_refused(FAKE_OWN_MESSAGE).await;
+    }
+
+    #[tokio::test]
+    async fn redact_of_another_senders_reaction_is_refused_and_sends_nothing() {
+        assert_redact_refused(FAKE_OTHER_REACTION).await;
+    }
+
+    #[tokio::test]
+    async fn redact_of_another_senders_message_is_refused_and_sends_nothing() {
+        assert_redact_refused(FAKE_OTHER_EVENT).await;
+    }
+
+    #[tokio::test]
+    async fn redact_of_an_unknown_event_fails_without_redacting() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(
+            &mut write,
+            json!({"op": "redact", "room": FAKE_ROOM, "event_id": "$no-such-event"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("fetching the event"),
+            "{reply}"
+        );
+        assert!(hs.requests_matching("PUT", "/redact/").is_empty());
+    }
+
+    #[tokio::test]
+    async fn react_and_redact_report_an_unknown_room_on_a_live_client() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        for req in [
+            json!({"op": "react", "room": "!elsewhere:example.org", "event_id": "$e", "key": "🤖"}),
+            json!({"op": "redact", "room": "!elsewhere:example.org", "event_id": "$e"}),
+        ] {
+            send(&mut write, req.clone()).await;
+            let reply = recv(&mut read).await;
+            assert_eq!(reply["ok"], false, "{req}");
+            assert!(
+                reply["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no joined room matching"),
+                "{req}: {reply}"
+            );
+        }
+        assert!(hs.requests_matching("PUT", "/").is_empty());
+    }
+
+    #[tokio::test]
+    async fn advertised_ops_are_all_dispatched() {
+        // Every op in `OPS` reaches a real handler: none falls through to
+        // `handle_op`'s `unknown op` arm. Run against the fake homeserver
+        // with retries off, so ops that make Matrix requests fail fast on
+        // a 404 instead of retrying an unreachable host.
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        for op in OPS {
+            send(&mut write, json!({"op": op, "persona": "writer_agent"})).await;
+            let reply = recv(&mut read).await;
+            let error = reply["error"].as_str().unwrap_or("");
+            assert!(!error.contains("unknown op"), "{op}: {reply}");
+        }
     }
 }

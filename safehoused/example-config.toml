@@ -110,7 +110,8 @@ recovery_passphrase = "change-me-as-well"
 # personas = ["writer_agent", "research_agent", "operator"]
 
 # Unix-domain socket path the daemon listens on for local agent RPC
-# (hello/send/create_room/add_to_space/list_rooms/read/check/invite — see
+# (hello/send/react/redact/create_room/add_to_space/list_rooms/read/check/
+# invite/leave — the full list is `ops` in the hello/status reply — see
 # safehoused/src/rpc.rs). AF_UNIX only, by design — never a TCP listener
 # (docs/decisions.md D8). Defaults to "<state_dir>/safehoused.sock" when
 # omitted.
