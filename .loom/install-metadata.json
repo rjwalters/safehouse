@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1030",
-  "loom_commit": "329081380ff68dbe34a7db8292a4daba759f94db",
+  "loom_version": "0.19.1032",
+  "loom_commit": "acff7238f3257ad1f748b5b9bb57e810ca2c25cf",
   "install_date": "2026-07-29",
   "installed_files": [
     ".loom/credentials.md.example",
@@ -128,6 +128,6 @@
     ".loom/scripts/tests/ci-excluded.txt"
   ],
   "last_resync": "2026-10-10",
-  "loom_source_remote": "https://github.com/rjwalters/loom.git",
+  "loom_source_remote": "git@github.com:rjwalters/loom.git",
   "requires_daemon": "0.19.772"
 }
