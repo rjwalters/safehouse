@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1062",
-  "loom_commit": "a7d666f32a59f5a00a5572e4d29da2643a33ae3e",
+  "loom_version": "0.19.1065",
+  "loom_commit": "33bb950d65b9038d5cf119a252820edca1192edf",
   "install_date": "2026-07-29",
   "installed_files": [
     ".loom/credentials.md.example",
@@ -135,7 +135,11 @@
     ".loom/scripts/tests/test-sweep-pr-mode.sh",
     ".loom/scripts/tests/test-worktree-race-rescue.sh",
     ".loom/docs/native-sweep.md",
-    ".loom/runtimes/gemini.json"
+    ".loom/runtimes/gemini.json",
+    ".claude/commands/loom/sweep-doctor-glm-escalation.md",
+    ".claude/commands/loom/sweep.md",
+    ".loom/docs/stale-check-inputs.md",
+    ".loom/scripts/sweep-checkpoint.sh"
   ],
   "last_resync": "2026-10-11",
   "loom_source_remote": "git@github.com:rjwalters/loom.git",
