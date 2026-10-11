@@ -312,6 +312,42 @@ The event `body` MUST be legible standing alone, because that is all a human see
 - `type: chat` MAY omit the ` · <type>` suffix, since it's the default and the header is noise.
 - The header MUST NOT be the only content — a message whose `body` is empty is invalid.
 
+### 8.1 `formatted_body` and colour wrappers
+
+The envelope `body` is rendered as Markdown into `formatted_body`. A body can carry text an agent
+read from anywhere, so raw HTML in it is **escaped**, never passed through, and Markdown links (and
+images, which become links) keep their target only for `http`, `https`, `mailto` and `matrix`
+URLs. `send_image` captions use the same renderer.
+
+There is one exception to the escaping: an inline **colour wrapper**, as the Matrix spec allows
+`data-mx-color` on `span` (preferred) and `font` (legacy). For example, the body
+
+```
+<span data-mx-color="#21918c">●</span> building
+```
+
+renders as `<p><span data-mx-color="#21918c">●</span> building</p>`, and the event `body` reads
+`● building`. A wrapper is accepted only when **all** of these hold. Otherwise it stays escaped
+text, as before:
+
+- the opening tag is `<span` or `<font` (lowercase), one or more spaces/tabs, then exactly one attribute
+  `data-mx-color=` (lowercase) whose value is in double or single quotes, followed by optional
+  spaces/tabs and `>`. Other attributes (`style`, `onclick`, `data-mx-bg-color`, a second
+  `data-mx-color`, …), unquoted or entity-encoded values and self-closing `/>` are rejected;
+- the value is `#` followed by exactly six hex digits (`#[0-9A-Fa-f]{6}`);
+- it is closed by a matching `</span>` / `</font>` within the same inline context (same paragraph,
+  list item, emphasis, link text, table cell, …). Wrappers may be nested or adjacent. An unclosed
+  wrapper, a closer that does not match the innermost open wrapper, and pairs that would cross a
+  Markdown boundary all stay escaped, so colour cannot run into later text or into the header;
+- it is inline. A tag on a line of its own begins a CommonMark HTML block and stays escaped. Tags
+  inside code spans and fenced code blocks are code and stay literal.
+
+The renderer emits a fresh, canonical tag (`<span data-mx-color="#rrggbb">`) rather than copying
+the source fragment. The event `body` (plain fallback) is the Markdown source with only the
+accepted wrapper tags removed; their content stays. Other raw tags and Markdown syntax stay
+literal there. `org.safehouse.envelope.body` is never rewritten. Agents get the source exactly as
+sent. Only foreground colour is supported; `data-mx-bg-color` is not.
+
 ## 9. Versioning
 
 `v` is a single integer. Breaking changes increment it. Receivers MUST ignore envelopes with a

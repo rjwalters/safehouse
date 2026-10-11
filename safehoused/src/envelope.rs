@@ -356,7 +356,8 @@ pub fn render(env: &Envelope) -> (String, String) {
     } else {
         format!(" · {}", env.kind)
     };
-    let plain = format!("{from} → {to}{suffix}\n{}", env.body);
+    let (plain_body, html_body) = render_body(&env.body);
+    let plain = format!("{from} → {to}{suffix}\n{plain_body}");
     let html_suffix = if env.kind == "chat" {
         String::new()
     } else {
@@ -367,15 +368,27 @@ pub fn render(env: &Envelope) -> (String, String) {
         html_escape(&from),
         html_escape(&to),
         html_suffix,
-        markdown_html(&env.body)
+        html_body
     );
     (plain, html)
 }
 
-/// The body as HTML: agents (and people) write Markdown, and a plain-escaped
-/// body loses every line break and shows `**bold**` literally. Raw HTML in the
-/// body is escaped rather than passed through. A body can carry text an agent
-/// read from anywhere, so it must never inject markup into the room.
+/// The body as (plain, HTML): agents (and people) write Markdown, and a
+/// plain-escaped body loses every line break and shows `**bold**` literally.
+/// Raw HTML in the body is escaped rather than passed through. A body can
+/// carry text an agent read from anywhere, so it must never inject markup into
+/// the room.
+///
+/// The one exception (#227) is a Matrix colour wrapper — a paired
+/// `<span data-mx-color="#rrggbb">…</span>` (or legacy `<font …>`), validated
+/// by [`parse_color_tag`] and paired by [`pair_color_tags`]. Accepted wrappers
+/// are *reconstructed* from the parsed colour, never forwarded as the
+/// original fragment. Everything else — unpaired or malformed wrappers
+/// included — stays escaped exactly as before.
+///
+/// The plain half is the Markdown source verbatim, minus only the source text
+/// of the accepted colour wrappers (their content stays). Other raw tags and
+/// Markdown syntax keep their literal representation.
 ///
 /// Markdown links and images are **not** passed through unconditionally
 /// (#212): `[a](javascript:alert(1))` or `![](https://tracker.example/p.gif)`
@@ -385,18 +398,176 @@ pub fn render(env: &Envelope) -> (String, String) {
 /// allowed-scheme list, but the daemon must not depend on every client doing
 /// that — [`sanitize_link_events`] applies the same allowlist here, at the
 /// only place that renders.
-fn markdown_html(body: &str) -> String {
-    use pulldown_cmark::{html, Event, Options, Parser};
-    let parser = Parser::new_ext(body, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES).map(
-        |event| match event {
-            Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
-            other => other,
-        },
-    );
-    let events = sanitize_link_events(parser.collect());
+fn render_body(body: &str) -> (String, String) {
+    use pulldown_cmark::{html, CowStr, Event, Options, Parser};
+    let parsed: Vec<(Event<'_>, std::ops::Range<usize>)> =
+        Parser::new_ext(body, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES)
+            .into_offset_iter()
+            .collect();
+    let colors = pair_color_tags(&parsed);
+
+    let mut plain = String::with_capacity(body.len());
+    let mut copied_to = 0;
+    let mut events = Vec::with_capacity(parsed.len());
+    for ((event, range), color) in parsed.into_iter().zip(colors) {
+        match (event, color) {
+            (Event::InlineHtml(_), Some(markup)) => {
+                // Validated colour wrapper: drop its source from the plain
+                // fallback, and emit the freshly built markup for the HTML.
+                plain.push_str(&body[copied_to..range.start]);
+                copied_to = range.end;
+                events.push(Event::InlineHtml(CowStr::from(markup)));
+            }
+            (Event::Html(raw) | Event::InlineHtml(raw), _) => events.push(Event::Text(raw)),
+            (other, _) => events.push(other),
+        }
+    }
+    plain.push_str(&body[copied_to..]);
+
+    let events = sanitize_link_events(events);
     let mut out = String::new();
     html::push_html(&mut out, events.into_iter());
-    out.trim_end().to_owned()
+    (plain, out.trim_end().to_owned())
+}
+
+/// The two tag names a colour wrapper may use. Matrix v1.16 prefers `span`
+/// for new messages; `font` is accepted as legacy compatibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorTagName {
+    Span,
+    Font,
+}
+
+impl ColorTagName {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "span" => Some(Self::Span),
+            "font" => Some(Self::Font),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Span => "span",
+            Self::Font => "font",
+        }
+    }
+}
+
+/// One raw inline-HTML tag that is syntactically a colour wrapper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorTag<'a> {
+    /// `<span data-mx-color="#rrggbb">`; the `&str` is the validated colour.
+    Open(ColorTagName, &'a str),
+    /// `</span>`.
+    Close(ColorTagName),
+}
+
+/// Strictly parse one raw inline-HTML fragment as a colour wrapper tag, or
+/// `None` for anything else. Deliberately narrow — this is an allowlist, not
+/// an HTML parser:
+///
+/// - open: `<span` or `<font` (lowercase), one or more spaces/tabs, exactly
+///   one `data-mx-color=` attribute (lowercase), a value in double or single
+///   quotes that is `#` + six hex digits (either case), optional spaces/tabs,
+///   then `>`. No other attribute (so no duplicates), no unquoted or
+///   entity-encoded value, no self-closing `/>`.
+/// - close: `</span>` or `</font>`, optionally with spaces/tabs before `>`.
+fn parse_color_tag(raw: &str) -> Option<ColorTag<'_>> {
+    const WS: [char; 2] = [' ', '\t'];
+    let inner = raw.strip_prefix('<')?.strip_suffix('>')?;
+    if let Some(rest) = inner.strip_prefix('/') {
+        return ColorTagName::parse(rest.trim_end_matches(WS)).map(ColorTag::Close);
+    }
+    let name_end = inner.find(WS)?;
+    let name = ColorTagName::parse(&inner[..name_end])?;
+    let rest = inner[name_end..]
+        .trim_start_matches(WS)
+        .strip_prefix("data-mx-color=")?;
+    let quote = match rest.as_bytes().first()? {
+        b'"' => '"',
+        b'\'' => '\'',
+        _ => return None,
+    };
+    let rest = &rest[1..];
+    let value_end = rest.find(quote)?;
+    let (value, tail) = (&rest[..value_end], &rest[value_end + 1..]);
+    if !tail.chars().all(|c| WS.contains(&c)) || !is_hex_color(value) {
+        return None;
+    }
+    Some(ColorTag::Open(name, value))
+}
+
+/// `#` followed by exactly six ASCII hex digits — the Matrix spec's colour form.
+fn is_hex_color(value: &str) -> bool {
+    value
+        .strip_prefix('#')
+        .is_some_and(|hex| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+impl ColorTag<'_> {
+    /// The canonical markup for this tag, rebuilt from the parsed parts — the
+    /// original source fragment is never forwarded.
+    fn markup(self) -> String {
+        match self {
+            Self::Open(name, color) => format!("<{} data-mx-color=\"{color}\">", name.as_str()),
+            Self::Close(name) => format!("</{}>", name.as_str()),
+        }
+    }
+}
+
+/// For each event, `Some(markup)` (see [`ColorTag::markup`]) when it is an
+/// inline-HTML colour wrapper tag that has a matching partner, `None`
+/// otherwise (and for every non-HTML event).
+///
+/// Pairing is a stack match: a closer pairs only with the innermost still-open
+/// wrapper, and only when that wrapper has the same tag name *and* was opened
+/// inside the same Markdown container (paragraph, emphasis, link, list item,
+/// table cell, …). An opener left open when its container ends is discarded.
+/// A closer that does not match is left unpaired (escaped) without disturbing
+/// the stack. So every accepted wrapper encloses only content of its own
+/// container, the emitted HTML stays well-formed, and colour can never bleed
+/// into following text or out of the body.
+///
+/// Block-level HTML (`Event::Html`) is never considered: a wrapper must sit
+/// inline, within text. Code spans and code blocks never produce
+/// `InlineHtml`, so tags quoted inside them stay literal.
+fn pair_color_tags(
+    events: &[(pulldown_cmark::Event<'_>, std::ops::Range<usize>)],
+) -> Vec<Option<String>> {
+    use pulldown_cmark::Event;
+
+    let mut paired: Vec<Option<String>> = vec![None; events.len()];
+    let mut depth = 0usize;
+    // (event index, parsed tag, container depth at the opener)
+    let mut open: Vec<(usize, ColorTag<'_>, usize)> = Vec::new();
+    for (i, (event, _)) in events.iter().enumerate() {
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                while open.last().is_some_and(|&(_, _, d)| d > depth) {
+                    open.pop();
+                }
+            }
+            Event::InlineHtml(raw) => match parse_color_tag(raw) {
+                Some(tag @ ColorTag::Open(..)) => open.push((i, tag, depth)),
+                Some(tag @ ColorTag::Close(name)) => {
+                    if let Some(&(j, opener @ ColorTag::Open(open_name, _), d)) = open.last() {
+                        if open_name == name && d == depth {
+                            open.pop();
+                            paired[j] = Some(opener.markup());
+                            paired[i] = Some(tag.markup());
+                        }
+                    }
+                }
+                None => {}
+            },
+            _ => {}
+        }
+    }
+    paired
 }
 
 /// The URL schemes a rendered `<a href>` / image-turned-link may carry
@@ -1106,6 +1277,304 @@ mod tests {
         assert!(!html.contains("<script>"), "{html}");
         assert!(!html.contains("<a href"), "{html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
+    }
+
+    // ---- #227 — data-mx-color wrappers ------------------------------------
+
+    /// (plain body without the header line, html body without the header).
+    fn render_colored(body: &str) -> (String, String) {
+        let (plain, html) = render(&env("bot", "@a:x", "chat", body));
+        let plain = plain.split_once('\n').expect("header line").1.to_owned();
+        let html = html
+            .strip_prefix("<b>bot → @a:x</b><br/>")
+            .expect("header")
+            .to_owned();
+        (plain, html)
+    }
+
+    #[test]
+    fn color_font_wrapper_passes_through() {
+        let (plain, html) = render_colored("<font data-mx-color=\"#21918c\">●</font> building");
+        assert_eq!(
+            html,
+            "<p><font data-mx-color=\"#21918c\">●</font> building</p>"
+        );
+        assert_eq!(plain, "● building");
+    }
+
+    #[test]
+    fn color_span_wrapper_passes_through() {
+        let (plain, html) = render_colored("<span data-mx-color=\"#21918c\">●</span> building");
+        assert_eq!(
+            html,
+            "<p><span data-mx-color=\"#21918c\">●</span> building</p>"
+        );
+        assert_eq!(plain, "● building");
+    }
+
+    #[test]
+    fn color_accepts_mixed_case_hex_single_quotes_and_spacing() {
+        for (body, want) in [
+            (
+                "<span data-mx-color=\"#AbCdEf\">x</span>",
+                "<p><span data-mx-color=\"#AbCdEf\">x</span></p>",
+            ),
+            // Single quotes and extra whitespace are normalized away by
+            // reconstruction.
+            (
+                "<span data-mx-color='#abcdef'>x</span>",
+                "<p><span data-mx-color=\"#abcdef\">x</span></p>",
+            ),
+            (
+                "<span  \tdata-mx-color=\"#ABCDEF\" \t>x</span \t>",
+                "<p><span data-mx-color=\"#ABCDEF\">x</span></p>",
+            ),
+        ] {
+            let (plain, html) = render_colored(body);
+            assert_eq!(html, want, "{body}");
+            assert_eq!(plain, "x", "{body}");
+        }
+    }
+
+    #[test]
+    fn color_adjacent_wrappers() {
+        let body =
+            "<span data-mx-color=\"#440154\">●</span><font data-mx-color=\"#fde725\">●</font>";
+        let (plain, html) = render_colored(body);
+        assert_eq!(
+            html,
+            "<p><span data-mx-color=\"#440154\">●</span><font data-mx-color=\"#fde725\">●</font></p>"
+        );
+        assert_eq!(plain, "●●");
+    }
+
+    #[test]
+    fn color_nested_wrappers_keep_their_nesting() {
+        let body =
+            "<span data-mx-color=\"#111111\">a <span data-mx-color=\"#222222\">b</span> c</span>";
+        let (plain, html) = render_colored(body);
+        assert_eq!(
+            html,
+            "<p><span data-mx-color=\"#111111\">a <span data-mx-color=\"#222222\">b</span> c</span></p>"
+        );
+        assert_eq!(plain, "a b c");
+    }
+
+    #[test]
+    fn color_rejects_other_or_extra_attributes() {
+        for body in [
+            "<span style=\"color:red\">x</span>",
+            "<span onclick=\"alert(1)\">x</span>",
+            "<span href=\"https://evil\">x</span>",
+            "<span data-mx-color=\"#21918c\" style=\"color:red\">x</span>",
+            "<span style=\"color:red\" data-mx-color=\"#21918c\">x</span>",
+            "<span data-mx-color=\"#21918c\" onclick=\"alert(1)\">x</span>",
+            "<span data-mx-color=\"#21918c\" data-mx-color=\"#000000\">x</span>",
+            "<span data-mx-bg-color=\"#21918c\">x</span>",
+            "<span DATA-MX-COLOR=\"#21918c\">x</span>",
+            "<span>x</span>",
+        ] {
+            let (plain, html) = render_colored(body);
+            assert!(!html.contains("<span"), "{body} -> {html}");
+            assert!(!html.contains("</span>"), "{body} -> {html}");
+            assert!(html.contains("&lt;span"), "{body} -> {html}");
+            assert!(html.contains("&lt;/span&gt;"), "{body} -> {html}");
+            assert_eq!(plain, body, "plain keeps the literal source");
+        }
+    }
+
+    #[test]
+    fn color_rejects_bad_values() {
+        for value in [
+            "\"#21918\"",        // short
+            "\"#21918cc\"",      // long
+            "\"#21918g\"",       // non-hex
+            "\"21918c\"",        // no '#'
+            "\"red\"",           // named colour
+            "\"#abc\"",          // CSS shorthand
+            "\"&#35;21918c\"",   // entity-encoded '#'
+            "\"#21918c&quot;\"", // entity-encoded quote trick
+            "\"#21918c\"\"",     // stray quote
+            "#21918c",           // unquoted
+            "\"#21918c'",        // mismatched quotes
+            "\" #21918c\"",      // padded value
+            "\"#21918c\"/",      // self-closing
+        ] {
+            let body = format!("<font data-mx-color={value}>x</font> after");
+            let (plain, html) = render_colored(&body);
+            assert!(!html.contains("<font"), "{body} -> {html}");
+            assert!(!html.contains("</font>"), "{body} -> {html}");
+            assert_eq!(plain, body);
+        }
+    }
+
+    #[test]
+    fn color_other_raw_tags_still_escaped() {
+        let body = "<b>x</b> <div data-mx-color=\"#21918c\">y</div> <img src=x onerror=alert(1)>";
+        let (plain, html) = render_colored(body);
+        assert!(!html.contains("<b>"), "{html}");
+        assert!(!html.contains("<div"), "{html}");
+        assert!(!html.contains("<img"), "{html}");
+        assert_eq!(plain, body);
+    }
+
+    #[test]
+    fn color_unclosed_tag_stays_escaped_and_does_not_bleed() {
+        let body = "<span data-mx-color=\"#21918c\">teal forever";
+        let (plain, html) = render_colored(body);
+        assert_eq!(
+            html,
+            "<p>&lt;span data-mx-color=\"#21918c\"&gt;teal forever</p>"
+        );
+        assert_eq!(plain, body);
+    }
+
+    #[test]
+    fn color_stray_closer_stays_escaped() {
+        let (plain, html) = render_colored("x</span>");
+        assert_eq!(html, "<p>x&lt;/span&gt;</p>");
+        assert_eq!(plain, "x</span>");
+    }
+
+    #[test]
+    fn color_mismatched_closer_stays_escaped() {
+        // `</font>` cannot close a `span`; the span is left unclosed, so
+        // both stay literal.
+        let body = "<span data-mx-color=\"#21918c\">x</font> y";
+        let (plain, html) = render_colored(body);
+        assert!(!html.contains("<span"), "{html}");
+        assert!(!html.contains("</font>"), "{html}");
+        assert_eq!(plain, body);
+
+        // A mismatched closer inside a valid pair stays literal; the pair
+        // itself is still accepted.
+        let body = "<span data-mx-color=\"#21918c\">x</font>y</span>";
+        let (plain, html) = render_colored(body);
+        assert_eq!(
+            html,
+            "<p><span data-mx-color=\"#21918c\">x&lt;/font&gt;y</span></p>"
+        );
+        assert_eq!(plain, "x</font>y");
+    }
+
+    #[test]
+    fn color_crossed_wrappers_never_produce_misnested_html() {
+        let body =
+            "<span data-mx-color=\"#111111\"><font data-mx-color=\"#222222\">x</span></font>";
+        let (_, html) = render_colored(body);
+        // Only the inner font pairs; the span and its closer stay literal.
+        assert_eq!(
+            html,
+            "<p>&lt;span data-mx-color=\"#111111\"&gt;<font data-mx-color=\"#222222\">x&lt;/span&gt;</font></p>"
+        );
+    }
+
+    #[test]
+    fn color_does_not_pair_across_markdown_containers() {
+        // Opener inside **bold**, closer outside: pairing would mis-nest
+        // `<strong><span></strong></span>`, so both stay literal.
+        let body = "**<span data-mx-color=\"#21918c\">a** b</span>";
+        let (_, html) = render_colored(body);
+        assert!(!html.contains("<span"), "{html}");
+        assert!(!html.contains("</span>"), "{html}");
+
+        // Across paragraphs: neither leaks colour into the next block.
+        let body = "<span data-mx-color=\"#21918c\">a\n\nb</span>";
+        let (_, html) = render_colored(body);
+        assert!(!html.contains("<span"), "{html}");
+        assert!(!html.contains("</span>"), "{html}");
+    }
+
+    #[test]
+    fn color_block_level_html_stays_escaped() {
+        // A tag alone on its own line starts a CommonMark HTML block, not
+        // inline HTML; wrappers are only recognized inline.
+        let body = "<span data-mx-color=\"#21918c\">\nx\n</span>";
+        let (plain, html) = render_colored(body);
+        assert!(!html.contains("<span"), "{html}");
+        assert!(!html.contains("</span>"), "{html}");
+        assert_eq!(plain, body);
+    }
+
+    #[test]
+    fn color_wrapper_around_markdown_inside_container() {
+        let body =
+            "- <span data-mx-color=\"#21918c\">**building**</span> [#1](https://x.example/1)";
+        let (plain, html) = render_colored(body);
+        assert!(
+            html.contains(
+                "<li><span data-mx-color=\"#21918c\"><strong>building</strong></span> <a href=\"https://x.example/1\">#1</a></li>"
+            ),
+            "{html}"
+        );
+        assert_eq!(plain, "- **building** [#1](https://x.example/1)");
+    }
+
+    #[test]
+    fn color_tags_in_code_stay_literal() {
+        let body = "`<span data-mx-color=\"#21918c\">x</span>`\n\n```\n<font data-mx-color=\"#21918c\">y</font>\n```";
+        let (plain, html) = render_colored(body);
+        assert!(!html.contains("<span"), "{html}");
+        assert!(!html.contains("<font"), "{html}");
+        assert!(
+            html.contains("<code>&lt;span data-mx-color=\"#21918c\"&gt;x&lt;/span&gt;</code>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("&lt;font data-mx-color=\"#21918c\"&gt;y&lt;/font&gt;"),
+            "{html}"
+        );
+        assert_eq!(plain, body);
+    }
+
+    #[test]
+    fn color_does_not_touch_header_or_envelope_body() {
+        let body = "<span data-mx-color=\"#21918c\">●</span> ok";
+        let e = env("writer_agent", "research_agent", "status", body);
+        let (plain, html) = render(&e);
+        assert_eq!(plain, "writer-agent → research-agent · status\n● ok");
+        assert!(
+            html.starts_with("<b>writer-agent → research-agent</b> · <i>status</i><br/><p><span"),
+            "{html}"
+        );
+        // The structured payload keeps the original source, tags included.
+        let content = to_event_content(&e, None);
+        assert_eq!(content["org.safehouse.envelope"]["body"], body);
+        assert_eq!(content["body"], plain);
+    }
+
+    #[test]
+    fn color_in_send_image_caption() {
+        let (plain, html) = image_caption(
+            "writer_agent",
+            Some("@alice:x"),
+            Some("<span data-mx-color=\"#21918c\">●</span> <span style=\"x\">no</span>"),
+        );
+        assert!(
+            html.ends_with(
+                "<p><span data-mx-color=\"#21918c\">●</span> &lt;span style=\"x\"&gt;no&lt;/span&gt;</p>"
+            ),
+            "{html}"
+        );
+        assert!(
+            plain.ends_with("\n● <span style=\"x\">no</span>"),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn parse_color_tag_unit() {
+        use ColorTagName::*;
+        assert_eq!(
+            parse_color_tag("<span data-mx-color=\"#00ff00\">"),
+            Some(ColorTag::Open(Span, "#00ff00"))
+        );
+        assert_eq!(parse_color_tag("</font>"), Some(ColorTag::Close(Font)));
+        assert_eq!(parse_color_tag("<SPAN data-mx-color=\"#00ff00\">"), None);
+        assert_eq!(parse_color_tag("</ span>"), None);
+        assert_eq!(parse_color_tag("<span data-mx-color=\"#00ff00\"/>"), None);
+        assert_eq!(parse_color_tag("<span data-mx-color = \"#00ff00\">"), None);
+        assert_eq!(parse_color_tag("<spanx data-mx-color=\"#00ff00\">"), None);
     }
 
     // ---- #212 — Markdown link/image URL-scheme allowlist ------------------
