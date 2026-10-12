@@ -222,7 +222,9 @@ subprocess are sequential); the slot is effectively only observable in tests. Ev
 `post_transcript` echoes the transcript into the room as a threaded `m.notice` addressed at the
 sender (so it reaches no agent mailbox). Design rationale: `design.md` §4.1.3; config:
 `safehoused/example-config.toml`. **Not yet measured on real hardware** — the `base.en` vs
-`small.en` latency recommendation in the example config is reasoned, not benchmarked.
+`small.en` latency recommendation in the example config is reasoned, not benchmarked. **#231:** each outcome is also stored, encrypted, per event id
+(`safehoused/src/transcripts.rs`), so `read` returns the transcript for an `m.audio` row; old notes
+are backfilled in the background, at most `backfill_per_read` (default 2) per `read`.
 
 ## Deferred, with a deadline
 - ~~**D11 — CLA vs. DCO.**~~ ✅ Decided 2026-07-26: **DCO** (`CONTRIBUTING.md`, D11).

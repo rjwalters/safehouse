@@ -103,6 +103,14 @@ fn default_max_bytes() -> u64 {
     DEFAULT_MAX_BYTES
 }
 
+/// Default for [`TranscribeConfig::backfill_per_read`]: at most two old voice
+/// notes queued for transcription per `read` (#231).
+pub const DEFAULT_BACKFILL_PER_READ: usize = 2;
+
+fn default_backfill_per_read() -> usize {
+    DEFAULT_BACKFILL_PER_READ
+}
+
 /// The optional `[transcribe]` block on the daemon [`Config`](crate::Config).
 /// Absent = the whole subsystem is disabled (zero behavior change). Same flat,
 /// explicit, `deny_unknown_fields` style as [`EgressConfig`](crate::egress::EgressConfig).
@@ -144,6 +152,15 @@ pub struct TranscribeConfig {
     /// the voice note, so the humans see what the agents saw. Off by default.
     #[serde(default)]
     pub post_transcript: bool,
+    /// How many never-transcribed `m.audio` events one `read` may queue for
+    /// transcription (#231): voice notes from before transcription was on,
+    /// or from before the daemon joined. The queue is worked one note at a
+    /// time in the background, sharing the single-flight slot with live
+    /// notes; the `read` itself never waits and returns the file name until
+    /// the transcript is stored. `0` turns the backfill off (a `read` still
+    /// returns any transcript already stored). Defaults to 2.
+    #[serde(default = "default_backfill_per_read")]
+    pub backfill_per_read: usize,
 }
 
 /// Boot-time fail-safe guards, mirroring
@@ -374,10 +391,17 @@ impl Transcription {
 /// `url`/`file`/`info` keys stay exactly as the sender wrote them, and the
 /// original room event is of course never modified at all.
 pub fn apply_to_content(content: &mut Value, outcome: &Transcription) {
+    apply_body(content, outcome.body());
+}
+
+/// [`apply_to_content`] for a body that was transcribed earlier and stored
+/// (#231): the `read` op and a replayed live event fold the stored body in
+/// exactly the way a fresh outcome is folded in.
+pub fn apply_body(content: &mut Value, body: &str) {
     let Some(map) = content.as_object_mut() else {
         return;
     };
-    map.insert("body".to_owned(), Value::String(outcome.body().to_owned()));
+    map.insert("body".to_owned(), Value::String(body.to_owned()));
     map.remove("formatted_body");
     map.remove("format");
 }
@@ -443,14 +467,20 @@ impl Transcriber {
         self.config.post_transcript
     }
 
+    /// The `read` backfill bound (config `backfill_per_read`, #231).
+    pub fn backfill_per_read(&self) -> usize {
+        self.config.backfill_per_read
+    }
+
     /// One-line boot summary for the startup log.
     pub fn describe(&self) -> String {
         format!(
-            "{} (max {}, timeout {}s, max {} bytes{})",
+            "{} (max {}, timeout {}s, max {} bytes, backfill {} per read{})",
             self.config.command.join(" "),
             format_duration(self.config.max_seconds),
             self.config.timeout_seconds,
             self.config.max_bytes,
+            self.config.backfill_per_read,
             if self.config.post_transcript {
                 ", posting transcripts to the room"
             } else {
@@ -625,6 +655,7 @@ mod tests {
             timeout_seconds: 10,
             max_bytes: DEFAULT_MAX_BYTES,
             post_transcript: false,
+            backfill_per_read: DEFAULT_BACKFILL_PER_READ,
         }
     }
 

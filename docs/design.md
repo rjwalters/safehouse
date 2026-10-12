@@ -188,6 +188,22 @@ When configured (`safehoused/src/transcribe.rs`, hooked into `on_message` *befor
   the room as a threaded `m.notice` under the voice note, addressed at the note's sender so §7
   routing matches no persona and it reaches no agent mailbox — the agents already have the
   transcript as the body; that copy is the humans'.
+- **Room history reads the same body (#231).** The outcome (transcript body, or file name plus
+  failure note) is stored under the event id (`safehoused/src/transcripts.rs`), so the `read` op
+  returns for an `m.audio` row exactly what the mailbox delivered, not the file name. The store is
+  the matrix-sdk state store the daemon already opens with `store_passphrase`, as custom values;
+  that store hashes a custom key but keeps the value in the clear, so each entry is sealed with a
+  daemon-owned `StoreCipher` (XChaCha20-Poly1305), itself kept in the same store sealed under
+  `store_passphrase`, and keyed by `hash_key(event_id)`. Text only: audio is never written anywhere
+  (`get_file(.., use_cache: false)`). Entries are not removed when the note is redacted (room
+  history is not deleted, claude-bot#282). A voice note `read` meets with nothing stored (older
+  than transcription being on, or from before the daemon joined) is queued for a **bounded
+  backfill**: at most `transcribe.backfill_per_read` notes per `read` (default 2, newest first, `0`
+  turns it off), worked one at a time by a background task. The `read` never waits; it returns the
+  file name until the transcript is stored, and a later `read` picks it up. Each note is
+  transcribed once, success or failure; re-reads and a late live delivery reuse the stored body.
+  The backfill shares the single-flight slot with live notes, so a live note can wait behind at
+  most one backfill run, bounded by `timeout_seconds` like any slot wait.
 - **Transcription is not a routing decision.** It runs for every observed `m.audio` event, before §7
   decides who the envelope reaches, including in rooms the daemon only mirrors. Making it conditional
   on "will this reach an agent" would mean a second, divergent notion of delivery alongside the one

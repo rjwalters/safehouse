@@ -330,6 +330,15 @@ recovery_passphrase = "change-me-as-well"
 # voice note's sender, so it reaches no agent mailbox — the agents already
 # have the transcript as the message body. Defaults to false.
 # post_transcript = true
+#
+# Room history (#231). Every outcome is stored, encrypted, under the voice
+# note's event id, so the `read` op returns the transcript rather than the
+# file name. A voice note `read` finds with nothing stored (from before
+# transcription was on) is queued for transcription in the background, at
+# most this many per `read`, one at a time; the `read` never waits and shows
+# the file name until the transcript is stored. Each note is transcribed
+# once. 0 turns this backfill off. Defaults to 2.
+# backfill_per_read = 2
 
 # --- Config schema version (issue #101, provisioning parity) ------------
 

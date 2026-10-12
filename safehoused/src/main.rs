@@ -16,6 +16,7 @@ mod rpc;
 #[cfg(test)]
 mod test_support;
 mod transcribe;
+mod transcripts;
 
 use std::{
     env, fs,
@@ -37,7 +38,7 @@ use matrix_sdk::{
         events::room::{
             encrypted::OriginalSyncRoomEncryptedEvent,
             member::{OriginalSyncRoomMemberEvent, StrippedRoomMemberEvent},
-            message::{MessageType, OriginalSyncRoomMessageEvent},
+            message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
             redaction::OriginalSyncRoomRedactionEvent,
         },
     },
@@ -52,6 +53,7 @@ use crate::{
     mailbox::Mailbox,
     rpc::Registry,
     transcribe::{TranscribeConfig, Transcriber, Transcription},
+    transcripts::{TranscriptStore, VoiceNotes},
 };
 
 /// The egress subsystem is optional; when absent from config the daemon runs
@@ -61,8 +63,9 @@ type EgressHandle = Option<Arc<Egress>>;
 
 /// Voice-note transcription (#200) is optional the same way egress is: absent
 /// from config means `None` threads through `on_message` and not one line of
-/// `transcribe.rs` executes.
-type TranscribeHandle = Option<Arc<Transcriber>>;
+/// `transcribe.rs` executes. When present it also carries the stored
+/// transcripts and the `read` backfill queue (#231, `transcripts.rs`).
+type TranscribeHandle = Option<Arc<VoiceNotes>>;
 
 /// `leave_when_alone` (#201) is optional the same way egress and transcription
 /// are: absent (the default) means `None` threads through the membership
@@ -520,6 +523,10 @@ async fn run() -> Result<()> {
     // built (and its boot guard enforced) only when configured, otherwise
     // `None` threads through `on_message` and the daemon behaves exactly as
     // it did before this feature existed.
+    //
+    // #231: with it comes the encrypted per-event transcript store (in the
+    // state store opened with `store_passphrase`) and the background worker
+    // that transcribes old voice notes the `read` op queues, one at a time.
     let transcriber: TranscribeHandle = match config.transcribe.clone() {
         Some(cfg) => {
             let transcriber = Transcriber::open(cfg).context("initializing transcription")?;
@@ -527,7 +534,16 @@ async fn run() -> Result<()> {
                 "safehoused: voice-note transcription enabled: {}",
                 transcriber.describe()
             );
-            Some(transcriber)
+            let store = TranscriptStore::open(client.clone(), &secrets.store_passphrase)
+                .await
+                .context("opening the transcript store")?;
+            let (voice, backfill) = VoiceNotes::new(transcriber, store);
+            let media_client = client.clone();
+            tokio::spawn(voice.clone().run_backfill(backfill, move |content| {
+                fetch_audio(media_client.clone(), content)
+            }));
+            registry.set_voice_notes(voice.clone());
+            Some(voice)
         }
         None => None,
     };
@@ -1410,34 +1426,36 @@ async fn post_transcript_notice(
 /// [`transcribe::fallback_body`]) and logs the reason. Silently dropping a
 /// human's voice note, or delivering it as an unexplained file name, are both
 /// worse than a noisy body.
+///
+/// #231: the outcome (success or failure note) is stored under the event id
+/// so the `read` op returns the same body. An event that already has a stored
+/// body (a `read` backfilled it first, or the event is seen again) reuses it
+/// and is not transcribed a second time; its transcript is not re-posted.
 async fn transcribe_audio_body(
-    transcriber: Option<&Arc<Transcriber>>,
+    voice: Option<&Arc<VoiceNotes>>,
     client: &Client,
     event: &OriginalSyncRoomMessageEvent,
     room_id: &str,
     content: &mut Value,
 ) -> Option<String> {
-    let transcriber = transcriber?;
+    let voice = voice?;
+    let transcriber = voice.transcriber();
     let note = transcribe::audio_note_from_content(content)?;
-    let MessageType::Audio(audio) = &event.content.msgtype else {
+    let MessageType::Audio(_) = &event.content.msgtype else {
         return None;
     };
-    let media = client.media();
+    let event_id = event.event_id.as_str();
+    if let Some(body) = voice.stored(event_id).await {
+        transcribe::apply_body(content, &body);
+        return None;
+    }
+    let audio_content = content.clone();
     let outcome = transcriber
-        .transcribe(&note, || async move {
-            // `use_cache: false` — the media store would otherwise persist
-            // decrypted voice-note audio on disk for a one-shot read. The
-            // transcript is the artifact worth keeping; the plaintext audio
-            // is not.
-            media
-                .get_file(audio, false)
-                .await
-                .map_err(|err| format!("{err:#}"))?
-                .ok_or_else(|| "the event carries no media source".to_owned())
-        })
+        .transcribe(&note, || fetch_audio(client.clone(), audio_content))
         .await;
 
     transcribe::apply_to_content(content, &outcome);
+    voice.persist(event_id, &outcome).await;
 
     match outcome {
         Transcription::Transcribed { transcript, .. } => {
@@ -1455,6 +1473,26 @@ async fn transcribe_audio_body(
             None
         }
     }
+}
+
+/// Download and decrypt an `m.audio` event's media from its raw `content`:
+/// the live path and the `read` backfill (#231) both go through here.
+///
+/// `use_cache: false`: the media store would otherwise persist decrypted
+/// voice-note audio on disk for a one-shot read. The transcript is the
+/// artifact worth keeping; the plaintext audio is not.
+async fn fetch_audio(client: Client, content: Value) -> std::result::Result<Vec<u8>, String> {
+    let content: RoomMessageEventContent = serde_json::from_value(content)
+        .map_err(|err| format!("the event content is not a message: {err}"))?;
+    let MessageType::Audio(audio) = &content.msgtype else {
+        return Err("the event is not m.audio".to_owned());
+    };
+    client
+        .media()
+        .get_file(audio, false)
+        .await
+        .map_err(|err| format!("{err:#}"))?
+        .ok_or_else(|| "the event carries no media source".to_owned())
 }
 
 /// #30: a native Matrix redaction of a source event suppresses any completion
@@ -1815,6 +1853,10 @@ mod config_tests {
         assert_eq!(transcribe.timeout_seconds, 120);
         assert_eq!(transcribe.max_bytes, transcribe::DEFAULT_MAX_BYTES);
         assert!(!transcribe.post_transcript);
+        assert_eq!(
+            transcribe.backfill_per_read,
+            transcribe::DEFAULT_BACKFILL_PER_READ
+        );
         assert!(transcribe::validate_transcribe_config(&transcribe).is_ok());
     }
 
@@ -2909,5 +2951,115 @@ mod sync_retry_tests {
             retries_seen.borrow().is_empty(),
             "a fatal error must never invoke the retry-state hook"
         );
+    }
+}
+
+/// #231: the live path stores its outcome per event id, and reuses a stored
+/// body rather than transcribing the same event twice.
+#[cfg(test)]
+mod live_transcript_tests {
+    use super::*;
+
+    async fn offline_client() -> Client {
+        Client::builder()
+            .homeserver_url("http://127.0.0.1:1")
+            .build()
+            .await
+            .expect("building a client does not require network access")
+    }
+
+    async fn voice(client: &Client, runs: &std::path::Path) -> Arc<VoiceNotes> {
+        let transcriber = Transcriber::open(TranscribeConfig {
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("echo run >>{}; cat", runs.display()),
+            ],
+            max_seconds: 600,
+            timeout_seconds: 10,
+            max_bytes: transcribe::DEFAULT_MAX_BYTES,
+            post_transcript: true,
+            backfill_per_read: 2,
+        })
+        .unwrap();
+        let store = TranscriptStore::with_cipher(
+            client.clone(),
+            matrix_sdk_store_encryption::StoreCipher::new().unwrap(),
+        );
+        VoiceNotes::new(transcriber, store).0
+    }
+
+    fn audio_event() -> (OriginalSyncRoomMessageEvent, Value) {
+        let content = json!({
+            "msgtype": "m.audio",
+            "body": "voice-message-recording.ogg",
+            "url": "mxc://example.org/abc",
+            "info": { "duration": 41_500 },
+        });
+        let event = serde_json::from_value(json!({
+            "type": "m.room.message",
+            "event_id": "$voice:example.org",
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1,
+            "content": content,
+        }))
+        .unwrap();
+        (event, content)
+    }
+
+    #[tokio::test]
+    async fn a_live_failure_note_is_stored_under_the_event_id() {
+        let dir = test_support::tempdir("safehoused-live-voice");
+        let client = offline_client().await;
+        let voice = voice(&client, &dir.join("runs")).await;
+        let (event, mut content) = audio_event();
+        // The offline client cannot download the media: a failure note.
+        let posted = transcribe_audio_body(
+            Some(&voice),
+            &client,
+            &event,
+            "!r:example.org",
+            &mut content,
+        )
+        .await;
+        assert!(posted.is_none());
+        let body = content["body"].as_str().unwrap().to_owned();
+        assert!(body.contains("voice-message-recording.ogg"), "{body}");
+        assert!(body.contains("transcription failed"), "{body}");
+        assert_eq!(
+            voice.stored("$voice:example.org").await.as_deref(),
+            Some(body.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stored_body_is_reused_without_a_model_run() {
+        let dir = test_support::tempdir("safehoused-live-voice");
+        let runs = dir.join("runs");
+        let client = offline_client().await;
+        let voice = voice(&client, &runs).await;
+        voice
+            .persist(
+                "$voice:example.org",
+                &Transcription::Transcribed {
+                    body: "🎙 (voice note, 0:42) already done".into(),
+                    transcript: "already done".into(),
+                },
+            )
+            .await;
+        let (event, mut content) = audio_event();
+        let posted = transcribe_audio_body(
+            Some(&voice),
+            &client,
+            &event,
+            "!r:example.org",
+            &mut content,
+        )
+        .await;
+        assert!(posted.is_none(), "a reused transcript is not re-posted");
+        assert_eq!(content["body"], "🎙 (voice note, 0:42) already done");
+        assert!(!runs.exists(), "the model ran again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
