@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1112",
-  "loom_commit": "f398bec2d5f4f4c4a70a52e7565a4f159924e8b3",
+  "loom_version": "0.19.1127",
+  "loom_commit": "587395b09661ba64dfca25b2e42ea7bc20413295",
   "install_date": "2026-07-29",
   "installed_files": [
     ".loom/credentials.md.example",
@@ -160,6 +160,6 @@
     ".loom/scripts/tests/test-version-check-gate-callsites.sh"
   ],
   "last_resync": "2026-10-12",
-  "loom_source_remote": "git@github.com:rjwalters/loom.git",
+  "loom_source_remote": "https://github.com/rjwalters/loom.git",
   "requires_daemon": "0.19.1081"
 }
