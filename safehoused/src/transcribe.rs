@@ -68,6 +68,15 @@
 //! practice `command` points at a small wrapper that pipes stdin through
 //! `ffmpeg` into whisper.cpp.
 //!
+//! The command runs as the leader of its own process group, and it is
+//! stopped as a group (see [`Running`]): when it is cut short — the
+//! `timeout_seconds` cap, or a backfill run cancelled for a live note — the
+//! whole group gets SIGTERM, then SIGKILL after a 2s grace. So a wrapper's
+//! `ffmpeg`/`whisper-cli` children stop with it, as long as they stay in its
+//! group (a wrapper must not `setsid`/`setpgid` them away). A wrapper that
+//! keeps decrypted audio in temporary files should delete them on SIGTERM;
+//! SIGKILL gives it no chance to.
+//!
 //! ## The duration cap, honestly
 //!
 //! Trimming an encoded Opus/Ogg stream is a container-aware operation this
@@ -88,11 +97,17 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
-    io::AsyncWriteExt as _,
-    process::Command,
-    sync::{watch, Mutex},
+    io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _},
+    process::{Child, Command},
+    sync::{watch, Mutex, OwnedMutexGuard},
     time::timeout,
 };
+
+/// How long a transcriber's process group has, after SIGTERM, to exit (and a
+/// wrapper to delete its temporary files) before the group is SIGKILLed.
+/// The single-flight slot stays held until then, so at most this long is
+/// added to a live note that preempted a backfill run.
+const TERM_GRACE: Duration = Duration::from_secs(2);
 
 /// Hard ceiling on the transcript length folded into an envelope body. A
 /// mis-configured command (`cat` on a 20 MiB file, a transcriber echoing its
@@ -545,7 +560,9 @@ pub struct Transcriber {
     /// Single-flight slot. One transcriber process at a time, daemon-wide —
     /// the acceptance criterion, and the reason a burst of voice notes cannot
     /// swamp a small host. Waiting for it is bounded by `timeout_seconds`.
-    slot: Mutex<()>,
+    /// Shared (`Arc`) so a stopped transcriber's group can keep holding it
+    /// until every process in the group is gone ([`Running`]).
+    slot: Arc<Mutex<()>>,
     /// How many live transcriptions ([`Self::transcribe`]) are in flight
     /// (#231). A backfill run ([`Self::transcribe_backfill`]) starts only at
     /// zero and is cancelled the moment it rises, so a live note, which
@@ -577,7 +594,7 @@ impl Transcriber {
             .map_err(|e| anyhow::anyhow!("invalid transcribe config: {e}"))?;
         Ok(Arc::new(Self {
             config,
-            slot: Mutex::new(()),
+            slot: Arc::new(Mutex::new(())),
             live: watch::Sender::new(0),
         }))
     }
@@ -742,32 +759,50 @@ impl Transcriber {
         // Single-flight. Waiting is bounded too: a backlog must degrade to
         // "delivered with a note" rather than pile up unboundedly behind a
         // slow transcriber.
-        let _slot = timeout(bound, self.slot.lock()).await.map_err(|_| {
-            (
-                FailureKind::SlotTimeout,
-                format!(
-                    "another transcription still held the single-flight slot after {}s",
-                    self.config.timeout_seconds
-                ),
-            )
-        })?;
+        let slot = timeout(bound, Arc::clone(&self.slot).lock_owned())
+            .await
+            .map_err(|_| {
+                (
+                    FailureKind::SlotTimeout,
+                    format!(
+                        "another transcription still held the single-flight slot after {}s",
+                        self.config.timeout_seconds
+                    ),
+                )
+            })?;
 
         let mut child = Command::new(&program)
             .args(&argv[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // A timed-out (or preempted, #231) transcriber is dropped; without
-            // this it would be left running (and still holding a core) after
-            // we gave up.
+            // Its own process group, so stopping it reaches whatever it
+            // started too (a wrapper's ffmpeg and whisper-cli), not only the
+            // direct child (#231). See [`Running`].
+            .process_group(0)
+            // Backstop only: [`Running`] stops the whole group; this kills
+            // the direct child if that ever cannot run (no runtime).
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| (FailureKind::Spawn, format!("could not run {program}: {e}")))?;
-
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| (FailureKind::Spawn, format!("{program} has no stdin pipe")))?;
+        let pgid = child
+            .id()
+            .and_then(|id| libc::pid_t::try_from(id).ok())
+            .ok_or_else(|| (FailureKind::Spawn, format!("{program} has no pid")))?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        // From here on, however this function ends — timeout, an early
+        // return, or a backfill run dropped mid-await — the whole group is
+        // stopped unless the transcriber was seen to exit by itself.
+        let mut running = Running {
+            child: Some(child),
+            pgid,
+            slot: Some(slot),
+        };
+        let (Some(mut stdin), Some(stdout), Some(stderr)) = (stdin, stdout, stderr) else {
+            return Err((FailureKind::Spawn, format!("{program} has no stdio pipes")));
+        };
         // Written from a separate task so a transcriber that streams output
         // while we are still feeding it cannot deadlock on a full pipe. Write
         // errors are deliberately ignored: a command that does not read stdin
@@ -781,7 +816,12 @@ impl Transcriber {
         // backfill run is dropped mid-await.
         let _writer = AbortOnDrop(writer);
 
-        let output = match timeout(bound, child.wait_with_output()).await {
+        let collect = async {
+            let child = running.child.as_mut().expect("set above");
+            let (status, out, err) = tokio::join!(child.wait(), read_all(stdout), read_all(stderr));
+            Ok::<_, std::io::Error>((status?, out?, err?))
+        };
+        let (status, stdout, stderr) = match timeout(bound, collect).await {
             Err(_) => {
                 return Err((
                     FailureKind::Killed,
@@ -794,11 +834,13 @@ impl Transcriber {
             Ok(Err(e)) => return Err((FailureKind::Spawn, format!("{program} failed: {e}"))),
             Ok(Ok(output)) => output,
         };
+        // It exited by itself and has been reaped: nothing left to stop.
+        running.exited();
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr);
             let detail = stderr.lines().next().unwrap_or("").trim().to_owned();
-            let kind = if output.status.code() == Some(EXIT_UNDECODABLE) {
+            let kind = if status.code() == Some(EXIT_UNDECODABLE) {
                 FailureKind::Undecodable
             } else {
                 FailureKind::Crashed
@@ -807,7 +849,7 @@ impl Transcriber {
                 kind,
                 format!(
                     "{program} exited with {}{}",
-                    output.status,
+                    status,
                     if detail.is_empty() {
                         String::new()
                     } else {
@@ -816,7 +858,78 @@ impl Transcriber {
                 ),
             ));
         }
-        Ok(clamp_transcript(&String::from_utf8_lossy(&output.stdout)))
+        Ok(clamp_transcript(&String::from_utf8_lossy(&stdout)))
+    }
+}
+
+/// Read a child's output pipe to the end.
+async fn read_all(mut pipe: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    pipe.read_to_end(&mut buf).await?;
+    Ok(buf)
+}
+
+/// Send `signal` to every process in group `pgid`. A group that is already
+/// gone (`ESRCH`) is the outcome we want, so the result is ignored.
+fn signal_group(pgid: libc::pid_t, signal: libc::c_int) {
+    // SAFETY: `killpg` takes plain integers and has no memory-safety
+    // preconditions.
+    unsafe {
+        libc::killpg(pgid, signal);
+    }
+}
+
+/// A running transcriber, the leader of its own process group, and the
+/// single-flight slot it holds (#231).
+///
+/// The configured command is usually a wrapper that runs `ffmpeg` and then
+/// `whisper-cli`, so killing only the direct child would leave those running
+/// (re-parented to init, still holding the cores beside the next
+/// transcription) and leave the wrapper's decrypted-audio temp files behind.
+/// So when this is dropped before the transcriber was seen to exit by itself
+/// — a timeout, an early return, a preempted backfill run — it stops the
+/// whole group: SIGTERM at once (a wrapper's chance to delete its temp
+/// files), then, once the leader exits or [`TERM_GRACE`] passes, SIGKILL for
+/// anything left, then reaps the leader. The slot is released only after
+/// that, so single-flight still holds while the old group winds down.
+///
+/// The leader stays unreaped (a zombie at worst) until the SIGKILL unless it
+/// exits on its own first, and then the SIGKILL follows immediately, so the
+/// group id cannot have been reused by an unrelated process.
+struct Running {
+    child: Option<Child>,
+    pgid: libc::pid_t,
+    slot: Option<OwnedMutexGuard<()>>,
+}
+
+impl Running {
+    /// The transcriber exited by itself and was reaped: nothing to stop.
+    fn exited(&mut self) {
+        self.child = None;
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let pgid = self.pgid;
+        let slot = self.slot.take();
+        signal_group(pgid, libc::SIGTERM);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = timeout(TERM_GRACE, child.wait()).await;
+                    signal_group(pgid, libc::SIGKILL);
+                    let _ = child.wait().await;
+                    drop(slot);
+                });
+            }
+            // No runtime to wait on (shutdown): kill the group outright;
+            // dropping `child` hands the leader to tokio's orphan reaping.
+            Err(_) => signal_group(pgid, libc::SIGKILL),
+        }
     }
 }
 
@@ -1252,24 +1365,119 @@ mod tests {
         assert!(out.is_final());
     }
 
+    // --- stopping a transcriber stops its whole process group (#231) -------
+
+    /// A fake wrapper in a fresh scratch dir. Fed `slow` on stdin it does
+    /// what the real wrapper does while it works: writes a temp file it
+    /// deletes on SIGTERM, and waits on a child — here one that ignores
+    /// SIGTERM, so only the SIGKILL escalation can stop it. It records its
+    /// group id (`$$`: it leads its own group) and the child's pid, then
+    /// creates `started`. Fed anything else it prints `live text`.
+    struct FakeWrapper {
+        dir: std::path::PathBuf,
+    }
+
+    impl FakeWrapper {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "safehoused-transcribe-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn script(&self) -> String {
+            format!(
+                "if [ \"$(cat)\" = slow ]; then \
+                   trap 'rm -f {d}/audio.tmp; exit 143' TERM; \
+                   echo $$ >{d}/pgid; touch {d}/audio.tmp; \
+                   (trap '' TERM; exec sleep 30) & echo $! >{d}/child; \
+                   touch {d}/started; wait; \
+                 fi; echo live text",
+                d = self.dir.display()
+            )
+        }
+
+        fn path(&self, name: &str) -> std::path::PathBuf {
+            self.dir.join(name)
+        }
+
+        /// Wait, bounded, until the slow run is under way.
+        async fn wait_started(&self) {
+            let started = self.path("started");
+            timeout(Duration::from_secs(10), async {
+                while !started.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the fake transcriber never started");
+        }
+
+        fn pid(&self, name: &str) -> libc::pid_t {
+            std::fs::read_to_string(self.path(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+
+        /// Within a bound, every process in the group is gone (including the
+        /// SIGTERM-ignoring grandchild) and the temp file was cleaned up.
+        /// Probes only the recorded ids: no pattern-based process search.
+        async fn assert_stopped(&self) {
+            let pgid = self.pid("pgid");
+            let grandchild = self.pid("child");
+            // SAFETY: signal 0 only checks that the target exists.
+            let alive = || unsafe { libc::killpg(pgid, 0) == 0 || libc::kill(grandchild, 0) == 0 };
+            let gone = timeout(Duration::from_secs(5), async {
+                while alive() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            if gone.is_err() {
+                // Don't leak it past a failed assertion.
+                signal_group(pgid, libc::SIGKILL);
+                panic!("transcriber process group {pgid} (grandchild {grandchild}) survived");
+            }
+            assert!(
+                !self.path("audio.tmp").exists(),
+                "SIGTERM came too late or never: the wrapper left its temp file"
+            );
+        }
+    }
+
+    impl Drop for FakeWrapper {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_transcriber_is_stopped_with_its_whole_process_group() {
+        let fake = FakeWrapper::new("timeout-group");
+        let mut config = cfg(&["/bin/sh", "-c", &fake.script()]);
+        config.timeout_seconds = 1;
+        let t = Transcriber::open(config).unwrap();
+        let out = t
+            .transcribe(&voice_note(Some(1_000), None), || fetch_ok(b"slow"))
+            .await;
+        assert_eq!(kind_of(&out), Some(FailureKind::Killed), "{out:?}");
+        fake.assert_stopped().await;
+    }
+
     // --- live notes before backfill (#231) ----------------------------------
 
     #[tokio::test]
     async fn a_live_note_cancels_a_running_backfill_and_takes_the_slot() {
         // The backfill's transcriber would hold the slot for 30s; the live
         // note must not wait for it (timeout 5s, which a wait would exceed).
-        let dir = std::env::temp_dir().join(format!(
-            "safehoused-transcribe-preempt-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let started = dir.join("started");
-        let script = format!(
-            "if [ \"$(cat)\" = slow ]; then touch {0}; sleep 30; fi; echo live text",
-            started.display()
-        );
-        let mut config = cfg(&["/bin/sh", "-c", &script]);
+        // Stopping it stops its whole process group, not just the shell.
+        let fake = FakeWrapper::new("preempt");
+        let mut config = cfg(&["/bin/sh", "-c", &fake.script()]);
         config.timeout_seconds = 5;
         let t = Transcriber::open(config).unwrap();
         let note = voice_note(Some(1_000), None);
@@ -1280,9 +1488,7 @@ mod tests {
             tokio::spawn(async move { t.transcribe_backfill(&note, || fetch_ok(b"slow")).await })
         };
         // Wait until the backfill's transcriber is running and holds the slot.
-        while !started.exists() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        fake.wait_started().await;
 
         let begun = std::time::Instant::now();
         let live = t.transcribe(&note, || fetch_ok(b"fast")).await;
@@ -1298,7 +1504,7 @@ mod tests {
         let backfilled = backfill.await.unwrap();
         assert_eq!(kind_of(&backfilled), Some(FailureKind::Preempted));
         assert!(!backfilled.is_final(), "a preempted run is not stored");
-        let _ = std::fs::remove_dir_all(&dir);
+        fake.assert_stopped().await;
     }
 
     #[tokio::test]

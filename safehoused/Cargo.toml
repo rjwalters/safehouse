@@ -26,3 +26,7 @@ mime = "0.3"
 # Outbound-only HTTP POST client for the egress sink (#31). Never used to
 # accept inbound connections — see egress.rs's `Sink::Http`.
 reqwest = { workspace = true }
+# Already vendored transitively (tokio, matrix-sdk; MIT/Apache-2.0). Used
+# directly by transcribe.rs to signal a transcriber's whole process group
+# (`killpg`), so a wrapper's ffmpeg/whisper-cli children stop with it (#231).
+libc = "0.2"

@@ -215,9 +215,18 @@ When configured (`safehoused/src/transcribe.rs`, hooked into `on_message` *befor
   - *Live notes come first.* A live note stalls the sync loop for every room while it waits, so it
     must never wait behind a backfill. The backfill worker starts a run only while no live
     transcription is in flight, and a live note that starts during a run cancels it at once
-    (dropping the run kills its transcriber, `kill_on_drop`, and frees the slot). The cancelled note
+    (dropping the run stops its transcriber's whole process group, below, and frees the slot once
+    the group is gone, at most `TERM_GRACE` = 2s later). The cancelled note
     is not stored and not counted as an attempt; a later `read` queues it again. So the backfill
     adds no sync-loop stall and can never cause a live note's slot timeout.
+  - *A transcriber is stopped as a process group.* The command is spawned as the leader of its own
+    process group. When it is cut short (the `timeout_seconds` cap on any run, live or backfill, or
+    a cancelled backfill run), the whole group gets SIGTERM, then SIGKILL once the leader exits or
+    2s pass, and the leader is reaped. Killing only the direct child would leave a wrapper's
+    `ffmpeg`/`whisper-cli` running beside the next transcription (breaking single-flight on a small
+    host) and its decrypted-audio temp files on disk. Requirements on a transcriber command: keep
+    its children in its process group (no `setsid`/`setpgid`), and, if it writes decrypted audio
+    to temporary files, delete them on SIGTERM; SIGKILL leaves it no chance to.
 - **Transcription is not a routing decision.** It runs for every observed `m.audio` event, before §7
   decides who the envelope reaches, including in rooms the daemon only mirrors. Making it conditional
   on "will this reach an agent" would mean a second, divergent notion of delivery alongside the one

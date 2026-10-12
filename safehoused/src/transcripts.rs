@@ -649,9 +649,13 @@ mod tests {
                     .await
             })
         };
-        while !started.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !started.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the backfill's transcriber never started");
 
         let begun = std::time::Instant::now();
         let note = transcribe::audio_note_from_content(&audio("live.ogg")).unwrap();
