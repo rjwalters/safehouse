@@ -92,6 +92,8 @@ const NOT_OWN_REACTION: &str = "not_own_reaction";
 use crate::{
     envelope::{self, Envelope},
     mailbox::{Mailbox, MailboxCheckResult},
+    transcribe,
+    transcripts::VoiceNotes,
 };
 
 pub struct Registry {
@@ -133,6 +135,10 @@ pub struct Registry {
     /// a sync cycle completes successfully, so `status`'s `connected` field
     /// reflects live reality, not a stale in-backoff snapshot.
     retry_state: std::sync::Mutex<Option<RetryState>>,
+    /// Stored voice-note transcripts and the backfill queue (#231), set once
+    /// at boot when `[transcribe]` is configured. Unset, `read` returns an
+    /// `m.audio` row's file name exactly as before.
+    voice: std::sync::OnceLock<Arc<VoiceNotes>>,
 }
 
 /// A snapshot of an in-progress sync retry/backoff cycle (#85). See
@@ -229,7 +235,13 @@ impl Registry {
             last_event_received_at: std::sync::Mutex::new(None),
             last_sync_completed_at: std::sync::Mutex::new(None),
             retry_state: std::sync::Mutex::new(None),
+            voice: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Hand the `read` op the transcript store (#231). Called once at boot.
+    pub fn set_voice_notes(&self, voice: Arc<VoiceNotes>) {
+        let _ = self.voice.set(voice);
     }
 
     /// Record that a room event (message, invite, redaction, or
@@ -961,59 +973,14 @@ async fn handle_op(
             options.limit = (limit as u32).into();
             let batch = room.messages(options).await?;
             let own = client.user_id().map(|u| u.to_string()).unwrap_or_default();
-            let mut messages = Vec::new();
-            for event in batch.chunk.iter().rev() {
-                let Ok(parsed) = serde_json::from_str::<Value>(event.raw().json().get()) else {
-                    continue;
-                };
-                if parsed.get("type").and_then(Value::as_str) != Some("m.room.message") {
-                    continue;
-                }
-                let sender = parsed
-                    .get("sender")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                let content = parsed.get("content").cloned().unwrap_or(Value::Null);
-                let mut message = json!({
-                    "event_id": parsed.get("event_id"),
-                    "sender": sender,
-                    "own": sender == own,
-                    "ts": parsed.get("origin_server_ts"),
-                });
-                let obj = message.as_object_mut().expect("json object literal");
-                // Described, never fetched: an agent asks for the bytes with
-                // `fetch_media` when it needs them.
-                if let Some(a) = envelope::attachment_from_content(&content) {
-                    obj.insert("attachment".into(), a);
-                }
-                // §5.2: resolve the thread agent the same way the live
-                // dispatch path does, so a replayed thread reply synthesizes
-                // the same envelope it would have gotten in real time.
-                let event_id = parsed.get("event_id").and_then(Value::as_str);
-                let thread_root = envelope::thread_root_from_content(&content)
-                    .or_else(|| event_id.map(str::to_owned));
-                let thread_agent = match &thread_root {
-                    Some(root) => registry.threads.target_for_thread(root).await,
-                    None => None,
-                };
-                // §7.2: never hand an agent a guessed envelope for a version we
-                // don't support — mark it so the agent can surface, not act.
-                match envelope::from_event_json(
-                    &content,
-                    &sender,
-                    &registry.personas,
-                    thread_agent.as_deref(),
-                ) {
-                    envelope::Inbound::Envelope(env, _unknown_persona) => {
-                        obj.insert("envelope".into(), serde_json::to_value(env)?);
-                    }
-                    envelope::Inbound::UnsupportedVersion(v) => {
-                        obj.insert("unsupported_version".into(), json!(v));
-                    }
-                }
-                messages.push(message);
-            }
+            // `chunk` is newest first; rows are returned oldest first.
+            let events: Vec<Value> = batch
+                .chunk
+                .iter()
+                .rev()
+                .filter_map(|event| serde_json::from_str::<Value>(event.raw().json().get()).ok())
+                .collect();
+            let messages = read_messages(&events, &own, registry).await?;
             Ok(json!({"ok": true, "room_id": room.room_id(), "messages": messages}))
         }
         "check" => {
@@ -1074,6 +1041,88 @@ async fn handle_op(
         }
         other => anyhow::bail!("unknown op {other:?}"),
     }
+}
+
+/// The `read` op's rows, from timeline events in chronological order. Split
+/// out of `handle_op` so it is testable without a joined room.
+///
+/// #231: an `m.audio` row's envelope gets the body the live path delivered
+/// (the stored transcript, or the file name plus the failure note) instead of
+/// the bare file name. A voice note with nothing stored is queued for a
+/// bounded background backfill and keeps its file name for this read.
+async fn read_messages(events: &[Value], own: &str, registry: &Registry) -> Result<Vec<Value>> {
+    let parsed_messages: Vec<&Value> = events
+        .iter()
+        .filter(|parsed| parsed.get("type").and_then(Value::as_str) == Some("m.room.message"))
+        .collect();
+    let transcripts = match registry.voice.get() {
+        Some(voice) => {
+            let rows: Vec<(String, Value)> = parsed_messages
+                .iter()
+                .rev()
+                .filter_map(|parsed| {
+                    let event_id = parsed.get("event_id").and_then(Value::as_str)?;
+                    let content = parsed.get("content")?;
+                    Some((event_id.to_owned(), content.clone()))
+                })
+                .collect();
+            voice.bodies_for_read(&rows).await
+        }
+        None => HashMap::new(),
+    };
+    let mut messages = Vec::new();
+    for parsed in parsed_messages {
+        let sender = parsed
+            .get("sender")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let mut content = parsed.get("content").cloned().unwrap_or(Value::Null);
+        let mut message = json!({
+            "event_id": parsed.get("event_id"),
+            "sender": sender,
+            "own": sender == own,
+            "ts": parsed.get("origin_server_ts"),
+        });
+        let obj = message.as_object_mut().expect("json object literal");
+        // Described, never fetched: an agent asks for the bytes with
+        // `fetch_media` when it needs them.
+        if let Some(a) = envelope::attachment_from_content(&content) {
+            obj.insert("attachment".into(), a);
+        }
+        let event_id = parsed.get("event_id").and_then(Value::as_str);
+        // #231: fold in the stored voice-note body after the attachment is
+        // described (from the original content) and before synthesis.
+        if let Some(body) = event_id.and_then(|id| transcripts.get(id)) {
+            transcribe::apply_body(&mut content, body);
+        }
+        // §5.2: resolve the thread agent the same way the live
+        // dispatch path does, so a replayed thread reply synthesizes
+        // the same envelope it would have gotten in real time.
+        let thread_root =
+            envelope::thread_root_from_content(&content).or_else(|| event_id.map(str::to_owned));
+        let thread_agent = match &thread_root {
+            Some(root) => registry.threads.target_for_thread(root).await,
+            None => None,
+        };
+        // §7.2: never hand an agent a guessed envelope for a version we
+        // don't support — mark it so the agent can surface, not act.
+        match envelope::from_event_json(
+            &content,
+            &sender,
+            &registry.personas,
+            thread_agent.as_deref(),
+        ) {
+            envelope::Inbound::Envelope(env, _unknown_persona) => {
+                obj.insert("envelope".into(), serde_json::to_value(env)?);
+            }
+            envelope::Inbound::UnsupportedVersion(v) => {
+                obj.insert("unsupported_version".into(), json!(v));
+            }
+        }
+        messages.push(message);
+    }
+    Ok(messages)
 }
 
 /// Resolve the thread a `send` belongs to: `(root, m.relates_to)`. An
@@ -3846,5 +3895,219 @@ mod tests {
             let error = reply["error"].as_str().unwrap_or("");
             assert!(!error.contains("unknown op"), "{op}: {reply}");
         }
+    }
+
+    // --- #231: voice-note transcripts in `read` ----------------------------
+
+    /// A registry whose `read` sees a transcript store and a transcriber that
+    /// logs each model run to `runs` (one line per run) and echoes stdin.
+    async fn voice_registry(
+        runs: &std::path::Path,
+        backfill_per_read: usize,
+    ) -> (
+        Arc<Registry>,
+        Arc<VoiceNotes>,
+        tokio::sync::mpsc::Receiver<crate::transcripts::BackfillJob>,
+    ) {
+        let script = format!("echo run >>{}; cat", runs.display());
+        let transcriber =
+            crate::transcribe::Transcriber::open(crate::transcribe::TranscribeConfig {
+                command: vec!["/bin/sh".into(), "-c".into(), script],
+                max_seconds: 600,
+                timeout_seconds: 10,
+                max_bytes: crate::transcribe::DEFAULT_MAX_BYTES,
+                post_transcript: false,
+                backfill_per_read,
+            })
+            .unwrap();
+        let store = crate::transcripts::TranscriptStore::with_cipher(
+            offline_client().await,
+            matrix_sdk_store_encryption::StoreCipher::new().unwrap(),
+        );
+        let (voice, rx) = VoiceNotes::new(transcriber, store);
+        let registry = Registry::new(vec!["writer".into()], Mailbox::open_in_memory().unwrap());
+        registry.set_voice_notes(voice.clone());
+        (registry, voice, rx)
+    }
+
+    fn message_event(event_id: &str, content: Value) -> Value {
+        json!({
+            "type": "m.room.message",
+            "event_id": event_id,
+            "sender": "@alice:example.org",
+            "origin_server_ts": 1,
+            "content": content,
+        })
+    }
+
+    fn voice_event(event_id: &str) -> Value {
+        message_event(
+            event_id,
+            json!({
+                "msgtype": "m.audio",
+                "body": "voice-message-recording.ogg",
+                "url": "mxc://example.org/abc",
+                "info": { "duration": 41_500, "mimetype": "audio/ogg" },
+                "org.matrix.msc3245.voice": {},
+            }),
+        )
+    }
+
+    fn body_of(row: &Value) -> &str {
+        row["envelope"]["body"]
+            .as_str()
+            .expect("row has an envelope body")
+    }
+
+    fn model_runs(runs: &std::path::Path) -> usize {
+        std::fs::read_to_string(runs)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn read_returns_the_live_transcript_for_an_audio_row() {
+        let dir = crate::test_support::tempdir("safehoused-read-voice");
+        let (registry, voice, mut rx) = voice_registry(&dir.join("runs"), 2).await;
+        // What `on_message` stores after a live transcription.
+        voice
+            .persist(
+                "$live",
+                &crate::transcribe::Transcription::Transcribed {
+                    body: "🎙 (voice note, 0:42) ship it".into(),
+                    transcript: "ship it".into(),
+                },
+            )
+            .await;
+        let rows = read_messages(&[voice_event("$live")], "@bot:example.org", &registry)
+            .await
+            .unwrap();
+        assert_eq!(body_of(&rows[0]), "🎙 (voice note, 0:42) ship it");
+        // The attachment is still described from the original event.
+        assert!(rows[0].get("attachment").is_some(), "{}", rows[0]);
+        assert!(rx.try_recv().is_err(), "a stored note is not queued");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_returns_the_stored_final_failure_note() {
+        let dir = crate::test_support::tempdir("safehoused-read-voice");
+        let (registry, voice, _rx) = voice_registry(&dir.join("runs"), 2).await;
+        let body = "🎙 (voice note, 0:42 — transcription failed: x) voice-message-recording.ogg";
+        voice
+            .persist(
+                "$failed",
+                &crate::transcribe::Transcription::Fallback {
+                    body: body.into(),
+                    reason: "transcription failed: x".into(),
+                    kind: crate::transcribe::FailureKind::Undecodable,
+                },
+            )
+            .await;
+        let rows = read_messages(&[voice_event("$failed")], "", &registry)
+            .await
+            .unwrap();
+        assert_eq!(body_of(&rows[0]), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_backfills_old_notes_bounded_then_never_again() {
+        let dir = crate::test_support::tempdir("safehoused-read-voice");
+        let runs = dir.join("runs");
+        let (registry, voice, mut rx) = voice_registry(&runs, 2).await;
+        let events: Vec<Value> = (0..5).map(|i| voice_event(&format!("$old{i}"))).collect();
+
+        // First read: every row keeps its file name, and only the two newest
+        // are queued. Nothing ran inline.
+        let rows = read_messages(&events, "", &registry).await.unwrap();
+        assert!(rows
+            .iter()
+            .all(|r| body_of(r) == "voice-message-recording.ogg"));
+        assert_eq!(model_runs(&runs), 0);
+        let queued: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|j| j.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["$old4", "$old3"]
+        );
+
+        // The worker transcribes them one at a time.
+        for job in queued {
+            voice
+                .backfill_one(job, |_| async { Ok(b"from the archive".to_vec()) })
+                .await;
+        }
+        assert_eq!(model_runs(&runs), 2);
+
+        // Re-read: the two have transcripts, the next two are queued.
+        let rows = read_messages(&events, "", &registry).await.unwrap();
+        assert_eq!(body_of(&rows[4]), "🎙 (voice note, 0:42) from the archive");
+        assert_eq!(body_of(&rows[3]), "🎙 (voice note, 0:42) from the archive");
+        assert_eq!(body_of(&rows[2]), "voice-message-recording.ogg");
+        let queued: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|j| j.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["$old2", "$old1"]
+        );
+        for job in queued {
+            voice
+                .backfill_one(job, |_| async { Ok(b"later".to_vec()) })
+                .await;
+        }
+        assert_eq!(model_runs(&runs), 4);
+
+        // Re-reading transcribed notes runs no model a second time.
+        let _ = read_messages(&events, "", &registry).await.unwrap();
+        let queued: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|j| j.event_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["$old0"]
+        );
+        for job in queued {
+            voice
+                .backfill_one(job, |_| async { Ok(b"last".to_vec()) })
+                .await;
+        }
+        let rows = read_messages(&events, "", &registry).await.unwrap();
+        assert!(rows
+            .iter()
+            .all(|r| body_of(r).starts_with("🎙 (voice note, 0:42) ")));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(model_runs(&runs), 5, "each note transcribed exactly once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_leaves_non_audio_rows_unchanged() {
+        let dir = crate::test_support::tempdir("safehoused-read-voice");
+        let (registry, _voice, mut rx) = voice_registry(&dir.join("runs"), 2).await;
+        let text = message_event("$t", json!({ "msgtype": "m.text", "body": "hello" }));
+        let with_voice = read_messages(std::slice::from_ref(&text), "", &registry)
+            .await
+            .unwrap();
+        let plain = Registry::new(vec!["writer".into()], Mailbox::open_in_memory().unwrap());
+        let without_voice = read_messages(&[text], "", &plain).await.unwrap();
+        assert_eq!(with_voice, without_voice);
+        assert_eq!(body_of(&with_voice[0]), "hello");
+        assert!(rx.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_without_transcription_returns_the_filename() {
+        let plain = Registry::new(vec!["writer".into()], Mailbox::open_in_memory().unwrap());
+        let rows = read_messages(&[voice_event("$v")], "", &plain)
+            .await
+            .unwrap();
+        assert_eq!(body_of(&rows[0]), "voice-message-recording.ogg");
     }
 }
