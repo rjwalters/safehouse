@@ -264,8 +264,9 @@ impl VoiceNotes {
                 pending.insert(event_id.clone());
                 budget -= 1;
             } else {
-                // Full: the worker is behind. Leave the rest for a later read.
-                break;
+                // Full: the worker is behind. Stop queueing, but keep looking
+                // up stored bodies for the remaining rows.
+                budget = 0;
             }
         }
         bodies
@@ -449,6 +450,33 @@ mod tests {
             .map(|j| j.event_id)
             .collect();
         assert_eq!(queued, vec!["$new0", "$new1"]);
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_still_returns_stored_bodies_for_older_rows() {
+        let (voice, mut rx) = voice_notes(&["/bin/cat"], 2).await;
+        voice
+            .bodies_for_read(&[
+                ("$p0".to_owned(), audio("p0.ogg")),
+                ("$p1".to_owned(), audio("p1.ogg")),
+            ])
+            .await;
+        voice.store.put("$old", "stored transcript").await.unwrap();
+        // The queue is full: the uncached newer row fails to enqueue, but the
+        // older stored row must still come back.
+        let rows = vec![
+            ("$new".to_owned(), audio("new.ogg")),
+            ("$old".to_owned(), audio("old.ogg")),
+        ];
+        let bodies = voice.bodies_for_read(&rows).await;
+        assert_eq!(
+            bodies.get("$old").map(String::as_str),
+            Some("stored transcript")
+        );
+        let queued: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|j| j.event_id)
+            .collect();
+        assert_eq!(queued, vec!["$p0", "$p1"], "$new must not be queued");
     }
 
     #[tokio::test]
