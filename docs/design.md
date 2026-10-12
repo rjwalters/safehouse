@@ -171,7 +171,8 @@ When configured (`safehoused/src/transcribe.rs`, hooked into `on_message` *befor
   matrix-sdk awaits event handlers to completion before the next `/sync`, so while a voice note is
   transcribing the daemon processes no event in any room. `timeout_seconds` bounds three sequential
   stages (download, slot wait, subprocess), so the worst case is up to ~3x it; the single-flight
-  slot is effectively only observable in tests because the sync loop already serializes handlers.
+  slot is contended only by the `read` backfill (#231, below), because the sync loop already
+  serializes handlers, and the backfill yields to a live note rather than making it wait.
   Decoupling transcription from the sync loop (trading away in-turn ordering into §5 synthesis) and
   a streaming download remain open follow-ons. The transcript folded into the body is length-clamped too — a mis-configured command
   must not be able to push an unbounded body into every mailbox.
@@ -188,7 +189,7 @@ When configured (`safehoused/src/transcribe.rs`, hooked into `on_message` *befor
   the room as a threaded `m.notice` under the voice note, addressed at the note's sender so §7
   routing matches no persona and it reaches no agent mailbox — the agents already have the
   transcript as the body; that copy is the humans'.
-- **Room history reads the same body (#231).** The outcome (transcript body, or file name plus
+- **Room history reads the same body (#231).** A final outcome (transcript body, or file name plus
   failure note) is stored under the event id (`safehoused/src/transcripts.rs`), so the `read` op
   returns for an `m.audio` row exactly what the mailbox delivered, not the file name. The store is
   the matrix-sdk state store the daemon already opens with `store_passphrase`, as custom values;
@@ -200,10 +201,23 @@ When configured (`safehoused/src/transcribe.rs`, hooked into `on_message` *befor
   than transcription being on, or from before the daemon joined) is queued for a **bounded
   backfill**: at most `transcribe.backfill_per_read` notes per `read` (default 2, newest first, `0`
   turns it off), worked one at a time by a background task. The `read` never waits; it returns the
-  file name until the transcript is stored, and a later `read` picks it up. Each note is
-  transcribed once, success or failure; re-reads and a late live delivery reuse the stored body.
-  The backfill shares the single-flight slot with live notes, so a live note can wait behind at
-  most one backfill run, bounded by `timeout_seconds` like any slot wait.
+  file name until the transcript is stored, and a later `read` picks it up. Re-reads and a late
+  live delivery reuse the stored body.
+  - *Only final outcomes are stored.* `FailureKind::is_final` (`transcribe.rs`) is the one place
+    that decides. Final: a transcript; over `max_bytes` or `max_seconds`; empty decrypted audio; a
+    transcriber that exits 0 with no text, or exits **65** (`EX_DATAERR`: "this audio cannot be
+    decoded" — the contract for a transcriber wrapper). Transient, so not stored: a media download
+    error or timeout, a single-flight slot timeout, a transcriber that cannot be started, is killed
+    at `timeout_seconds`, or exits any other way (OOM kill, binary mid-upgrade), and a preempted
+    backfill run. A transient live failure is still delivered with its note; a later `read` finds
+    nothing stored and backfills the note. A note that keeps failing transiently is retried at most
+    3 times per daemon run, so it cannot hold the per-read budget for ever.
+  - *Live notes come first.* A live note stalls the sync loop for every room while it waits, so it
+    must never wait behind a backfill. The backfill worker starts a run only while no live
+    transcription is in flight, and a live note that starts during a run cancels it at once
+    (dropping the run kills its transcriber, `kill_on_drop`, and frees the slot). The cancelled note
+    is not stored and not counted as an attempt; a later `read` queues it again. So the backfill
+    adds no sync-loop stall and can never cause a live note's slot timeout.
 - **Transcription is not a routing decision.** It runs for every observed `m.audio` event, before §7
   decides who the envelope reaches, including in rooms the daemon only mirrors. Making it conditional
   on "will this reach an agent" would mean a second, divergent notion of delivery alongside the one

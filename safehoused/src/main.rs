@@ -1427,8 +1427,12 @@ async fn post_transcript_notice(
 /// human's voice note, or delivering it as an unexplained file name, are both
 /// worse than a noisy body.
 ///
-/// #231: the outcome (success or failure note) is stored under the event id
-/// so the `read` op returns the same body. An event that already has a stored
+/// #231: a final outcome (a transcript, or a failure a retry cannot change)
+/// is stored under the event id so the `read` op returns the same body. A
+/// transient failure (download error, killed or crashed transcriber, ...) is
+/// delivered with its note but not stored, so a later `read` can backfill the
+/// transcript. A live note never waits behind a backfill run: it cancels it
+/// (`Transcriber::transcribe`). An event that already has a stored
 /// body (a `read` backfilled it first, or the event is seen again) reuses it
 /// and is not transcribed a second time; its transcript is not re-posted.
 async fn transcribe_audio_body(
@@ -1465,10 +1469,16 @@ async fn transcribe_audio_body(
             );
             transcriber.post_transcript().then_some(transcript)
         }
-        Transcription::Fallback { reason, .. } => {
+        Transcription::Fallback { reason, kind, .. } => {
             eprintln!(
-                "safehoused: {} in {room_id} not transcribed ({}): {reason}",
-                event.event_id, note.filename
+                "safehoused: {} in {room_id} not transcribed ({}): {reason}{}",
+                event.event_id,
+                note.filename,
+                if kind.is_final() {
+                    ""
+                } else {
+                    " (not stored; a later read retries)"
+                }
             );
             None
         }
@@ -2990,11 +3000,15 @@ mod live_transcript_tests {
     }
 
     fn audio_event() -> (OriginalSyncRoomMessageEvent, Value) {
+        audio_event_lasting(41_500)
+    }
+
+    fn audio_event_lasting(duration_ms: u64) -> (OriginalSyncRoomMessageEvent, Value) {
         let content = json!({
             "msgtype": "m.audio",
             "body": "voice-message-recording.ogg",
             "url": "mxc://example.org/abc",
-            "info": { "duration": 41_500 },
+            "info": { "duration": duration_ms },
         });
         let event = serde_json::from_value(json!({
             "type": "m.room.message",
@@ -3008,12 +3022,13 @@ mod live_transcript_tests {
     }
 
     #[tokio::test]
-    async fn a_live_failure_note_is_stored_under_the_event_id() {
+    async fn a_transient_live_failure_is_delivered_but_not_stored() {
         let dir = test_support::tempdir("safehoused-live-voice");
         let client = offline_client().await;
         let voice = voice(&client, &dir.join("runs")).await;
         let (event, mut content) = audio_event();
-        // The offline client cannot download the media: a failure note.
+        // The offline client cannot download the media: a failure note, but a
+        // passing one, so a later `read` may still backfill the transcript.
         let posted = transcribe_audio_body(
             Some(&voice),
             &client,
@@ -3026,6 +3041,28 @@ mod live_transcript_tests {
         let body = content["body"].as_str().unwrap().to_owned();
         assert!(body.contains("voice-message-recording.ogg"), "{body}");
         assert!(body.contains("transcription failed"), "{body}");
+        assert_eq!(voice.stored("$voice:example.org").await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_final_live_failure_is_stored_under_the_event_id() {
+        let dir = test_support::tempdir("safehoused-live-voice");
+        let client = offline_client().await;
+        let voice = voice(&client, &dir.join("runs")).await;
+        // Twenty minutes, over the 600s cap with no placeholder to trim with:
+        // no retry can change that.
+        let (event, mut content) = audio_event_lasting(20 * 60 * 1000);
+        transcribe_audio_body(
+            Some(&voice),
+            &client,
+            &event,
+            "!r:example.org",
+            &mut content,
+        )
+        .await;
+        let body = content["body"].as_str().unwrap().to_owned();
+        assert!(body.contains("max_seconds"), "{body}");
         assert_eq!(
             voice.stored("$voice:example.org").await.as_deref(),
             Some(body.as_str())

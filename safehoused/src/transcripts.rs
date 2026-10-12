@@ -27,8 +27,18 @@
 //!   queued for transcription, at most `backfill_per_read` per `read`, and
 //!   transcribed one at a time by [`VoiceNotes::run_backfill`]. The `read`
 //!   never waits: it returns the file name until the transcript is stored.
-//!   Each note is transcribed once; its outcome, success or failure, is
-//!   stored, and later reads (and a late live delivery) reuse it.
+//!   The backfill yields to live notes: a run starts only while no live
+//!   transcription is in flight, and a live note cancels one in progress
+//!   (`Transcriber::transcribe_backfill`), so it never stalls the sync loop.
+//! - **Only final outcomes are stored.** A transcript, or a failure that a
+//!   retry cannot change (over a cap, empty or undecodable audio, no text;
+//!   `FailureKind::is_final`). A failure that might pass (download error or
+//!   timeout, slot timeout, a killed, crashed or missing transcriber, a
+//!   preempted backfill) is delivered live with its note but not stored, so a
+//!   later `read` queues the note again. To keep a note that never stops
+//!   failing from taking the per-read budget forever, it is retried at most
+//!   [`MAX_BACKFILL_ATTEMPTS`] times per daemon run (a preempted run does not
+//!   count; a restart starts the count again).
 
 use std::{
     collections::{HashMap, HashSet},
@@ -43,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::transcribe::{self, Transcriber, Transcription};
+use crate::transcribe::{self, FailureKind, Transcriber, Transcription};
 
 /// State-store custom key holding the passphrase-exported [`StoreCipher`].
 const CIPHER_KEY: &[u8] = b"safehoused.transcripts.cipher.v1";
@@ -51,6 +61,10 @@ const CIPHER_KEY: &[u8] = b"safehoused.transcripts.cipher.v1";
 /// Table name mixed into every entry's key hash. Versioned so a future change
 /// to the entry shape can start a fresh keyspace.
 const TABLE: &str = "safehoused.transcripts.v1";
+
+/// How many backfill runs a note may fail transiently before `read` stops
+/// queueing it, until the daemon restarts.
+pub const MAX_BACKFILL_ATTEMPTS: u32 = 3;
 
 /// One stored transcript. A struct rather than a bare string so a field can be
 /// added later without a new keyspace.
@@ -159,6 +173,9 @@ pub struct VoiceNotes {
     /// Event ids queued or being transcribed, so overlapping reads do not
     /// queue the same note twice.
     pending: Mutex<HashSet<String>>,
+    /// Transient backfill failures per event id, this daemon run. A note at
+    /// [`MAX_BACKFILL_ATTEMPTS`] is not queued again.
+    attempts: Mutex<HashMap<String, u32>>,
 }
 
 impl VoiceNotes {
@@ -174,6 +191,7 @@ impl VoiceNotes {
                 store,
                 queue,
                 pending: Mutex::new(HashSet::new()),
+                attempts: Mutex::new(HashMap::new()),
             }),
             rx,
         )
@@ -196,12 +214,19 @@ impl VoiceNotes {
         }
     }
 
-    /// Store one transcription outcome (success or failure note). Errors are
-    /// logged, never fatal: the message has already been delivered.
-    pub async fn persist(&self, event_id: &str, outcome: &Transcription) {
+    /// Store one transcription outcome if it is final (a transcript, or a
+    /// failure a retry cannot change); a transient failure is not stored, so
+    /// a later `read` backfills the note. Returns whether it was stored.
+    /// Errors are logged, never fatal: the message has already been delivered.
+    pub async fn persist(&self, event_id: &str, outcome: &Transcription) -> bool {
+        if !outcome.is_final() {
+            return false;
+        }
         if let Err(err) = self.store.put(event_id, outcome.body()).await {
             eprintln!("safehoused: storing the transcript for {event_id} failed: {err:#}");
+            return false;
         }
+        true
     }
 
     /// The `read` op's lookup. `rows` are `(event_id, content)` pairs,
@@ -224,6 +249,9 @@ impl VoiceNotes {
             if budget == 0 {
                 continue;
             }
+            if self.attempts_exhausted(event_id) {
+                continue;
+            }
             let mut pending = self.pending.lock().expect("pending set lock");
             if pending.contains(event_id) {
                 continue;
@@ -243,9 +271,34 @@ impl VoiceNotes {
         bodies
     }
 
-    /// Transcribe one queued note and store the outcome. `fetch` downloads
-    /// and decrypts the audio from the event content. Skips the model run
-    /// when something (a live delivery) stored a body meanwhile.
+    /// Record one backfill run's outcome against the note's retry budget.
+    fn count_attempt(&self, event_id: &str, outcome: &Transcription) {
+        let mut attempts = self.attempts.lock().expect("attempts lock");
+        match outcome {
+            Transcription::Fallback {
+                kind: FailureKind::Preempted,
+                ..
+            } => {}
+            o if o.is_final() => {
+                attempts.remove(event_id);
+            }
+            _ => *attempts.entry(event_id.to_owned()).or_default() += 1,
+        }
+    }
+
+    fn attempts_exhausted(&self, event_id: &str) -> bool {
+        self.attempts
+            .lock()
+            .expect("attempts lock")
+            .get(event_id)
+            .is_some_and(|n| *n >= MAX_BACKFILL_ATTEMPTS)
+    }
+
+    /// Transcribe one queued note at backfill priority and store the outcome
+    /// if it is final. `fetch` downloads and decrypts the audio from the
+    /// event content. Skips the model run when something (a live delivery)
+    /// stored a body meanwhile. A transient failure is left unstored for a
+    /// later `read`; a preempted run does not count as an attempt.
     pub async fn backfill_one<F, Fut>(&self, job: BackfillJob, fetch: F)
     where
         F: FnOnce(Value) -> Fut,
@@ -254,15 +307,26 @@ impl VoiceNotes {
         let BackfillJob { event_id, content } = job;
         if self.stored(&event_id).await.is_none() {
             if let Some(note) = transcribe::audio_note_from_content(&content) {
-                let outcome = self.transcriber.transcribe(&note, || fetch(content)).await;
+                let outcome = self
+                    .transcriber
+                    .transcribe_backfill(&note, || fetch(content))
+                    .await;
                 match &outcome {
                     Transcription::Transcribed { .. } => {
                         println!("safehoused: backfilled the transcript of {event_id}")
                     }
-                    Transcription::Fallback { reason, .. } => {
-                        eprintln!("safehoused: backfill of {event_id} not transcribed: {reason}")
+                    Transcription::Fallback { reason, kind, .. } => {
+                        let retry = if kind.is_final() {
+                            ""
+                        } else {
+                            " (not stored; a later read retries)"
+                        };
+                        eprintln!(
+                            "safehoused: backfill of {event_id} not transcribed: {reason}{retry}"
+                        )
                     }
                 }
+                self.count_attempt(&event_id, &outcome);
                 self.persist(&event_id, &outcome).await;
             }
         }
@@ -449,16 +513,134 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_backfill_is_stored_and_not_retried() {
+    async fn a_transient_backfill_failure_is_not_stored_and_is_retried() {
+        let (voice, mut rx) = voice_notes(&["/bin/cat"], 2).await;
+        let rows = vec![("$old".to_owned(), audio("Voice message.ogg"))];
+        voice.bodies_for_read(&rows).await;
+        // A homeserver hiccup: nothing is stored...
+        voice
+            .backfill_one(rx.try_recv().unwrap(), |_| async {
+                Err("M_UNKNOWN: try again".to_owned())
+            })
+            .await;
+        assert_eq!(voice.stored("$old").await, None);
+        // ...so the next read queues the note again, and that run succeeds.
+        assert!(voice.bodies_for_read(&rows).await.is_empty());
+        voice
+            .backfill_one(rx.try_recv().expect("re-queued"), |_| async {
+                Ok(b"second time lucky".to_vec())
+            })
+            .await;
+        assert_eq!(
+            voice
+                .bodies_for_read(&rows)
+                .await
+                .get("$old")
+                .map(String::as_str),
+            Some("🎙 (voice note, 0:42) second time lucky")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_transcriber_is_not_stored_as_the_notes_outcome() {
+        // An operator-fixable condition, not a fact about the note.
         let (voice, mut rx) = voice_notes(&["/nonexistent/whisper-cli"], 2).await;
         let rows = vec![("$old".to_owned(), audio("Voice message.ogg"))];
         voice.bodies_for_read(&rows).await;
         voice
             .backfill_one(rx.try_recv().unwrap(), |_| async { Ok(b"audio".to_vec()) })
             .await;
-        let body = voice.bodies_for_read(&rows).await.remove("$old").unwrap();
+        assert!(voice.bodies_for_read(&rows).await.is_empty());
+        assert!(rx.try_recv().is_ok(), "queued again for a later run");
+    }
+
+    #[tokio::test]
+    async fn a_final_backfill_failure_is_stored_and_not_retried() {
+        let (voice, mut rx) = voice_notes(&["/bin/cat"], 2).await;
+        // Twenty minutes, over the 600s cap with no placeholder to trim with.
+        let mut long = audio("Voice message.ogg");
+        long["info"]["duration"] = json!(20 * 60 * 1000);
+        let rows = vec![("$long".to_owned(), long)];
+        voice.bodies_for_read(&rows).await;
+        voice
+            .backfill_one(rx.try_recv().unwrap(), |_| async { Ok(b"audio".to_vec()) })
+            .await;
+        let body = voice.bodies_for_read(&rows).await.remove("$long").unwrap();
         assert!(body.contains("Voice message.ogg"), "{body}");
-        assert!(body.contains("transcription failed"), "{body}");
-        assert!(rx.try_recv().is_err());
+        assert!(body.contains("max_seconds"), "{body}");
+        assert!(rx.try_recv().is_err(), "a final outcome is not retried");
+    }
+
+    #[tokio::test]
+    async fn a_note_that_keeps_failing_stops_being_queued() {
+        let (voice, mut rx) = voice_notes(&["/bin/cat"], 2).await;
+        let rows = vec![("$gone".to_owned(), audio("Voice message.ogg"))];
+        for _ in 0..MAX_BACKFILL_ATTEMPTS {
+            voice.bodies_for_read(&rows).await;
+            voice
+                .backfill_one(rx.try_recv().expect("queued"), |_| async {
+                    Err("M_NOT_FOUND".to_owned())
+                })
+                .await;
+        }
+        voice.bodies_for_read(&rows).await;
+        assert!(rx.try_recv().is_err(), "retried past the attempt bound");
+        assert_eq!(voice.stored("$gone").await, None, "still not stored");
+    }
+
+    #[tokio::test]
+    async fn a_live_note_preempts_a_running_backfill() {
+        // The backfill's transcriber would run for 30s; the live note's own
+        // timeout is 5s. The live note is transcribed at once, and the
+        // cancelled backfill is left unstored and queued again by a later read.
+        let dir = std::env::temp_dir().join(format!(
+            "safehoused-backfill-preempt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = dir.join("started");
+        let script = format!(
+            "if [ \"$(cat)\" = slow ]; then touch {0}; sleep 30; fi; echo live text",
+            started.display()
+        );
+        let store =
+            TranscriptStore::with_cipher(offline_client().await, StoreCipher::new().unwrap());
+        let mut cfg = config(&["/bin/sh", "-c", &script], 2);
+        cfg.timeout_seconds = 5;
+        let (voice, mut rx) = VoiceNotes::new(Transcriber::open(cfg).unwrap(), store);
+
+        let rows = vec![("$old".to_owned(), audio("Voice message.ogg"))];
+        voice.bodies_for_read(&rows).await;
+        let job = rx.try_recv().unwrap();
+        let backfill = {
+            let voice = voice.clone();
+            tokio::spawn(async move {
+                voice
+                    .backfill_one(job, |_| async { Ok(b"slow".to_vec()) })
+                    .await
+            })
+        };
+        while !started.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let begun = std::time::Instant::now();
+        let note = transcribe::audio_note_from_content(&audio("live.ogg")).unwrap();
+        let live = voice
+            .transcriber()
+            .transcribe(&note, || async { Ok(b"fast".to_vec()) })
+            .await;
+        assert!(
+            matches!(live, Transcription::Transcribed { .. }),
+            "{live:?}"
+        );
+        assert!(begun.elapsed() < std::time::Duration::from_secs(3));
+
+        backfill.await.unwrap();
+        assert_eq!(voice.stored("$old").await, None);
+        voice.bodies_for_read(&rows).await;
+        assert!(rx.try_recv().is_ok(), "the preempted note is queued again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

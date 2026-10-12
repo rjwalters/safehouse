@@ -331,13 +331,17 @@ recovery_passphrase = "change-me-as-well"
 # have the transcript as the message body. Defaults to false.
 # post_transcript = true
 #
-# Room history (#231). Every outcome is stored, encrypted, under the voice
+# Room history (#231). Each final outcome (a transcript, or a failure no
+# retry can change, such as over a cap) is stored, encrypted, under the voice
 # note's event id, so the `read` op returns the transcript rather than the
-# file name. A voice note `read` finds with nothing stored (from before
+# file name. A passing failure (download error, crashed transcriber) is not
+# stored, so a later `read` retries it. A transcriber wrapper that exits 65
+# says "this audio cannot be decoded", which is stored as final. A voice note `read` finds with nothing stored (from before
 # transcription was on) is queued for transcription in the background, at
 # most this many per `read`, one at a time; the `read` never waits and shows
-# the file name until the transcript is stored. Each note is transcribed
-# once. 0 turns this backfill off. Defaults to 2.
+# the file name until the transcript is stored. A live voice note always
+# goes first: it cancels a backfill run in progress. 0 turns this backfill
+# off. Defaults to 2.
 # backfill_per_read = 2
 
 # --- Config schema version (issue #101, provisioning parity) ------------

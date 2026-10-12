@@ -218,13 +218,16 @@ caveats: `max_bytes`'s pre-download check relies on sender-controlled `info.size
 it and the real memory bound is the homeserver's upload limit, as matrix-sdk 0.18 can't stream or
 cap downloads), and transcription is awaited inline in `on_message`, so it stalls the sync loop
 (no event in any room is processed) for up to ~3x `timeout_seconds` (download, slot wait,
-subprocess are sequential); the slot is effectively only observable in tests. Every failure falls back to the file name plus a visible reason. Optional
+subprocess are sequential); the slot is contended only by the #231 backfill, which yields to live notes. Every failure falls back to the file name plus a visible reason. Optional
 `post_transcript` echoes the transcript into the room as a threaded `m.notice` addressed at the
 sender (so it reaches no agent mailbox). Design rationale: `design.md` §4.1.3; config:
 `safehoused/example-config.toml`. **Not yet measured on real hardware** — the `base.en` vs
-`small.en` latency recommendation in the example config is reasoned, not benchmarked. **#231:** each outcome is also stored, encrypted, per event id
-(`safehoused/src/transcripts.rs`), so `read` returns the transcript for an `m.audio` row; old notes
-are backfilled in the background, at most `backfill_per_read` (default 2) per `read`.
+`small.en` latency recommendation in the example config is reasoned, not benchmarked. **#231:** each final outcome (a transcript, or a failure no retry can
+change: over a cap, undecodable audio) is also stored, encrypted, per event id
+(`safehoused/src/transcripts.rs`), so `read` returns the transcript for an `m.audio` row; transient
+failures are not stored and are retried by a later `read`. Old notes are backfilled in the
+background, at most `backfill_per_read` (default 2) per `read`, at lower priority than live notes: a
+live note cancels a running backfill, so the backfill never stalls the sync loop.
 
 ## Deferred, with a deadline
 - ~~**D11 — CLA vs. DCO.**~~ ✅ Decided 2026-07-26: **DCO** (`CONTRIBUTING.md`, D11).

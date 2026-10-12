@@ -35,7 +35,11 @@
 //!     voice note is up to ~3x `timeout_seconds` (6 minutes at the default
 //!     120) of daemon-wide stall. Because handler invocations are already
 //!     serialized by the sync loop, the single-flight slot is in practice only
-//!     observable in tests; it is not what bounds concurrency in production.
+//!     contended by the `read` backfill (#231), and that never makes a live
+//!     note wait: a backfill run starts only while no live transcription is
+//!     in flight and is cancelled (its transcriber killed) the moment one
+//!     starts ([`Transcriber::transcribe_backfill`]). So the backfill adds no
+//!     sync-loop stall.
 //!   - *`max_bytes` is not a pre-download memory ceiling.* The pre-download
 //!     check uses the sender-controlled `info.size` and only fires when that
 //!     is present; a sender can omit or understate it. matrix-sdk 0.18's
@@ -55,6 +59,10 @@
 //! `{max_millis}` placeholders substituted, see [`render_command`]), the raw
 //! decrypted media bytes on stdin, and nothing else. Whatever it writes to
 //! stdout is the transcript; stderr is used only to explain a non-zero exit.
+//! Exit status 65 ([`EXIT_UNDECODABLE`], sysexits' `EX_DATAERR`) means "this
+//! audio cannot be decoded" and is stored as the note's final outcome (#231);
+//! any other failure is taken to be about the host and is retried by a later
+//! `read` (see [`FailureKind::is_final`]).
 //! Container/codec handling is the command's business — a voice note is
 //! typically Opus-in-Ogg, which `whisper-cli` cannot read directly, so in
 //! practice `command` points at a small wrapper that pipes stdin through
@@ -79,7 +87,12 @@ use std::{future::Future, process::Stdio, sync::Arc, time::Duration};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::{io::AsyncWriteExt as _, process::Command, sync::Mutex, time::timeout};
+use tokio::{
+    io::AsyncWriteExt as _,
+    process::Command,
+    sync::{watch, Mutex},
+    time::timeout,
+};
 
 /// Hard ceiling on the transcript length folded into an envelope body. A
 /// mis-configured command (`cat` on a 20 MiB file, a transcriber echoing its
@@ -135,8 +148,8 @@ pub struct TranscribeConfig {
     /// These are three *sequential* bounds, and transcription is awaited
     /// inline in `on_message`, which blocks the matrix-sdk sync loop (no
     /// event in any room is processed meanwhile). The worst-case stall per
-    /// voice note is therefore up to ~3x this value, not 1x. The single-flight
-    /// slot only contends in tests: the sync loop already serializes handlers.
+    /// voice note is therefore up to ~3x this value, not 1x. A live note never
+    /// waits for the slot behind the `read` backfill, which yields to it.
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
     /// Size cap, checked against the event's advertised `info.size` *before*
@@ -155,9 +168,12 @@ pub struct TranscribeConfig {
     /// How many never-transcribed `m.audio` events one `read` may queue for
     /// transcription (#231): voice notes from before transcription was on,
     /// or from before the daemon joined. The queue is worked one note at a
-    /// time in the background, sharing the single-flight slot with live
-    /// notes; the `read` itself never waits and returns the file name until
-    /// the transcript is stored. `0` turns the backfill off (a `read` still
+    /// time in the background, at a lower priority than live notes (a live
+    /// note cancels a backfill run in progress); the `read` itself never
+    /// waits and returns the file name until the transcript is stored. Only
+    /// a transcript or a final failure (over a cap, undecodable) is stored; a
+    /// note whose run failed for a passing reason is queued again by a later
+    /// `read`. `0` turns the backfill off (a `read` still
     /// returns any transcript already stored). Defaults to 2.
     #[serde(default = "default_backfill_per_read")]
     pub backfill_per_read: usize,
@@ -273,8 +289,8 @@ pub enum Plan {
     /// placeholder — the body then says the transcript is partial.
     Run { truncate_to_seconds: Option<u64> },
     /// Do not download at all; deliver the fallback body carrying this
-    /// reason.
-    Skip(String),
+    /// reason. Always a final outcome (an over-cap note stays over-cap).
+    Skip(FailureKind, String),
 }
 
 /// Apply the pre-download caps. Unknown duration/size are *not* treated as
@@ -283,10 +299,13 @@ pub enum Plan {
 pub fn plan(cfg: &TranscribeConfig, note: &AudioNote) -> Plan {
     if let Some(size) = note.size_bytes {
         if size > cfg.max_bytes {
-            return Plan::Skip(format!(
-                "not transcribed: {size} bytes exceeds the {} byte transcribe.max_bytes cap",
-                cfg.max_bytes
-            ));
+            return Plan::Skip(
+                FailureKind::OverSizeCap,
+                format!(
+                    "not transcribed: {size} bytes exceeds the {} byte transcribe.max_bytes cap",
+                    cfg.max_bytes
+                ),
+            );
         }
     }
     if let Some(secs) = note.duration_secs() {
@@ -296,13 +315,16 @@ pub fn plan(cfg: &TranscribeConfig, note: &AudioNote) -> Plan {
                     truncate_to_seconds: Some(cfg.max_seconds),
                 };
             }
-            return Plan::Skip(format!(
-                "not transcribed: {} is longer than the {} transcribe.max_seconds cap, and \
+            return Plan::Skip(
+                FailureKind::OverDurationCap,
+                format!(
+                    "not transcribed: {} is longer than the {} transcribe.max_seconds cap, and \
                  transcribe.command has no {{max_seconds}}/{{max_millis}} placeholder to \
                  trim with",
-                format_duration(secs),
-                format_duration(cfg.max_seconds)
-            ));
+                    format_duration(secs),
+                    format_duration(cfg.max_seconds)
+                ),
+            );
         }
     }
     Plan::Run {
@@ -351,6 +373,69 @@ pub fn fallback_body(note: &AudioNote, reason: &str) -> String {
     format!("🎙 ({head} — {reason}) {}", note.filename)
 }
 
+/// Why a voice note was not transcribed. Every failure path in
+/// [`Transcriber`] names one, and [`FailureKind::is_final`] is the single
+/// place that decides whether that outcome is a fact about the note (stored,
+/// #231) or about the moment (delivered with its note, never stored, so a
+/// later `read` can backfill it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureKind {
+    /// Over `max_bytes`, by the advertised `info.size` or the downloaded size.
+    OverSizeCap,
+    /// Over `max_seconds`, and the command has no placeholder to trim with.
+    OverDurationCap,
+    /// The decrypted audio was zero bytes.
+    EmptyAudio,
+    /// The transcriber exited 0 and wrote nothing.
+    NoText,
+    /// The transcriber exited with [`EXIT_UNDECODABLE`]: it cannot read this
+    /// audio (unsupported codec, corrupt stream).
+    Undecodable,
+    /// The media download or decryption failed (homeserver, network, token).
+    Fetch,
+    /// The media download ran past `timeout_seconds`.
+    FetchTimeout,
+    /// The single-flight slot was still held after `timeout_seconds`.
+    SlotTimeout,
+    /// A backfill run was cancelled (its transcriber killed) because a live
+    /// voice note arrived.
+    Preempted,
+    /// The transcriber could not be started, or its pipes failed.
+    Spawn,
+    /// The transcriber ran past `timeout_seconds` and was killed.
+    Killed,
+    /// The transcriber exited non-zero (other than [`EXIT_UNDECODABLE`]) or
+    /// died on a signal: an OOM kill, a binary mid-upgrade, a missing model.
+    Crashed,
+}
+
+impl FailureKind {
+    /// Whether retrying the same note can never change the outcome. Only these
+    /// are stored; everything else might succeed on a later `read`.
+    pub fn is_final(self) -> bool {
+        match self {
+            FailureKind::OverSizeCap
+            | FailureKind::OverDurationCap
+            | FailureKind::EmptyAudio
+            | FailureKind::NoText
+            | FailureKind::Undecodable => true,
+            FailureKind::Fetch
+            | FailureKind::FetchTimeout
+            | FailureKind::SlotTimeout
+            | FailureKind::Preempted
+            | FailureKind::Spawn
+            | FailureKind::Killed
+            | FailureKind::Crashed => false,
+        }
+    }
+}
+
+/// Exit status by which a transcriber says "this audio cannot be decoded"
+/// (sysexits' `EX_DATAERR`). Treated as a final outcome; any other non-zero
+/// exit is assumed to be about the host, not the note, and is retried by a
+/// later `read`.
+pub const EXIT_UNDECODABLE: i32 = 65;
+
 /// The outcome of one voice note. Either way a body is produced and the
 /// message is delivered.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -360,8 +445,12 @@ pub enum Transcription {
     /// optional `post_transcript` notice).
     Transcribed { body: String, transcript: String },
     /// Transcription was skipped or failed; `body` is the file name plus a
-    /// visible note. `reason` is also logged.
-    Fallback { body: String, reason: String },
+    /// visible note. `reason` is also logged; `kind` says whether to store it.
+    Fallback {
+        body: String,
+        reason: String,
+        kind: FailureKind,
+    },
 }
 
 impl Transcription {
@@ -372,10 +461,20 @@ impl Transcription {
         }
     }
 
-    fn fallback(note: &AudioNote, reason: String) -> Self {
+    /// Whether this outcome is definitive and may be stored (#231): a
+    /// transcript, or a failure that [`FailureKind::is_final`].
+    pub fn is_final(&self) -> bool {
+        match self {
+            Transcription::Transcribed { .. } => true,
+            Transcription::Fallback { kind, .. } => kind.is_final(),
+        }
+    }
+
+    fn fallback(note: &AudioNote, kind: FailureKind, reason: String) -> Self {
         Transcription::Fallback {
             body: fallback_body(note, &reason),
             reason,
+            kind,
         }
     }
 }
@@ -447,6 +546,27 @@ pub struct Transcriber {
     /// the acceptance criterion, and the reason a burst of voice notes cannot
     /// swamp a small host. Waiting for it is bounded by `timeout_seconds`.
     slot: Mutex<()>,
+    /// How many live transcriptions ([`Self::transcribe`]) are in flight
+    /// (#231). A backfill run ([`Self::transcribe_backfill`]) starts only at
+    /// zero and is cancelled the moment it rises, so a live note, which
+    /// stalls the sync loop while it waits, never waits behind a backfill.
+    live: watch::Sender<usize>,
+}
+
+/// Counts one live transcription for as long as it is held.
+struct LiveGuard<'a>(&'a watch::Sender<usize>);
+
+impl<'a> LiveGuard<'a> {
+    fn enter(live: &'a watch::Sender<usize>) -> Self {
+        live.send_modify(|n| *n += 1);
+        Self(live)
+    }
+}
+
+impl Drop for LiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
 }
 
 impl Transcriber {
@@ -458,6 +578,7 @@ impl Transcriber {
         Ok(Arc::new(Self {
             config,
             slot: Mutex::new(()),
+            live: watch::Sender::new(0),
         }))
     }
 
@@ -489,10 +610,14 @@ impl Transcriber {
         )
     }
 
-    /// The whole pipeline for one `m.audio` event: caps, download (via the
-    /// caller's `fetch`, which is where matrix-sdk's media API lives — kept
-    /// out of this module so the pipeline is testable without a homeserver),
-    /// post-download size check, then the single-flight subprocess.
+    /// The whole pipeline for one live `m.audio` event: caps, download (via
+    /// the caller's `fetch`, which is where matrix-sdk's media API lives —
+    /// kept out of this module so the pipeline is testable without a
+    /// homeserver), post-download size check, then the single-flight
+    /// subprocess.
+    ///
+    /// Takes priority over the backfill: while this runs, any backfill run is
+    /// cancelled and no new one starts, so the slot is free for it at once.
     ///
     /// Infallible by construction: every error becomes a
     /// [`Transcription::Fallback`] carrying a deliverable body.
@@ -501,8 +626,41 @@ impl Transcriber {
         F: FnOnce() -> Fut,
         Fut: Future<Output = std::result::Result<Vec<u8>, String>>,
     {
+        let _live = LiveGuard::enter(&self.live);
+        self.pipeline(note, fetch).await
+    }
+
+    /// [`Self::transcribe`] for a `read` backfill (#231), at the lowest
+    /// priority: waits until no live transcription is in flight, and gives up
+    /// as soon as one starts (dropping the run, which kills the transcriber
+    /// and frees the slot). A cancelled run returns a
+    /// [`FailureKind::Preempted`] fallback, which is not stored.
+    pub async fn transcribe_backfill<F, Fut>(&self, note: &AudioNote, fetch: F) -> Transcription
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<Vec<u8>, String>>,
+    {
+        let mut live = self.live.subscribe();
+        // The sender lives in `self`, so these never see a closed channel.
+        let _ = live.wait_for(|n| *n == 0).await;
+        tokio::select! {
+            biased;
+            _ = live.wait_for(|n| *n > 0) => Transcription::fallback(
+                note,
+                FailureKind::Preempted,
+                "transcription postponed: a live voice note took priority".to_owned(),
+            ),
+            outcome = self.pipeline(note, fetch) => outcome,
+        }
+    }
+
+    async fn pipeline<F, Fut>(&self, note: &AudioNote, fetch: F) -> Transcription
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<Vec<u8>, String>>,
+    {
         let truncate_to_seconds = match plan(&self.config, note) {
-            Plan::Skip(reason) => return Transcription::fallback(note, reason),
+            Plan::Skip(kind, reason) => return Transcription::fallback(note, kind, reason),
             Plan::Run {
                 truncate_to_seconds,
             } => truncate_to_seconds,
@@ -513,6 +671,7 @@ impl Transcriber {
             Err(_) => {
                 return Transcription::fallback(
                     note,
+                    FailureKind::FetchTimeout,
                     format!(
                         "transcription failed: downloading the audio took longer than {}s",
                         self.config.timeout_seconds
@@ -522,6 +681,7 @@ impl Transcriber {
             Ok(Err(err)) => {
                 return Transcription::fallback(
                     note,
+                    FailureKind::Fetch,
                     format!("transcription failed: could not fetch/decrypt the audio: {err}"),
                 )
             }
@@ -531,12 +691,14 @@ impl Transcriber {
         if audio.is_empty() {
             return Transcription::fallback(
                 note,
+                FailureKind::EmptyAudio,
                 "transcription failed: the decrypted audio was empty".to_owned(),
             );
         }
         if audio.len() as u64 > self.config.max_bytes {
             return Transcription::fallback(
                 note,
+                FailureKind::OverSizeCap,
                 format!(
                     "not transcribed: downloaded {} bytes, over the {} byte \
                      transcribe.max_bytes cap",
@@ -553,34 +715,40 @@ impl Transcriber {
             },
             Ok(_) => Transcription::fallback(
                 note,
+                FailureKind::NoText,
                 "transcription failed: the transcriber produced no text".to_owned(),
             ),
-            Err(err) => Transcription::fallback(note, format!("transcription failed: {err}")),
+            Err((kind, err)) => {
+                Transcription::fallback(note, kind, format!("transcription failed: {err}"))
+            }
         }
     }
 
     /// Run the configured command with `audio` on stdin, one at a time,
     /// under the wall-clock bound. Returns the trimmed, length-clamped
-    /// stdout.
+    /// stdout, or the failure's kind and description.
     async fn run_command(
         &self,
         audio: Vec<u8>,
         truncate_to_seconds: Option<u64>,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<String, (FailureKind, String)> {
         let argv = render_command(&self.config, truncate_to_seconds);
         let program = argv
             .first()
             .cloned()
-            .ok_or_else(|| "transcribe.command is empty".to_owned())?;
+            .ok_or_else(|| (FailureKind::Spawn, "transcribe.command is empty".to_owned()))?;
         let bound = Duration::from_secs(self.config.timeout_seconds);
 
         // Single-flight. Waiting is bounded too: a backlog must degrade to
         // "delivered with a note" rather than pile up unboundedly behind a
         // slow transcriber.
         let _slot = timeout(bound, self.slot.lock()).await.map_err(|_| {
-            format!(
-                "another transcription still held the single-flight slot after {}s",
-                self.config.timeout_seconds
+            (
+                FailureKind::SlotTimeout,
+                format!(
+                    "another transcription still held the single-flight slot after {}s",
+                    self.config.timeout_seconds
+                ),
             )
         })?;
 
@@ -589,16 +757,17 @@ impl Transcriber {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // A timed-out transcriber is dropped below; without this it would
-            // be left running (and still holding a core) after we gave up.
+            // A timed-out (or preempted, #231) transcriber is dropped; without
+            // this it would be left running (and still holding a core) after
+            // we gave up.
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("could not run {program}: {e}"))?;
+            .map_err(|e| (FailureKind::Spawn, format!("could not run {program}: {e}")))?;
 
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| format!("{program} has no stdin pipe"))?;
+            .ok_or_else(|| (FailureKind::Spawn, format!("{program} has no stdin pipe")))?;
         // Written from a separate task so a transcriber that streams output
         // while we are still feeding it cannot deadlock on a full pipe. Write
         // errors are deliberately ignored: a command that does not read stdin
@@ -608,37 +777,55 @@ impl Transcriber {
             let _ = stdin.write_all(&audio).await;
             let _ = stdin.shutdown().await;
         });
+        // Aborts the writer however this function ends, including when a
+        // backfill run is dropped mid-await.
+        let _writer = AbortOnDrop(writer);
 
         let output = match timeout(bound, child.wait_with_output()).await {
             Err(_) => {
-                writer.abort();
-                return Err(format!(
-                    "{program} exceeded the {}s transcribe.timeout_seconds cap (killed)",
-                    self.config.timeout_seconds
+                return Err((
+                    FailureKind::Killed,
+                    format!(
+                        "{program} exceeded the {}s transcribe.timeout_seconds cap (killed)",
+                        self.config.timeout_seconds
+                    ),
                 ));
             }
-            Ok(Err(e)) => {
-                writer.abort();
-                return Err(format!("{program} failed: {e}"));
-            }
+            Ok(Err(e)) => return Err((FailureKind::Spawn, format!("{program} failed: {e}"))),
             Ok(Ok(output)) => output,
         };
-        writer.abort();
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let detail = stderr.lines().next().unwrap_or("").trim().to_owned();
-            return Err(format!(
-                "{program} exited with {}{}",
-                output.status,
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {detail}")
-                }
+            let kind = if output.status.code() == Some(EXIT_UNDECODABLE) {
+                FailureKind::Undecodable
+            } else {
+                FailureKind::Crashed
+            };
+            return Err((
+                kind,
+                format!(
+                    "{program} exited with {}{}",
+                    output.status,
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {detail}")
+                    }
+                ),
             ));
         }
         Ok(clamp_transcript(&String::from_utf8_lossy(&output.stdout)))
+    }
+}
+
+/// Aborts a spawned task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -749,7 +936,10 @@ mod tests {
             &voice_note(Some(1_000), Some(99_999_999)),
         );
         match plan {
-            Plan::Skip(reason) => assert!(reason.contains("max_bytes"), "{reason}"),
+            Plan::Skip(kind, reason) => {
+                assert_eq!(kind, FailureKind::OverSizeCap);
+                assert!(reason.contains("max_bytes"), "{reason}");
+            }
             other => panic!("expected a skip, got {other:?}"),
         }
     }
@@ -780,7 +970,8 @@ mod tests {
         let mut config = cfg(&["/bin/whisper", "-f", "-"]);
         config.max_seconds = 60;
         match plan(&config, &voice_note(Some(600_000), None)) {
-            Plan::Skip(reason) => {
+            Plan::Skip(kind, reason) => {
+                assert_eq!(kind, FailureKind::OverDurationCap);
                 assert!(reason.contains("10:00"), "{reason}");
                 assert!(reason.contains("1:00"), "{reason}");
             }
@@ -876,9 +1067,11 @@ mod tests {
             .transcribe(&voice_note(Some(41_500), None), || fetch_ok(b"audio"))
             .await;
         match out {
-            Transcription::Fallback { body, reason } => {
+            Transcription::Fallback { body, reason, kind } => {
                 assert!(body.contains("Voice message.ogg"), "{body}");
                 assert!(reason.contains("transcription failed"), "{reason}");
+                // Operator-fixable, not a fact about the note: retried.
+                assert_eq!(kind, FailureKind::Spawn);
             }
             other => panic!("expected a fallback, got {other:?}"),
         }
@@ -897,6 +1090,22 @@ mod tests {
             .await;
         assert!(out.body().contains("model not found"), "{out:?}");
         assert!(out.body().contains("Voice message.ogg"), "{out:?}");
+        assert_eq!(kind_of(&out), Some(FailureKind::Crashed));
+    }
+
+    #[tokio::test]
+    async fn exit_65_means_the_audio_is_undecodable() {
+        let t = Transcriber::open(cfg(&[
+            "/bin/sh",
+            "-c",
+            "cat >/dev/null; echo 'invalid data' >&2; exit 65",
+        ]))
+        .unwrap();
+        let out = t
+            .transcribe(&voice_note(Some(41_500), None), || fetch_ok(b"audio"))
+            .await;
+        assert_eq!(kind_of(&out), Some(FailureKind::Undecodable));
+        assert!(out.is_final());
     }
 
     #[tokio::test]
@@ -906,6 +1115,7 @@ mod tests {
             .transcribe(&voice_note(Some(41_500), None), || fetch_ok(b"audio"))
             .await;
         assert!(out.body().contains("produced no text"), "{out:?}");
+        assert_eq!(kind_of(&out), Some(FailureKind::NoText));
     }
 
     #[tokio::test]
@@ -918,6 +1128,7 @@ mod tests {
             .await;
         assert!(out.body().contains("timeout_seconds"), "{out:?}");
         assert!(out.body().contains("Voice message.ogg"), "{out:?}");
+        assert_eq!(kind_of(&out), Some(FailureKind::Killed));
     }
 
     #[tokio::test]
@@ -967,6 +1178,147 @@ mod tests {
             })
             .await;
         assert!(out.body().contains("max_bytes"), "{out:?}");
+        assert_eq!(kind_of(&out), Some(FailureKind::OverSizeCap));
+    }
+
+    // --- final vs. transient (#231) ---------------------------------------
+
+    fn kind_of(out: &Transcription) -> Option<FailureKind> {
+        match out {
+            Transcription::Fallback { kind, .. } => Some(*kind),
+            Transcription::Transcribed { .. } => None,
+        }
+    }
+
+    #[test]
+    fn only_failures_about_the_note_itself_are_final() {
+        use FailureKind::*;
+        for kind in [
+            OverSizeCap,
+            OverDurationCap,
+            EmptyAudio,
+            NoText,
+            Undecodable,
+        ] {
+            assert!(kind.is_final(), "{kind:?} would not change on retry");
+        }
+        for kind in [
+            Fetch,
+            FetchTimeout,
+            SlotTimeout,
+            Preempted,
+            Spawn,
+            Killed,
+            Crashed,
+        ] {
+            assert!(!kind.is_final(), "{kind:?} might succeed on retry");
+        }
+        assert!(Transcription::Transcribed {
+            body: String::new(),
+            transcript: String::new()
+        }
+        .is_final());
+    }
+
+    #[tokio::test]
+    async fn download_failures_are_transient() {
+        let mut config = cfg(&["/bin/cat"]);
+        config.timeout_seconds = 1;
+        let t = Transcriber::open(config).unwrap();
+        let note = voice_note(Some(1_000), None);
+        let out = t
+            .transcribe(&note, || async { Err("M_UNKNOWN".to_owned()) })
+            .await;
+        assert_eq!(kind_of(&out), Some(FailureKind::Fetch));
+        let out = t
+            .transcribe(&note, || async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(b"late".to_vec())
+            })
+            .await;
+        assert_eq!(kind_of(&out), Some(FailureKind::FetchTimeout));
+        assert!(!out.is_final());
+    }
+
+    #[tokio::test]
+    async fn over_the_duration_cap_is_final() {
+        let mut config = cfg(&["/bin/cat"]);
+        config.max_seconds = 60;
+        let t = Transcriber::open(config).unwrap();
+        let out = t
+            .transcribe(&voice_note(Some(600_000), None), || fetch_ok(b"audio"))
+            .await;
+        assert_eq!(kind_of(&out), Some(FailureKind::OverDurationCap));
+        assert!(out.is_final());
+    }
+
+    // --- live notes before backfill (#231) ----------------------------------
+
+    #[tokio::test]
+    async fn a_live_note_cancels_a_running_backfill_and_takes_the_slot() {
+        // The backfill's transcriber would hold the slot for 30s; the live
+        // note must not wait for it (timeout 5s, which a wait would exceed).
+        let dir = std::env::temp_dir().join(format!(
+            "safehoused-transcribe-preempt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let started = dir.join("started");
+        let script = format!(
+            "if [ \"$(cat)\" = slow ]; then touch {0}; sleep 30; fi; echo live text",
+            started.display()
+        );
+        let mut config = cfg(&["/bin/sh", "-c", &script]);
+        config.timeout_seconds = 5;
+        let t = Transcriber::open(config).unwrap();
+        let note = voice_note(Some(1_000), None);
+
+        let backfill = {
+            let t = t.clone();
+            let note = note.clone();
+            tokio::spawn(async move { t.transcribe_backfill(&note, || fetch_ok(b"slow")).await })
+        };
+        // Wait until the backfill's transcriber is running and holds the slot.
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let begun = std::time::Instant::now();
+        let live = t.transcribe(&note, || fetch_ok(b"fast")).await;
+        assert!(
+            matches!(&live, Transcription::Transcribed { transcript, .. } if transcript == "live text"),
+            "{live:?}"
+        );
+        assert!(
+            begun.elapsed() < Duration::from_secs(3),
+            "the live note waited {:?} behind the backfill",
+            begun.elapsed()
+        );
+        let backfilled = backfill.await.unwrap();
+        assert_eq!(kind_of(&backfilled), Some(FailureKind::Preempted));
+        assert!(!backfilled.is_final(), "a preempted run is not stored");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_backfill_waits_while_a_live_note_is_in_flight() {
+        let t = Transcriber::open(cfg(&["/bin/cat"])).unwrap();
+        let note = voice_note(Some(1_000), None);
+        let guard = LiveGuard::enter(&t.live);
+        let backfill = {
+            let t = t.clone();
+            let note = note.clone();
+            tokio::spawn(async move { t.transcribe_backfill(&note, || fetch_ok(b"old")).await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !backfill.is_finished(),
+            "the backfill ran beside a live note"
+        );
+        drop(guard);
+        let out = backfill.await.unwrap();
+        assert!(matches!(out, Transcription::Transcribed { .. }), "{out:?}");
     }
 
     // --- folding the outcome back into the event content ------------------

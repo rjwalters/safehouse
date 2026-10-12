@@ -3990,7 +3990,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_returns_the_stored_failure_note() {
+    async fn read_returns_the_stored_final_failure_note() {
         let dir = crate::test_support::tempdir("safehoused-read-voice");
         let (registry, voice, _rx) = voice_registry(&dir.join("runs"), 2).await;
         let body = "🎙 (voice note, 0:42 — transcription failed: x) voice-message-recording.ogg";
@@ -4000,6 +4000,7 @@ mod tests {
                 &crate::transcribe::Transcription::Fallback {
                     body: body.into(),
                     reason: "transcription failed: x".into(),
+                    kind: crate::transcribe::FailureKind::Undecodable,
                 },
             )
             .await;
