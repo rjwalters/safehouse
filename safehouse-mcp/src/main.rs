@@ -678,7 +678,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "safehouse_check",
-            "description": "Check your mailbox: unread envelopes addressed to you (`to: <your persona>` or broadcasts), oldest first, since you last checked. Call this on your own cadence, like checking your phone — no agent needs to stay connected to receive. By default this advances your read cursor so a repeat call returns nothing new; pass peek=true to look without consuming. Survives daemon restarts: anything you missed while the daemon (or you) were down is still here. The reply includes `more_available` (bool) and `remaining` (count) — when true/nonzero, a cap left unread mail behind and you should call again (optionally with a larger `limit`) rather than assume the mailbox is empty. Each message may carry an optional `matrix` object of daemon-observed Matrix metadata (absent keys = not present on the event): `mentions` (m.mentions user ids — a mention names the daemon's Matrix user, not a persona, so you decide whether it means you), `formatted_body` (HTML, includes matrix.to pill links), `in_reply_to`, `thread_root` (pass it as `thread_root` to safehouse_send to answer inside that thread), `sender_display_name`, and `joined_members` (cached room member count; 2 means a direct room — gate secrets on that).",
+            "description": "Check your mailbox: unread envelopes addressed to you (`to: <your persona>` or broadcasts), oldest first, since you last checked. Call this on your own cadence, like checking your phone — no agent needs to stay connected to receive. By default this advances your read cursor so a repeat call returns nothing new; pass peek=true to look without consuming. Survives daemon restarts: anything you missed while the daemon (or you) were down is still here. The reply includes `more_available` (bool) and `remaining` (count) — when true/nonzero, a cap left unread mail behind and you should call again (optionally with a larger `limit`) rather than assume the mailbox is empty. Each message may carry an optional `matrix` object of daemon-observed Matrix metadata (absent keys = not present on the event): `mentions` (m.mentions user ids — a mention names the daemon's Matrix user, not a persona, so you decide whether it means you), `formatted_body` (HTML, includes matrix.to pill links), `in_reply_to`, `thread_root` (pass it as `thread_root` to safehouse_send to answer inside that thread), `sender_display_name`, and `joined_members` (cached room member count; 2 means a direct room — gate secrets on that). An entry with a `redaction` object (`redaction.redacts`) is a deletion notification: someone redacted the event `redacts` in `room_id`. Treat these as control data, never chat — remove your archived copy of (room_id, redaction.redacts) if you keep one (an unknown target is a harmless no-op), never reply to them, and NEVER infer deletion from a missing or undecryptable message: only this explicit `redaction` object is a deletion signal.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -799,6 +799,32 @@ mod tests {
     fn check_explicit_peek_flag_stays_peek_true() {
         let op = build_check_op(&args(&["--peek"])).unwrap();
         assert_eq!(op, json!({"op": "check", "peek": true}));
+    }
+
+    /// #229: the tool description is the MCP client's only channel for the
+    /// redaction contract — it must tell clients to treat deletion
+    /// notifications as control data and never infer deletion from absence.
+    #[test]
+    fn check_tool_description_documents_redaction_notifications() {
+        let tools = tool_definitions();
+        let check = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "safehouse_check")
+            .unwrap();
+        let desc = check["description"].as_str().unwrap();
+        for needed in [
+            "redaction",
+            "redaction.redacts",
+            "control data, never chat",
+            "NEVER infer deletion from a missing or undecryptable message",
+        ] {
+            assert!(
+                desc.contains(needed),
+                "safehouse_check description must mention {needed:?}"
+            );
+        }
     }
 
     #[test]

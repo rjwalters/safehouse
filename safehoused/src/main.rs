@@ -1465,8 +1465,12 @@ async fn transcribe_audio_body(
 /// completion already published). The `redacts` target is read from the raw
 /// event JSON so this stays correct across room versions (v11 moved `redacts`
 /// into `content`).
+///
+/// #229: the same observation also files a **durable redaction notification**
+/// into every local persona's mailbox (envelope-v1 §7b), *before and
+/// independently of* the egress half — see [`handle_redaction`].
 async fn on_redaction(
-    _event: OriginalSyncRoomRedactionEvent,
+    event: OriginalSyncRoomRedactionEvent,
     room: Room,
     raw: RawEvent,
     Ctx(egress): Ctx<EgressHandle>,
@@ -1474,29 +1478,76 @@ async fn on_redaction(
 ) {
     // #85: counts as liveness too — see `on_message`'s doc comment.
     registry.record_event_received();
-    let Some(egress) = egress.as_ref() else {
+    handle_redaction(
+        registry.as_ref(),
+        egress.as_ref(),
+        room.room_id().as_str(),
+        event.event_id.as_str(),
+        event.sender.as_str(),
+        raw.get(),
+    )
+    .await;
+}
+
+/// #229: the target of an `m.room.redaction`, read from raw event JSON —
+/// `content.redacts` in v11+ (the modern authoritative field, checked first),
+/// top-level `redacts` pre-v11. `None` when the event is unparseable or
+/// carries no usable target (absent, empty, or not a string): an invalid
+/// redaction produces no deletion notification.
+fn redaction_target(raw: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(raw).ok()?;
+    parsed
+        .get("content")
+        .and_then(|c| c.get("redacts"))
+        .and_then(Value::as_str)
+        .or_else(|| parsed.get("redacts").and_then(Value::as_str))
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+}
+
+/// #229: the redaction handler core, split out of [`on_redaction`] so the
+/// full delivery path is exercisable without a homeserver — the regression
+/// this issue fixed lived exactly here: with egress unconfigured, the old
+/// early return meant *nothing* ever reached the mailbox, so an
+/// archive-keeping client could never learn a message was redacted.
+///
+/// Two independent consumers, in fixed order, each error contained so a
+/// failure in one can never suppress the attempt at the other:
+///
+/// 1. **Durable mailbox notification** — always attempted for a valid
+///    target, regardless of egress configuration or room allowlists. Fanned
+///    out to every local persona by [`Registry::mailbox_deliver_redaction`].
+/// 2. **Egress retraction** (#30) — the pre-#229 behavior, guards unchanged:
+///    only when egress is configured *and* the room is opted in.
+///
+/// A redaction with no extractable target produces neither (there is nothing
+/// to identify — neither a deletion target nor a retract key).
+async fn handle_redaction(
+    registry: &Registry,
+    egress: Option<&Arc<Egress>>,
+    room_id: &str,
+    event_id: &str,
+    sender: &str,
+    raw: &str,
+) {
+    let Some(redacts) = redaction_target(raw) else {
         return;
     };
-    let room_id = room.room_id().as_str().to_owned();
-    if !egress.is_egress_room(&room_id) {
-        return;
+    if let Err(err) = registry
+        .mailbox_deliver_redaction(room_id, event_id, sender, &redacts)
+        .await
+    {
+        eprintln!(
+            "safehoused: redaction mailbox delivery for {event_id} in {room_id} failed: {err:#}"
+        );
     }
-    let parsed: Value = match serde_json::from_str(raw.get()) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    // `redacts` is top-level pre-v11 and under `content` in v11+ — accept either.
-    let target = parsed.get("redacts").and_then(Value::as_str).or_else(|| {
-        parsed
-            .get("content")
-            .and_then(|c| c.get("redacts"))
-            .and_then(Value::as_str)
-    });
-    if let Some(target) = target {
-        if let Err(err) = egress.retract(&room_id, target).await {
-            eprintln!(
-                "safehoused: egress retract (redaction of {target}) in {room_id} failed: {err:#}"
-            );
+    if let Some(egress) = egress {
+        if egress.is_egress_room(room_id) {
+            if let Err(err) = egress.retract(room_id, &redacts).await {
+                eprintln!(
+                    "safehoused: egress retract (redaction of {redacts}) in {room_id} failed: {err:#}"
+                );
+            }
         }
     }
 }
@@ -2358,6 +2409,362 @@ mod replay_tests {
         });
         replay_thread_events(&threads, &personas(), &[malformed]).await;
         assert!(threads.target_for_thread("$anything").await.is_none());
+    }
+}
+
+/// #229: the redaction delivery path, exercised without a homeserver.
+/// [`handle_redaction`] is the exact code `on_redaction` runs (the handler
+/// only supplies the typed event's ids, the room, and the raw JSON), so these
+/// cover the acceptance criteria at the point the bug lived: with egress
+/// unconfigured, the old early return meant no notification ever reached the
+/// mailbox.
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use crate::envelope::Envelope;
+    use crate::mailbox::Mailbox;
+
+    fn test_registry(personas: &[&str]) -> Arc<Registry> {
+        Registry::new(
+            personas.iter().map(|&p| p.to_owned()).collect(),
+            Mailbox::open_in_memory().unwrap(),
+        )
+    }
+
+    /// A v11+ `m.room.redaction`: the target lives under `content.redacts`.
+    fn v11_redaction(event_id: &str, sender: &str, target: &str) -> String {
+        json!({
+            "type": "m.room.redaction",
+            "event_id": event_id,
+            "sender": sender,
+            "origin_server_ts": 1,
+            "content": { "redacts": target, "reason": "withdrawn" },
+        })
+        .to_string()
+    }
+
+    /// A pre-v11 `m.room.redaction`: the target is a top-level `redacts` key.
+    fn pre_v11_redaction(event_id: &str, sender: &str, target: &str) -> String {
+        json!({
+            "type": "m.room.redaction",
+            "event_id": event_id,
+            "sender": sender,
+            "origin_server_ts": 1,
+            "redacts": target,
+            "content": { "reason": "withdrawn" },
+        })
+        .to_string()
+    }
+
+    fn egress_config(rooms: &[&str], sink: PathBuf) -> EgressConfig {
+        EgressConfig {
+            rooms: rooms.iter().map(|s| (*s).to_owned()).collect(),
+            deny_patterns: vec!["secret".to_owned()],
+            delay_seconds: 0,
+            sink_path: Some(sink),
+            sink_url: None,
+            sink_url_file: None,
+        }
+    }
+
+    /// A feed-eligible `completion` envelope (public visibility), so tests can
+    /// queue a pending egress row through the public `consider` path.
+    fn public_completion_env() -> Envelope {
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("public");
+        Envelope {
+            meta: Some(meta),
+            ..crate::test_support::envelope("writer_agent", "*", "completion", "done")
+        }
+    }
+
+    async fn assert_one_notification(
+        registry: &Registry,
+        personas: &[&str],
+        room_id: &str,
+        event_id: &str,
+        sender: &str,
+        redacts: &str,
+    ) {
+        for persona in personas {
+            let got = registry.check(persona, true, None).await.unwrap();
+            assert_eq!(got.len(), 1, "persona {persona} must see the redaction");
+            assert_eq!(got[0].room_id, room_id);
+            assert_eq!(got[0].event_id, event_id);
+            assert_eq!(got[0].sender, sender);
+            assert_eq!(
+                got[0]
+                    .redaction
+                    .as_ref()
+                    .expect("explicit redaction meta")
+                    .redacts,
+                redacts
+            );
+        }
+    }
+
+    // ---- redaction_target ---------------------------------------------------
+
+    #[test]
+    fn redaction_target_reads_both_wire_shapes() {
+        assert_eq!(
+            redaction_target(&v11_redaction("$r", "@s:x", "$t")).as_deref(),
+            Some("$t")
+        );
+        assert_eq!(
+            redaction_target(&pre_v11_redaction("$r", "@s:x", "$t")).as_deref(),
+            Some("$t")
+        );
+        // v11 wins when both are somehow present (the modern shape).
+        assert_eq!(
+            redaction_target(r#"{"redacts":"$old","content":{"redacts":"$new"}}"#).as_deref(),
+            Some("$new")
+        );
+    }
+
+    #[test]
+    fn redaction_target_rejects_absent_malformed_and_empty() {
+        // No target anywhere.
+        assert!(redaction_target(r#"{"content":{"reason":"x"}}"#).is_none());
+        // Non-string target.
+        assert!(redaction_target(r#"{"redacts":42}"#).is_none());
+        assert!(redaction_target(r#"{"content":{"redacts":{}}}"#).is_none());
+        // Empty-string target is not a deletion signal.
+        assert!(redaction_target(r#"{"redacts":""}"#).is_none());
+        // Unparseable raw event.
+        assert!(redaction_target("not json").is_none());
+    }
+
+    // ---- delivery: egress off (the #229 regression) --------------------------
+
+    #[tokio::test]
+    async fn redaction_with_egress_off_reaches_every_persona() {
+        // Before #229 this was the bug: `on_redaction` returned the moment it
+        // saw `egress: None`, so nothing ever reached the mailbox.
+        let registry = test_registry(&["writer_agent", "research_agent"]);
+        handle_redaction(
+            registry.as_ref(),
+            None,
+            "!room:x",
+            "$redaction1",
+            "@robb:x",
+            &v11_redaction("$redaction1", "@robb:x", "$target1"),
+        )
+        .await;
+        assert_one_notification(
+            registry.as_ref(),
+            &["writer_agent", "research_agent"],
+            "!room:x",
+            "$redaction1",
+            "@robb:x",
+            "$target1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pre_v11_top_level_redacts_also_notifies() {
+        let registry = test_registry(&["writer_agent"]);
+        handle_redaction(
+            registry.as_ref(),
+            None,
+            "!room:x",
+            "$redaction1",
+            "@robb:x",
+            &pre_v11_redaction("$redaction1", "@robb:x", "$target1"),
+        )
+        .await;
+        assert_one_notification(
+            registry.as_ref(),
+            &["writer_agent"],
+            "!room:x",
+            "$redaction1",
+            "@robb:x",
+            "$target1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn own_account_redaction_notifies_all_personas() {
+        // The daemon's own Matrix account sent the redaction (e.g. the
+        // `redact` op): no own-author suppression applies — every persona may
+        // hold an archived copy of the target.
+        let registry = test_registry(&["writer_agent", "research_agent"]);
+        handle_redaction(
+            registry.as_ref(),
+            None,
+            "!room:x",
+            "$redaction1",
+            "@safehoused:x",
+            &v11_redaction("$redaction1", "@safehoused:x", "$target1"),
+        )
+        .await;
+        assert_one_notification(
+            registry.as_ref(),
+            &["writer_agent", "research_agent"],
+            "!room:x",
+            "$redaction1",
+            "@safehoused:x",
+            "$target1",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn malformed_target_produces_no_notification() {
+        let registry = test_registry(&["writer_agent"]);
+        for raw in [
+            r#"{"content":{"reason":"no target"}}"#,
+            r#"{"redacts":42}"#,
+            r#"{"redacts":""}"#,
+            "not json",
+        ] {
+            handle_redaction(registry.as_ref(), None, "!room:x", "$r", "@s:x", raw).await;
+        }
+        let got = registry.check("writer_agent", true, None).await.unwrap();
+        assert!(
+            got.is_empty(),
+            "an invalid redaction must not produce deletion signals"
+        );
+    }
+
+    // ---- egress interplay: independence --------------------------------------
+
+    /// Queue a pending egress row for `event_id` in `!egressroom:x` via the
+    /// public `consider` path, so retraction is observable through
+    /// `publish_due` (a retracted row never publishes).
+    async fn queued_egress(egress: &Egress, event_id: &str) {
+        let queued = egress
+            .consider("!egressroom:x", event_id, &public_completion_env())
+            .await
+            .unwrap();
+        assert!(queued, "fixture must queue a pending row first");
+    }
+
+    #[tokio::test]
+    async fn egress_room_notifies_mailbox_and_retracts_independently() {
+        let dir = crate::test_support::tempdir("safehoused-redaction-test");
+        let egress = Egress::open(
+            egress_config(&["!egressroom:x"], dir.join("sink.jsonl")),
+            &dir.join("egress.sqlite3"),
+        )
+        .unwrap();
+        queued_egress(egress.as_ref(), "$target1").await;
+
+        let registry = test_registry(&["writer_agent"]);
+        handle_redaction(
+            registry.as_ref(),
+            Some(&egress),
+            "!egressroom:x",
+            "$redaction1",
+            "@robb:x",
+            &v11_redaction("$redaction1", "@robb:x", "$target1"),
+        )
+        .await;
+
+        // Half 1: the mailbox notification was filed.
+        assert_one_notification(
+            registry.as_ref(),
+            &["writer_agent"],
+            "!egressroom:x",
+            "$redaction1",
+            "@robb:x",
+            "$target1",
+        )
+        .await;
+        // Half 2: the pending completion was retracted (never publishes).
+        let published = egress.publish_due(4_000_000_000_000).await.unwrap();
+        assert!(
+            published.is_empty(),
+            "the redaction must still retract the pending egress row"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn non_egress_room_still_notifies_and_never_retracts() {
+        // Egress is configured with one allowlisted room; the redaction
+        // happens in a different room. The mailbox notification is
+        // room-independent; the retraction is not — the pending row for the
+        // same target id, queued in the allowlisted room, is untouched
+        // (retract is keyed by (room, event)).
+        let dir = crate::test_support::tempdir("safehoused-redaction-test");
+        let egress = Egress::open(
+            egress_config(&["!egressroom:x"], dir.join("sink.jsonl")),
+            &dir.join("egress.sqlite3"),
+        )
+        .unwrap();
+        queued_egress(egress.as_ref(), "$target1").await;
+
+        let registry = test_registry(&["writer_agent"]);
+        handle_redaction(
+            registry.as_ref(),
+            Some(&egress),
+            "!otherroom:x",
+            "$redaction1",
+            "@robb:x",
+            &v11_redaction("$redaction1", "@robb:x", "$target1"),
+        )
+        .await;
+
+        assert_one_notification(
+            registry.as_ref(),
+            &["writer_agent"],
+            "!otherroom:x",
+            "$redaction1",
+            "@robb:x",
+            "$target1",
+        )
+        .await;
+        let published = egress.publish_due(4_000_000_000_000).await.unwrap();
+        assert_eq!(
+            published.len(),
+            1,
+            "a redaction outside the egress room must not retract anything"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn mailbox_failure_does_not_suppress_egress_retraction() {
+        // Independence in the other direction: sabotage the mailbox store
+        // (drop its table from a second connection), then verify the
+        // notification attempt fails *loudly but harmlessly* while the
+        // egress retraction still happens.
+        let dir = crate::test_support::tempdir("safehoused-redaction-test");
+        let mailbox = Mailbox::open(&dir.join("mailbox.sqlite3")).unwrap();
+        let registry = Registry::new(vec!["writer_agent".to_owned()], mailbox);
+        let egress = Egress::open(
+            egress_config(&["!egressroom:x"], dir.join("sink.jsonl")),
+            &dir.join("egress.sqlite3"),
+        )
+        .unwrap();
+        queued_egress(egress.as_ref(), "$target1").await;
+
+        {
+            let saboteur = rusqlite::Connection::open(dir.join("mailbox.sqlite3")).unwrap();
+            saboteur
+                .execute("DROP TABLE messages", [])
+                .expect("sabotaging the mailbox store");
+        }
+
+        handle_redaction(
+            registry.as_ref(),
+            Some(&egress),
+            "!egressroom:x",
+            "$redaction1",
+            "@robb:x",
+            &v11_redaction("$redaction1", "@robb:x", "$target1"),
+        )
+        .await;
+
+        let published = egress.publish_due(4_000_000_000_000).await.unwrap();
+        assert!(
+            published.is_empty(),
+            "a mailbox delivery failure must not suppress the egress retraction"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 }
 

@@ -387,6 +387,48 @@ impl Registry {
         }
     }
 
+    /// #229: fan a redaction notification out to **every** locally-registered
+    /// persona's durable mailbox, so `check` (not live push) delivers the
+    /// deletion signal to archive-keeping clients.
+    ///
+    /// A dedicated delivery method on purpose — it deliberately bypasses
+    /// [`Self::mailbox_recipients`]: the §7 recipient-selection rules (direct
+    /// address, own-author loop-back suppression) are meaningless for a
+    /// redaction, because after the target event is stripped its routing can
+    /// no longer be reconstructed — every local persona may hold an archived
+    /// copy, so every local persona is told, including for redactions sent by
+    /// this daemon's own Matrix account.
+    ///
+    /// Every persona is attempted even when an earlier one fails (one
+    /// persona's broken mailbox must not starve the rest); the first failure
+    /// is returned so the caller can log it. Re-observed redactions are
+    /// deduplicated per persona by [`Mailbox::deliver_redaction`].
+    pub async fn mailbox_deliver_redaction(
+        &self,
+        room_id: &str,
+        event_id: &str,
+        sender: &str,
+        redacts: &str,
+    ) -> anyhow::Result<()> {
+        let env = crate::mailbox::redaction_envelope(sender, room_id, redacts);
+        let mut first_err: Option<anyhow::Error> = None;
+        for persona in &self.personas {
+            if let Err(err) = self
+                .mailbox
+                .deliver_redaction(persona, room_id, event_id, sender, redacts, &env)
+                .await
+            {
+                first_err.get_or_insert(anyhow::anyhow!(
+                    "delivering redaction {event_id} to persona {persona:?}: {err:#}"
+                ));
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
     /// Unread mailbox envelopes for `persona` — the `check` op / MCP tool.
     /// See [`Mailbox::check`] for the peek/limit/cursor/default-cap semantics.
     pub async fn check(
@@ -1006,6 +1048,14 @@ async fn handle_op(
                     // when the event carried none.
                     if let Some(matrix) = e.matrix.filter(|m| !m.is_empty()) {
                         entry["matrix"] = json!(matrix);
+                    }
+                    // #229: explicit deletion metadata for redaction
+                    // notifications — control data the client acts on
+                    // (remove its archived copy of `(room_id,
+                    // redaction.redacts)`), absent entirely on ordinary
+                    // mail. Documented in envelope-v1 §7b.
+                    if let Some(redaction) = e.redaction {
+                        entry["redaction"] = json!(redaction);
                     }
                     entry
                 })
@@ -2730,6 +2780,93 @@ mod tests {
             json!({"mentions": ["@bot:x"], "thread_root": "$root", "joined_members": 2})
         );
         assert!(msgs[1].as_object().unwrap().get("matrix").is_none());
+    }
+
+    // ---- #229: redaction notifications through check ------------------------
+
+    #[tokio::test]
+    async fn redaction_notification_reaches_every_local_persona() {
+        // Including when the redactor is this daemon's own Matrix account —
+        // the dedicated delivery path has no own-author suppression to skip.
+        let registry = Registry::new(
+            vec!["writer_agent".to_owned(), "research_agent".to_owned()],
+            Mailbox::open_in_memory().unwrap(),
+        );
+        registry
+            .mailbox_deliver_redaction("!room:x", "$redaction1", "@safehoused:x", "$target1")
+            .await
+            .unwrap();
+        for persona in ["writer_agent", "research_agent"] {
+            let got = registry.check(persona, true, None).await.unwrap();
+            assert_eq!(got.len(), 1, "{persona} must be notified");
+            assert_eq!(got[0].event_id, "$redaction1");
+            assert_eq!(got[0].sender, "@safehoused:x");
+            assert_eq!(got[0].redaction.as_ref().unwrap().redacts, "$target1");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_redaction_delivery_through_the_registry_deduplicates() {
+        let registry = Registry::new(
+            vec!["writer_agent".to_owned()],
+            Mailbox::open_in_memory().unwrap(),
+        );
+        for _ in 0..2 {
+            registry
+                .mailbox_deliver_redaction("!room:x", "$redaction1", "@robb:x", "$target1")
+                .await
+                .unwrap();
+        }
+        let got = registry.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(got.len(), 1);
+    }
+
+    /// The exact JSON a `check` consumer sees (envelope-v1 §7b): an ordinary
+    /// entry keeps its prior shape, the redaction entry adds `redaction`.
+    #[tokio::test]
+    async fn check_entries_expose_the_documented_redaction_shape() {
+        let (mut write, mut read, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        registry
+            .mailbox_deliver(
+                false,
+                "!room:x",
+                "$msg1",
+                "@robb:x",
+                &env_to("@robb:x", "*"),
+            )
+            .await
+            .unwrap();
+        registry
+            .mailbox_deliver_redaction("!room:x", "$redaction1", "@robb:x", "$msg1")
+            .await
+            .unwrap();
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "check"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], true);
+        let msgs = reply["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2, "oldest first: message, then its redaction");
+        // Ordinary entry: byte-for-byte the pre-#229 shape — no redaction key.
+        assert_eq!(msgs[0]["event_id"], json!("$msg1"));
+        assert!(msgs[0].as_object().unwrap().get("redaction").is_none());
+        // Redaction entry: the redaction event's own facts plus the explicit
+        // target, exactly as documented.
+        assert_eq!(msgs[1]["room_id"], json!("!room:x"));
+        assert_eq!(msgs[1]["event_id"], json!("$redaction1"));
+        assert_eq!(msgs[1]["sender"], json!("@robb:x"));
+        assert_eq!(msgs[1]["redaction"], json!({"redacts": "$msg1"}));
+        assert_eq!(msgs[1]["envelope"]["from"], json!("safehouse"));
+        assert_eq!(msgs[1]["envelope"]["type"], json!("chat"));
+        assert_eq!(
+            msgs[1]["envelope"]["body"],
+            json!("redaction: @robb:x redacted $msg1 in !room:x")
+        );
     }
 
     // ---- `check` op end-to-end over the socket (acceptance criteria) ------

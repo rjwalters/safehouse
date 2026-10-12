@@ -177,6 +177,21 @@ check returns nothing. `safehouse_check` supports `peek` (no-advance) and `limit
 supplies it (`safehouse_send`'s new `wake` argument) and round-trips through into `check` output
 unchanged, per D16 (the daemon never acts on it — only optional external wakers would).
 
+**Redaction notifications (#229).** A synced `m.room.redaction` now also files a durable deletion
+notification into *every* local persona's mailbox — regardless of egress config or room allowlists,
+and including redactions by the daemon's own account — so an archive-keeping client draining its
+mailbox can remove exactly the identified entry. The `check` entry carries the redaction event's
+own `room_id`/`event_id`/`sender` plus an explicit `redaction.redacts` target (extracted from both
+pre-v11 top-level `redacts` and v11+ `content.redacts`; a missing/malformed target ⇒ no
+notification). The stored `envelope` is a daemon-synthesized `chat` from the reserved `safehouse`
+persona — local control data, not a wire type; the contract and client rules are envelope-v1 §7b:
+treat as control data (remove the archived `(room_id, redacts)` entry, unknown target = no-op,
+never reply as chat), and a missing or undecryptable message is *never* a deletion signal. Delivery
+is deduplicated per persona (re-observation never double-files), survives restarts, and counts
+toward the mailbox's row/byte budgets. Carried by `check`/`safehouse_check` only — never live
+push, never `read`. Egress retraction (#30) is unchanged and independent: the mailbox delivery runs
+first, and a failure in either half is logged without suppressing the other.
+
 ### 6. Wire one real agent and retire the copy-paste relay.
 Start with the two-project handoff use case that motivated all this: one agent writing a long-form document, another holding the facts it needs, today bridged by a human copy-pasting.
 
