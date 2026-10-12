@@ -667,7 +667,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "safehouse_read",
-            "description": "Read recent messages from a safehouse room, newest last. Each message carries its envelope (from/to/type/task_id/body); human messages get a synthesized envelope. Matrix addressing metadata (mentions, thread_root, ...) is only on safehouse_check results, not here.",
+            "description": "Read recent messages from a safehouse room, newest last. Each message carries its envelope (from/to/type/task_id/body); human messages get a synthesized envelope. A message that belongs to a Matrix thread also carries a top-level `thread_root` (the thread root's event id; pass it as `thread_root` to safehouse_send to answer inside that thread); the key is omitted for main-timeline messages, thread roots and ordinary replies. The fuller `matrix` metadata object (mentions, formatted_body, ...) is only on safehouse_check results, not here.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
