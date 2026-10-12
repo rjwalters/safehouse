@@ -41,11 +41,24 @@
 //!    persona with a live, regularly-advancing cursor never approaches the
 //!    cap in practice, so this only bites a mailbox nobody has ever consumed
 //!    from.
+//!
+//! **Redaction notifications (#229).** Besides ordinary mail, the mailbox
+//! carries durable deletion signals: every observed `m.room.redaction` is
+//! filed into every local persona's mailbox as a row whose explicit
+//! [`RedactionMeta`] names the target event (`redacts`), so an archive-keeping
+//! client draining its mailbox with `check` can remove exactly the identified
+//! entry. These rows use the same table, cursor, ordering, row/byte caps, and
+//! GC as ordinary mail; they differ only in being deduplicated per persona
+//! (one row per redaction event id, via a partial unique index) and in never
+//! being eligible for the #60 ephemeral filter (see
+//! [`Mailbox::deliver_redaction`]). A missing or undecryptable message is
+//! never a deletion signal — only these explicit rows are.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::envelope::{Envelope, MatrixMeta};
@@ -202,6 +215,21 @@ pub struct MailboxEntry {
     /// Daemon-observed Matrix addressing metadata (#194); `None` when the
     /// event carried none (and for rows stored before this column existed).
     pub matrix: Option<MatrixMeta>,
+    /// #229: explicit deletion metadata when this row is a redaction
+    /// notification; `None` for ordinary messages and rows stored before
+    /// this column existed. See [`RedactionMeta`].
+    pub redaction: Option<RedactionMeta>,
+}
+
+/// #229: deletion metadata stored on a redaction-notification row and
+/// surfaced by `check` as the entry's `redaction` object. Deliberately an
+/// object (not a bare string column in the reply) so additive facts about a
+/// redaction can join it later without another shape change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactionMeta {
+    /// The id of the event this redaction removed — the deletion target a
+    /// client acts on, always paired with the entry's `room_id`.
+    pub redacts: String,
 }
 
 /// Result of [`Mailbox::check`]: the entries returned, plus whether a cap
@@ -245,6 +273,29 @@ pub struct Mailbox {
     conn: Mutex<Connection>,
 }
 
+/// #229: the control envelope stored alongside a redaction notification's
+/// explicit [`RedactionMeta`]. Local-storage compatibility, **not** a wire
+/// type: the mailbox row's `envelope` column is NOT NULL, so a redaction
+/// notification carries a plain v1 `chat` from the reserved `safehouse`
+/// persona ([`crate::envelope::DAEMON_PERSONA`]) — an older client that knows
+/// nothing of `redaction` sees one line of daemon-authored prose, and
+/// envelope-v1 gains no new `type` merely to transport local control data.
+/// The body is prose (never a JSON object) and the redaction delivery path
+/// never consults [`is_ephemeral_body`], so the #60 ephemeral filter cannot
+/// discard it.
+pub fn redaction_envelope(sender: &str, room_id: &str, redacts: &str) -> Envelope {
+    Envelope {
+        v: crate::envelope::SUPPORTED_VERSION,
+        from: crate::envelope::DAEMON_PERSONA.to_owned(),
+        to: "*".to_owned(),
+        kind: "chat".to_owned(),
+        task_id: None,
+        body: format!("redaction: {sender} redacted {redacts} in {room_id}"),
+        wake: None,
+        meta: None,
+    }
+}
+
 impl Mailbox {
     /// Open (creating if needed) the durable mailbox store at `path`.
     pub fn open(path: &Path) -> Result<Self> {
@@ -275,7 +326,8 @@ impl Mailbox {
                 event_id  TEXT NOT NULL,
                 sender    TEXT NOT NULL,
                 envelope  TEXT NOT NULL,
-                matrix    TEXT
+                matrix    TEXT,
+                redacts   TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_messages_persona_seq ON messages(persona, seq);
             CREATE TABLE IF NOT EXISTS cursors (
@@ -296,6 +348,31 @@ impl Mailbox {
             conn.execute("ALTER TABLE messages ADD COLUMN matrix TEXT", [])
                 .context("adding matrix column to mailbox schema")?;
         }
+        // #229: same guarded-ALTER treatment for the nullable `redacts`
+        // column (JSON [`RedactionMeta`]). Must run *before* the idempotency
+        // index below, which names the column — a partial index on a missing
+        // column is a schema error, so on a pre-#229 store the index has to
+        // wait for the ALTER.
+        let has_redacts: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'redacts'")
+            .and_then(|mut s| s.exists([]))
+            .context("inspecting mailbox schema")?;
+        if !has_redacts {
+            conn.execute("ALTER TABLE messages ADD COLUMN redacts TEXT", [])
+                .context("adding redacts column to mailbox schema")?;
+        }
+        // #229: per-persona idempotency for redaction notifications —
+        // re-observing the same redaction (sync replay overlap) must not file
+        // a second row for a persona. Scoped to redaction rows (`WHERE redacts
+        // IS NOT NULL`) so ordinary-message delivery semantics — which permit
+        // the same event to be re-filed, keyed by distinct `seq` — are
+        // untouched.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_persona_redaction \
+             ON messages(persona, event_id) WHERE redacts IS NOT NULL",
+            [],
+        )
+        .context("creating mailbox redaction idempotency index")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -351,6 +428,51 @@ impl Mailbox {
         .context("inserting mailbox row")?;
         gc_persona(&conn, persona, MAX_UNCONSUMED_PER_PERSONA)
             .context("garbage-collecting mailbox after delivery")?;
+        Ok(())
+    }
+
+    /// #229: record one redaction notification in `persona`'s mailbox.
+    ///
+    /// Differs from [`Self::deliver_with_matrix`] in two load-bearing ways:
+    ///
+    /// 1. **Never consults [`is_ephemeral_body`]** — a deletion signal is
+    ///    privacy-relevant control data that must be durable, never filtered
+    ///    as a coordination heartbeat. (The [`redaction_envelope`] body is
+    ///    prose, so the filter wouldn't match it anyway; not calling it makes
+    ///    that a guarantee rather than an accident.)
+    /// 2. **Inserts with `OR IGNORE`** against the `(persona, event_id)`
+    ///    idempotency index, so re-observing the same redaction — sync replay
+    ///    overlap — files nothing new, while distinct redaction events stay
+    ///    distinct rows.
+    ///
+    /// `event_id` is the **redaction event's own id** (not the target's),
+    /// `sender` the redactor's Matrix id, `redacts` the target event id, and
+    /// `env` the caller's [`redaction_envelope`] synthesis (built once per
+    /// redaction, shared across personas). Retention bounds
+    /// ([`gc_persona`]) apply exactly as to ordinary mail.
+    pub async fn deliver_redaction(
+        &self,
+        persona: &str,
+        room_id: &str,
+        event_id: &str,
+        sender: &str,
+        redacts: &str,
+        env: &Envelope,
+    ) -> Result<()> {
+        let payload = serde_json::to_string(env).context("serializing envelope for mailbox")?;
+        let meta = serde_json::to_string(&RedactionMeta {
+            redacts: redacts.to_owned(),
+        })
+        .context("serializing redaction metadata for mailbox")?;
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "INSERT OR IGNORE INTO messages (persona, room_id, event_id, sender, envelope, redacts) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![persona, room_id, event_id, sender, payload, meta],
+        )
+        .context("inserting mailbox redaction row")?;
+        gc_persona(&conn, persona, MAX_UNCONSUMED_PER_PERSONA)
+            .context("garbage-collecting mailbox after redaction delivery")?;
         Ok(())
     }
 
@@ -410,7 +532,7 @@ impl Mailbox {
             .unwrap_or(i64::from(DEFAULT_CHECK_LIMIT));
         let mut stmt = conn
             .prepare(
-                "SELECT seq, room_id, event_id, sender, envelope, matrix FROM messages \
+                "SELECT seq, room_id, event_id, sender, envelope, matrix, redacts FROM messages \
                  WHERE persona = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
             )
             .context("preparing mailbox query")?;
@@ -423,6 +545,7 @@ impl Mailbox {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .context("querying mailbox rows")?
@@ -432,12 +555,15 @@ impl Mailbox {
         let mut entries = Vec::with_capacity(rows.len());
         let mut max_seq = cursor;
         let mut used_bytes: usize = 0;
-        for (seq, room_id, event_id, sender, envelope, matrix) in rows {
+        for (seq, room_id, event_id, sender, envelope, matrix, redacts) in rows {
             // #190: stop before the row that would push the reply over the
             // size budget — but never before the first row, so an envelope
             // that alone exceeds the budget is still delivered (alone).
+            // #229: redaction metadata is part of the reply and therefore
+            // part of its cost, like `matrix` before it.
             let cost = entry_cost(&room_id, &event_id, &sender, &envelope)
-                + matrix.as_ref().map_or(0, String::len);
+                + matrix.as_ref().map_or(0, String::len)
+                + redacts.as_ref().map_or(0, String::len);
             if !entries.is_empty() && used_bytes.saturating_add(cost) > max_bytes {
                 break;
             }
@@ -448,12 +574,21 @@ impl Mailbox {
             // A matrix blob that fails to decode is dropped rather than
             // failing the whole check — it's advisory metadata.
             let matrix = matrix.and_then(|m| serde_json::from_str::<MatrixMeta>(&m).ok());
+            // #229: unlike `matrix`, redaction metadata is the payload, not
+            // an adornment — a row that *has* it but won't decode fails the
+            // check loudly rather than arriving as an ordinary chat and
+            // silently losing a deletion signal.
+            let redaction = redacts
+                .map(|r| serde_json::from_str::<RedactionMeta>(&r))
+                .transpose()
+                .context("decoding stored redaction metadata")?;
             entries.push(MailboxEntry {
                 room_id,
                 event_id,
                 sender,
                 envelope,
                 matrix,
+                redaction,
             });
         }
 
@@ -1099,6 +1234,241 @@ mod tests {
         let got = mailbox.check("writer_agent", true, None).await.unwrap();
         assert_eq!(got[0].matrix.as_ref(), Some(&meta));
         assert!(got[1].matrix.is_none());
+    }
+
+    // ---- #229: durable redaction notifications ------------------------------
+
+    /// Deliver one redaction notification as `on_redaction` would (synthesized
+    /// envelope + explicit target), returning the row count filed.
+    async fn deliver_one_redaction(
+        mailbox: &Mailbox,
+        persona: &str,
+        event_id: &str,
+        redacts: &str,
+    ) -> anyhow::Result<()> {
+        let env = redaction_envelope("@redactor:x", "!room:x", redacts);
+        mailbox
+            .deliver_redaction(persona, "!room:x", event_id, "@redactor:x", redacts, &env)
+            .await
+    }
+
+    #[tokio::test]
+    async fn redaction_notification_round_trips_with_explicit_metadata() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        deliver_one_redaction(&mailbox, "writer_agent", "$redaction1", "$target1")
+            .await
+            .unwrap();
+        let got = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(got.len(), 1);
+        let entry = &got[0];
+        assert_eq!(entry.room_id, "!room:x");
+        assert_eq!(
+            entry.event_id, "$redaction1",
+            "the entry's event_id is the redaction event's own id"
+        );
+        assert_eq!(entry.sender, "@redactor:x");
+        assert_eq!(
+            entry.redaction.as_ref(),
+            Some(&RedactionMeta {
+                redacts: "$target1".to_owned()
+            }),
+            "the explicit target rides the row, not just the envelope body"
+        );
+        // The stored envelope is the daemon-synthesized compatibility shape:
+        // plain v1 chat from the reserved safehouse persona, prose body.
+        assert_eq!(entry.envelope.from, crate::envelope::DAEMON_PERSONA);
+        assert_eq!(entry.envelope.kind, "chat");
+        assert_eq!(
+            entry.envelope.body,
+            "redaction: @redactor:x redacted $target1 in !room:x"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_observed_redaction_files_exactly_one_row() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        for _ in 0..3 {
+            deliver_one_redaction(&mailbox, "writer_agent", "$redaction1", "$target1")
+                .await
+                .unwrap();
+        }
+        let got = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "sync replay overlap must not duplicate a redaction per persona"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_redactions_remain_distinct_rows() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        deliver_one_redaction(&mailbox, "writer_agent", "$redaction1", "$target1")
+            .await
+            .unwrap();
+        deliver_one_redaction(&mailbox, "writer_agent", "$redaction2", "$target2")
+            .await
+            .unwrap();
+        // Same target redacted twice (a re-redaction) is still two distinct
+        // redaction *events* — the idempotency key is the event id.
+        deliver_one_redaction(&mailbox, "writer_agent", "$redaction3", "$target1")
+            .await
+            .unwrap();
+        let got = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(got.len(), 3);
+        let targets: Vec<_> = got
+            .iter()
+            .map(|e| e.redaction.as_ref().unwrap().redacts.clone())
+            .collect();
+        assert_eq!(targets, vec!["$target1", "$target2", "$target1"]);
+    }
+
+    #[tokio::test]
+    async fn redactions_interleave_with_messages_in_arrival_order() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        mailbox
+            .deliver(
+                "writer_agent",
+                "!room:x",
+                "$msg1",
+                "@robb:x",
+                &env("@robb:x", "writer_agent", "first"),
+            )
+            .await
+            .unwrap();
+        deliver_one_redaction(&mailbox, "writer_agent", "$redaction1", "$msg1")
+            .await
+            .unwrap();
+        mailbox
+            .deliver(
+                "writer_agent",
+                "!room:x",
+                "$msg2",
+                "@robb:x",
+                &env("@robb:x", "writer_agent", "second"),
+            )
+            .await
+            .unwrap();
+
+        // Peek first: the full interleaved backlog, oldest first, idempotent.
+        let peek1 = mailbox.check("writer_agent", false, None).await.unwrap();
+        let peek2 = mailbox.check("writer_agent", false, None).await.unwrap();
+        for got in [&peek1, &peek2] {
+            assert_eq!(got.len(), 3);
+            assert!(got[0].redaction.is_none(), "an ordinary message row");
+            assert_eq!(got[1].redaction.as_ref().unwrap().redacts, "$msg1");
+            assert!(got[2].redaction.is_none());
+        }
+
+        // Consuming advances past exactly what was returned.
+        let consumed = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(consumed.len(), 3);
+        let after = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert!(after.is_empty());
+    }
+
+    #[tokio::test]
+    async fn redaction_notification_survives_a_reopen() {
+        let dir = crate::test_support::tempdir("safehoused-mailbox-test");
+        let db_path = dir.join("mailbox.sqlite3");
+        {
+            let mailbox = Mailbox::open(&db_path).unwrap();
+            deliver_one_redaction(&mailbox, "writer_agent", "$redaction1", "$target1")
+                .await
+                .unwrap();
+        }
+        let reopened = Mailbox::open(&db_path).unwrap();
+        let got = reopened.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].event_id, "$redaction1");
+        assert_eq!(got[0].redaction.as_ref().unwrap().redacts, "$target1");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn redaction_metadata_counts_toward_the_byte_budget() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        for i in 0..5 {
+            deliver_one_redaction(
+                &mailbox,
+                "writer_agent",
+                &format!("$redaction{i}"),
+                "$target",
+            )
+            .await
+            .unwrap();
+        }
+        // A budget that fits only the first row: one row returned, the rest
+        // accurately reported as remaining — same accounting as #190.
+        let first = mailbox
+            .check_bounded("writer_agent", true, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1, "a zero-ish budget still returns one row");
+        assert_eq!(first.remaining, 4);
+        assert!(first.more_available);
+    }
+
+    #[tokio::test]
+    async fn pre_existing_mailbox_db_without_redacts_column_is_upgraded() {
+        let dir = std::env::temp_dir().join(format!("sh-mbx-redacts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mailbox.db");
+        let _ = std::fs::remove_file(&path);
+        let e = env("@robb:x", "writer_agent", "old row");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE messages (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, persona TEXT NOT NULL,
+                    room_id TEXT NOT NULL, event_id TEXT NOT NULL,
+                    sender TEXT NOT NULL, envelope TEXT NOT NULL, matrix TEXT);
+                 CREATE TABLE cursors (persona TEXT PRIMARY KEY, seq INTEGER NOT NULL);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (persona, room_id, event_id, sender, envelope) \
+                 VALUES ('writer_agent', '!r:x', '$old', '@robb:x', ?1)",
+                params![serde_json::to_string(&e).unwrap()],
+            )
+            .unwrap();
+        }
+        // Opening twice also proves the guarded ALTER and index creation are
+        // idempotent, and that an existing ordinary row coexists with the new
+        // unique index.
+        drop(Mailbox::open(&path).unwrap());
+        let mailbox = Mailbox::open(&path).unwrap();
+        deliver_one_redaction(&mailbox, "writer_agent", "$redaction1", "$old")
+            .await
+            .unwrap();
+        let got = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(got.len(), 2);
+        // The pre-existing ordinary row is untouched: no redaction metadata.
+        assert!(got[0].redaction.is_none());
+        assert_eq!(got[0].envelope.body, "old row");
+        // The new redaction row targets it explicitly.
+        assert_eq!(got[1].event_id, "$redaction1");
+        assert_eq!(got[1].redaction.as_ref().unwrap().redacts, "$old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn redaction_notifications_are_independent_per_persona() {
+        let mailbox = Mailbox::open_in_memory().unwrap();
+        deliver_one_redaction(&mailbox, "writer_agent", "$redaction1", "$target1")
+            .await
+            .unwrap();
+        let writer = mailbox.check("writer_agent", true, None).await.unwrap();
+        assert_eq!(writer.len(), 1);
+        // The other persona's mailbox (and cursor) is its own — the same
+        // redaction is deliverable there independently, deduplicated by
+        // persona, not globally.
+        deliver_one_redaction(&mailbox, "research_agent", "$redaction1", "$target1")
+            .await
+            .unwrap();
+        let research = mailbox.check("research_agent", true, None).await.unwrap();
+        assert_eq!(research.len(), 1);
+        assert_eq!(research[0].event_id, "$redaction1");
     }
 
     #[tokio::test]

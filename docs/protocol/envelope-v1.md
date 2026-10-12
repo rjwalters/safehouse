@@ -297,6 +297,70 @@ threading. The thread is identified by `matrix.thread_root` instead. To answer i
 value as `thread_root` on `send`: it threads the outgoing message under that event, taking
 precedence over `task_id`-based thread resolution.
 
+### 7b. Redaction notifications — `redaction` on `check` results
+
+A synced `m.room.redaction` is a **deletion signal**: a member removed a message, and a client that
+keeps an archive of room history (claude-bot's waker archive, a digest index) must remove its
+archived copy. The daemon therefore files one notification into **every** locally-registered
+persona's durable mailbox — regardless of egress configuration, room allowlists, or who sent the
+redaction (the daemon's own account included: after a redaction the original message's routing can
+no longer be reconstructed, so the daemon does not try to route it). This delivery runs before and
+independently of the egress-delay retraction (#30); a failure in either half is logged and never
+suppresses the other.
+
+A `check` entry carrying one looks exactly like this:
+
+```jsonc
+{
+  "room_id": "!fleet:example.com",       // the room the redaction happened in
+  "event_id": "$redaction_event",        // the REDACTION event's own id
+  "sender": "@human:example.com",        // the redactor's Matrix user id
+  "envelope": {                          // daemon-synthesized local representation — see below
+    "v": 1,
+    "from": "safehouse",
+    "to": "*",
+    "type": "chat",
+    "body": "redaction: @human:example.com redacted $archived_message in !fleet:example.com"
+  },
+  "redaction": { "redacts": "$archived_message" }   // the deletion target
+}
+```
+
+- **`event_id`** is the redaction event's own id (not the target's), and is the per-persona
+  idempotency key: re-observing the same redaction — sync replay overlap — never files a second
+  row. Distinct redaction events stay distinct rows even when they target the same event.
+- **`sender`** is the redactor's Matrix user id, exactly as the room stream reported it.
+- **`redaction.redacts`** is the **target**: the id of the event that was redacted. The daemon
+  extracts it from both the pre-v11 top-level `redacts` and the v11+ `content.redacts`; a redaction
+  whose target is missing, empty, or not a string produces **no** notification at all.
+- The `envelope` is a storage-compatibility artifact, **not** a new wire type: the mailbox row
+  requires an envelope, so the notification carries a plain v1 `chat` from the reserved `safehouse`
+  persona. An older client that knows nothing of `redaction` just sees one line of daemon-authored
+  prose; no envelope `type` was added and `v` is unchanged (§9). The metadata is never parsed out
+  of `body`.
+
+**Client handling — this is control data, not conversation.** On an entry with a `redaction`
+object: remove your archived copy of `(room_id, redaction.redacts)` — an unknown target is a
+harmless no-op — and never reply to it as chat. The inverse rule is equally binding: **a missing or
+undecryptable message is never a deletion signal.** Only this explicit `redaction` object says
+"deleted"; inferring deletion from absence would turn a transient key gap into mass data loss. The
+absence of `redaction` on an entry means "ordinary mail", never "no redactions exist".
+
+**Where these are (and are not) carried.** Redaction notifications ride the durable mailbox only:
+the `check` RPC op and the `safehouse_check` MCP tool / CLI subcommand. They are **not** pushed to
+connected sockets and **not** returned by `read` — `read` reflects current room state, where a
+redacted event is indistinguishable from an undecryptable one, which is exactly why absence must
+never be read as deletion. They obey the mailbox's ordering (oldest first, interleaved with
+ordinary mail by arrival), peek/consume cursor semantics, row and byte caps (`more_available` /
+`remaining` report truncation as usual — the metadata counts toward the byte budget), restart
+durability, and per-persona retention bounds.
+
+**Compatibility.** Existing mailbox databases are upgraded in place (a nullable `redacts` column
+and a per-persona uniqueness index over redaction rows are added at open); ordinary rows are
+unchanged. A daemon older than this feature never files these rows, so a client's archive-removal
+pass simply finds nothing to do — the notification is additive local RPC surface, not a wire
+change.
+
 ## 8. Rendering rules
 
 The event `body` MUST be legible standing alone, because that is all a human sees. Format:

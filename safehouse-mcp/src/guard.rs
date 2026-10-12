@@ -986,6 +986,44 @@ mod tests {
         assert!(!returns_room_content("status"));
     }
 
+    /// #229: a `check` reply's redaction notifications are deletion *control
+    /// data* the daemon derived itself, but they ride inside `messages` like
+    /// everything else — the untrusted marker must be purely additive and
+    /// never mangle or drop `redaction` metadata (a client that missed it
+    /// would keep an archived copy a member asked to remove).
+    #[test]
+    fn mark_untrusted_preserves_redaction_notification_metadata() {
+        let reply = json!({
+            "ok": true,
+            "messages": [
+                {
+                    "room_id": "!room:x",
+                    "event_id": "$redaction1",
+                    "sender": "@redactor:x",
+                    "envelope": {
+                        "v": 1,
+                        "from": "safehouse",
+                        "to": "*",
+                        "type": "chat",
+                        "body": "redaction: @redactor:x redacted $target1 in !room:x"
+                    },
+                    "redaction": {"redacts": "$target1"}
+                }
+            ],
+            "more_available": false,
+            "remaining": 0,
+        });
+        let marked = mark_untrusted(&reply);
+        assert_eq!(marked["untrusted_content"], json!(UNTRUSTED_NOTICE));
+        let entry = &marked["messages"][0];
+        assert_eq!(entry["redaction"], json!({"redacts": "$target1"}));
+        assert_eq!(entry["event_id"], json!("$redaction1"));
+        assert_eq!(
+            entry["envelope"]["body"],
+            reply["messages"][0]["envelope"]["body"]
+        );
+    }
+
     fn list_rooms_reply(name: Value) -> Value {
         json!({
             "ok": true,
