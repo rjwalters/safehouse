@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1144",
-  "loom_commit": "9e4381cbbd2386393e44c7a979583252948a3998",
+  "loom_version": "0.19.1148",
+  "loom_commit": "e675394377a73ec957d90a26c1a208dd62436c74",
   "install_date": "2026-07-29",
   "installed_files": [
     ".loom/credentials.md.example",
@@ -162,7 +162,7 @@
     ".loom/scripts/tests/test-merge-pr-closed-issue-cleanup.sh",
     ".loom/scripts/tests/test-post-verdict-gate.sh"
   ],
-  "last_resync": "2026-10-12",
+  "last_resync": "2026-10-13",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
   "requires_daemon": "0.19.1081"
 }
