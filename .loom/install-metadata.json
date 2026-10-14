@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1153",
-  "loom_commit": "9a9dcf747f2a97686a57681194c14483fffc7c3d",
+  "loom_version": "0.19.1154",
+  "loom_commit": "a661bf0d507bb02e74f5aacc1e0e1869878f9297",
   "install_date": "2026-07-29",
   "installed_files": [
     ".loom/credentials.md.example",
@@ -186,7 +186,7 @@
     ".loom/scripts/tests/test-sweep-experiment.sh",
     ".claude/commands/loom/sweep-arguments.md"
   ],
-  "last_resync": "2026-10-13",
+  "last_resync": "2026-10-14",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
   "requires_daemon": "0.19.1081"
 }
