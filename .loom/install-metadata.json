@@ -1,6 +1,6 @@
 {
-  "loom_version": "0.19.1161",
-  "loom_commit": "3187e328c5e0c0ef3342a3c303d4948852cfa665",
+  "loom_version": "0.19.1162",
+  "loom_commit": "f1ee755eeca1954f35bf83d19f4b84ad51feb9f5",
   "install_date": "2026-07-29",
   "installed_files": [
     ".loom/credentials.md.example",
@@ -260,7 +260,15 @@
     ".loom/scripts/lib/github-app-token.sh",
     ".loom/scripts/tests/test-github-app-token.sh",
     ".loom/scripts/tests/test-merge-pr-hold-state-trust.sh",
-    ".loom/scripts/tests/test-provision-hooks.sh"
+    ".loom/scripts/tests/test-provision-hooks.sh",
+    ".loom/docs/dispatch-plan.md",
+    ".loom/docs/promotion-throughput.md",
+    ".loom/scripts/check-evaluating-staleness.sh",
+    ".loom/scripts/check-verified-corrections-preserved.sh",
+    ".loom/scripts/claim-staleness.sh",
+    ".loom/scripts/post-verdict.sh",
+    ".loom/scripts/tests/test-champion-terminal-verdicts.sh",
+    ".loom/scripts/tests/test-check-evaluating-staleness.sh"
   ],
   "last_resync": "2026-10-15",
   "loom_source_remote": "https://github.com/rjwalters/loom.git",
