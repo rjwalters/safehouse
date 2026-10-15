@@ -280,13 +280,14 @@ async fn main() -> Result<()> {
         String::new()
     };
 
-    // Tuwunel v1.8.2 only executes admin-room messages beginning `!admin`;
-    // without it the command is silently ignored (issue #235). The underscore
-    // form `users create_user` was verified live 2026-07-28 (`docs/research/
-    // 2026-07-26-homeserver.md`). Overridable because tuwunel's admin-command
+    // The `!admin ` prefix is required: verified 2026-10-15 against a
+    // disposable tuwunel v1.8.2 (`docs/research/2026-07-26-homeserver.md`,
+    // "Verified: `users deactivate`"), an unprefixed `users ...` message in the
+    // admin room is silently ignored (issue #235). Underscore form verified
+    // live 2026-07-28 (issue #94). Overridable because tuwunel's admin-command
     // syntax has moved before and #94's own curated text uses a hyphenated
-    // `create-user` — if your server expects another form or prefix, set
-    // this explicitly rather than editing the binary.
+    // `create-user` — if your server expects another form or prefix, set this
+    // explicitly rather than editing the binary.
     let cmd_template = optional("PROVISION_CREATE_CMD_TEMPLATE", default_template(is_create));
     let ack_timeout_secs: u64 = optional("PROVISION_ACK_TIMEOUT_SECS", "20")
         .parse()

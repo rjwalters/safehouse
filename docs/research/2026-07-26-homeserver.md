@@ -241,3 +241,20 @@ up.
 Both trackers were swept for E2E bugs: continuwuity 132 open issues → exactly 1 tagged E2EE;
 tuwunel 50 open → exactly 1. It's the same bug (#292 / #1476). Neither has any open issue on
 `/room_keys`, to-device loss, or cross-signing, and the route handlers were read in source on both.
+
+## Verified: `users deactivate` force-leaves rooms (2026-10-15, issue #178)
+
+Run against a disposable **tuwunel v1.8.2** container (`ghcr.io/matrix-construct/tuwunel:v1.8.2`,
+federation off, registration-token signup; the first registered user is the server admin and is
+joined to the admin room), using `scripts/deprovision-host.sh --user <bot>` with a bot that had
+joined a second room. No production credentials were involved.
+
+- **Holds:** after `!admin users deactivate <bot>` the bot's `m.room.member` state in the other room
+  went `join` → `leave`, it dropped out of `joined_members`, and `/login` returned
+  `M_USER_DEACTIVATED`. Tuwunel force-leaves every room on deactivation, so no kick/leave step (or
+  `safehoused` RPC op) is needed.
+- **Gotcha found:** the admin room only runs messages that start with `!admin`. The tool's former
+  default commands (`users deactivate …`, `users create_user …`) were silently ignored — no reply, no
+  effect. The defaults in `spikes/provision-host` now carry the `!admin ` prefix; with it the tool
+  gets the server's `User … has been deactivated` ack. `PROVISION_CREATE_CMD_TEMPLATE` still
+  overrides.
