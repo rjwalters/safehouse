@@ -268,7 +268,7 @@ same class of invisible-until-it-bites-you problem, just for the binary instead 
 Dynamic scale-out to many hosts caps out at the rate a human can create Matrix accounts by hand.
 `scripts/provision-host.sh` mints a new fleet host's bot account **with no human action on the
 homeserver and no interactive prompt**, using admin-room automation instead: it sends
-`users create_user <bot> <generated-password>` as the `@safehouse-admin` server-admin bot into the
+`!admin users create_user <bot> <generated-password>` as the `@safehouse-admin` server-admin bot into the
 Matrix admin room (`docs/research/2026-07-26-homeserver.md`'s "Zero-downtime alternative (admin
 room)" path — the live server executes it in-process, no `systemctl stop`/`--execute`/`start`), then
 sends the `invite` op above from an already-onboarded host's socket so the new bot auto-joins the
@@ -296,7 +296,7 @@ steps 1–4 below remains the documented fallback: it always works, requires no 
 is what `provision-host.sh` itself is automating.
 
 **Decommissioning a host** (ephemeral/spot hosts should not leave dead accounts and stale room
-members behind): `scripts/deprovision-host.sh --host studio` sends `users deactivate` for that
+members behind): `scripts/deprovision-host.sh --host studio` sends `!admin users deactivate` for that
 host's bot account the same way. Tuwunel mirrors Synapse's admin-API deactivate semantics, which
 force-leave every room the account was a member of as part of deactivation — so this also retires
 the account's fleet-room membership without a separate kick/leave step; verify against your
