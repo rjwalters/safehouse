@@ -1174,6 +1174,50 @@ mod tests {
         std::fs::remove_dir_all(dir).ok();
     }
 
+    /// Mixed daemon versions share signal rooms: older ones send envelopes as
+    /// `m.text`, newer ones as `m.notice`. Egress gates on the parsed envelope,
+    /// never on msgtype, so a public completion must queue for publication
+    /// from the full ingest path (`from_event_json` -> `consider`) under
+    /// either msgtype — including content built by this daemon's own
+    /// `to_event_content`.
+    #[tokio::test]
+    async fn consider_publishes_completions_sent_as_notice_or_text() {
+        let dir = crate::test_support::tempdir("safehoused-egress-test");
+        let egress =
+            Egress::open_in_memory(config(&["!r:x"], &["secret"], 0, dir.join("sink.jsonl")))
+                .unwrap();
+        let mut meta = crate::test_support::completion_meta();
+        meta["visibility"] = json!("public");
+        let completion = env("completion", Some(meta));
+        let own = crate::envelope::to_event_content(&completion, None);
+        assert_eq!(own["msgtype"], "m.notice");
+        let mut legacy = own.clone();
+        legacy["msgtype"] = json!("m.text");
+
+        for (i, content) in [own, legacy].iter().enumerate() {
+            let parsed = match crate::envelope::from_event_json(
+                content,
+                "@safehoused:x",
+                &["builder_agent".to_owned()],
+                None,
+            ) {
+                crate::envelope::Inbound::Envelope(e, _) => e,
+                other => panic!("expected Envelope, got {other:?}"),
+            };
+            let queued = egress
+                .consider("!r:x", &format!("${i}"), &parsed)
+                .await
+                .unwrap();
+            assert!(
+                queued,
+                "{} completion must be publish-eligible",
+                content["msgtype"]
+            );
+        }
+        assert_eq!(pending_publish_row_count(&egress).await, 2);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[tokio::test]
     async fn consider_withholds_when_visibility_is_private() {
         let dir = crate::test_support::tempdir("safehoused-egress-test");

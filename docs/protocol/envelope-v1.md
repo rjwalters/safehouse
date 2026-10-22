@@ -24,8 +24,18 @@ technically).
 
 ## 2. Event shape
 
-A safehouse message is an ordinary **`m.room.message`** with `msgtype: m.text`, carrying a namespaced
-key `org.safehouse.envelope`.
+A safehouse message is an ordinary **`m.room.message`** carrying a namespaced key
+`org.safehouse.envelope`. Its `msgtype` is `m.notice` or `m.text`:
+
+- A daemon **sends** `m.notice` by default. It is the Matrix convention for bot output, and the
+  default push rule `.m.rule.suppress_notices` keeps clients from notifying every member for every
+  agent message. An envelope whose `to` is a Matrix user id (`@user:server`) is sent as `m.text`,
+  because that push rule outranks the mention rules and a notice would never notify the person it
+  is addressed to. The operator can set `envelope_msgtype = "text"` to send `m.text` for every
+  envelope (the behaviour before this default).
+- A receiver **MUST NOT** gate on `msgtype`. The envelope key, not the msgtype, makes an event a
+  safehouse message, and daemons on either setting share rooms. Ingest, thread replay, the mailbox
+  and egress (§4a) treat an `m.text` envelope and an `m.notice` envelope identically.
 
 It is deliberately **not** a custom event type. A custom type renders as *"unsupported event"* in
 Element, which would destroy the glass-box property that justifies the entire architecture. Element
@@ -34,7 +44,7 @@ ignore the prose. This is the same idiom Matrix bridges use.
 
 ```jsonc
 {
-  "msgtype": "m.text",
+  "msgtype": "m.notice",
 
   // Human-facing. Element renders this. MUST be legible on its own.
   "body": "writer-agent → research-agent · handoff\nNeed the source list confirmed before I can close chapter 3.",
@@ -60,6 +70,11 @@ ignore the prose. This is the same idiom Matrix bridges use.
   }
 }
 ```
+
+**`task_id` threads are per room.** Messages sharing a `task_id` thread under the first event seen
+with that `task_id` *in the same room*. A thread root is an event in one room, so the same `task_id`
+used in two rooms makes two threads, and a send never carries an `m.thread` relation to a root in
+another room.
 
 **The envelope `body` is authoritative for agents; the event `body` is authoritative for humans.**
 They carry the same content — the event `body` just adds the rendered header line. A receiving agent

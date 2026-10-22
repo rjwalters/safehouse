@@ -156,10 +156,17 @@ pub struct RetryState {
 /// the source of truth; this is a local index over it, not a second copy).
 #[derive(Default)]
 pub struct ThreadState {
-    /// `task_id` -> the event id of that task's thread root (§2). Recorded
-    /// the first time a `task_id` is seen; never overwritten, so every
-    /// message sharing a `task_id` threads under the same root.
-    task_roots: Mutex<HashMap<String, String>>,
+    /// `(room_id, task_id)` -> the event id of that task's thread root in
+    /// that room (§2). Recorded the first time a `task_id` is seen *in that
+    /// room*; never overwritten, so every message sharing a `task_id` in a
+    /// room threads under the same root.
+    ///
+    /// Keyed by room because a thread root is an event in one room: the same
+    /// `task_id` used in two rooms is two threads, and a send must never carry
+    /// an `m.thread` relation to an event that doesn't exist in its own room
+    /// (clients render that as an orphaned or top-level message). The other
+    /// two maps are keyed by event id, which is already globally unique.
+    task_roots: Mutex<HashMap<(String, String), String>>,
     /// thread root event id -> the most recent event id observed in that
     /// thread, for the `m.in_reply_to` rich-reply fallback (§2).
     latest_in_thread: Mutex<HashMap<String, String>>,
@@ -170,9 +177,14 @@ pub struct ThreadState {
 }
 
 impl ThreadState {
-    /// The thread root already recorded for `task_id`, if any.
-    pub async fn root_for_task(&self, task_id: &str) -> Option<String> {
-        self.task_roots.lock().await.get(task_id).cloned()
+    /// The thread root already recorded for `task_id` in `room_id`, if any.
+    /// A root seen for the same `task_id` in another room is never returned.
+    pub async fn root_for_task(&self, room_id: &str, task_id: &str) -> Option<String> {
+        self.task_roots
+            .lock()
+            .await
+            .get(&(room_id.to_owned(), task_id.to_owned()))
+            .cloned()
     }
 
     /// The most recent event id observed in the thread rooted at
@@ -191,11 +203,11 @@ impl ThreadState {
         self.thread_target.lock().await.get(root_event_id).cloned()
     }
 
-    /// Record that `event_id` (belonging to the thread rooted at
+    /// Record that `event_id` in `room_id` (belonging to the thread rooted at
     /// `thread_root`) carried `env`. Called for every dispatched envelope —
     /// own, remote, or human-synthesized — so thread state always reflects
     /// what actually round-tripped through the room (D6).
-    pub async fn observe(&self, thread_root: &str, event_id: &str, env: &Envelope) {
+    pub async fn observe(&self, room_id: &str, thread_root: &str, event_id: &str, env: &Envelope) {
         self.latest_in_thread
             .lock()
             .await
@@ -204,7 +216,7 @@ impl ThreadState {
             self.task_roots
                 .lock()
                 .await
-                .entry(task_id.clone())
+                .entry((room_id.to_owned(), task_id.clone()))
                 .or_insert_with(|| thread_root.to_owned());
         }
         // Only a persona-shaped `to` (never "*", never a Matrix user id) is
@@ -617,7 +629,8 @@ async fn handle_op(
             // `matrix.thread_root` from a `check` entry) takes precedence
             // and threads the send under that event regardless of `task_id`,
             // so an agent can answer inside a human-started thread.
-            let (known_root, relates_to) = resolve_send_thread(registry, req, &env).await;
+            let (known_root, relates_to) =
+                resolve_send_thread(registry, room.room_id().as_str(), req, &env).await;
 
             let content = envelope::to_event_content(&env, relates_to);
             let response = room
@@ -632,7 +645,10 @@ async fn handle_op(
             // `task_id` would each miss the other's root (§2).
             if env.task_id.is_some() {
                 let root = known_root.unwrap_or_else(|| event_id.clone());
-                registry.threads.observe(&root, &event_id, &env).await;
+                registry
+                    .threads
+                    .observe(room.room_id().as_str(), &root, &event_id, &env)
+                    .await;
             }
 
             Ok(send_reply(
@@ -1134,18 +1150,20 @@ async fn read_messages(events: &[Value], own: &str, registry: &Registry) -> Resu
     Ok(messages)
 }
 
-/// Resolve the thread a `send` belongs to: `(root, m.relates_to)`. An
-/// explicit `thread_root` wins over `task_id`-based resolution (#194); the
-/// `latest` event of the reply chain is whatever the registry has seen for
-/// that root, else the root itself.
+/// Resolve the thread a `send` to `room_id` belongs to: `(root,
+/// m.relates_to)`. An explicit `thread_root` wins over `task_id`-based
+/// resolution (#194); a `task_id` only resolves to a root recorded in the same
+/// room. The `latest` event of the reply chain is whatever the registry has
+/// seen for that root, else the root itself.
 async fn resolve_send_thread(
     registry: &Registry,
+    room_id: &str,
     req: &Value,
     env: &Envelope,
 ) -> (Option<String>, Option<Value>) {
     let known_root = match (send_thread_root(req), &env.task_id) {
         (Some(root), _) => Some(root),
-        (None, Some(task_id)) => registry.threads.root_for_task(task_id).await,
+        (None, Some(task_id)) => registry.threads.root_for_task(room_id, task_id).await,
         (None, None) => None,
     };
     let relates_to = match &known_root {
@@ -1731,6 +1749,9 @@ async fn reciprocal_parent_space(room: &Room) -> Option<String> {
 /// (`build_send_envelope` below, and `envelope::from_event_json`'s tests).
 #[cfg(test)]
 mod tests {
+    /// Room the thread-state tests observe in; `OTHER_ROOM` is a second one.
+    const TEST_ROOM: &str = "!room:x";
+    const OTHER_ROOM: &str = "!other:x";
     use std::time::Duration;
 
     use serde_json::json;
@@ -2570,17 +2591,24 @@ mod tests {
     #[tokio::test]
     async fn thread_state_records_root_the_first_time_a_task_id_is_seen() {
         let threads = ThreadState::default();
-        assert!(threads.root_for_task("source_check").await.is_none());
+        assert!(threads
+            .root_for_task(TEST_ROOM, "source_check")
+            .await
+            .is_none());
 
         threads
             .observe(
+                TEST_ROOM,
                 "$root",
                 "$root",
                 &thread_env("research_agent", Some("source_check")),
             )
             .await;
         assert_eq!(
-            threads.root_for_task("source_check").await.as_deref(),
+            threads
+                .root_for_task(TEST_ROOM, "source_check")
+                .await
+                .as_deref(),
             Some("$root")
         );
     }
@@ -2644,6 +2672,65 @@ mod tests {
         );
     }
 
+    /// A `task_id` is per room: the same id seen in two rooms gets two roots,
+    /// each first-seen-wins within its own room, and a lookup in a third room
+    /// finds neither.
+    #[tokio::test]
+    async fn thread_state_same_task_id_in_two_rooms_has_two_roots() {
+        let threads = ThreadState::default();
+        let env = thread_env("research_agent", Some("source_check"));
+        threads.observe(TEST_ROOM, "$rootA", "$rootA", &env).await;
+        assert!(
+            threads
+                .root_for_task(OTHER_ROOM, "source_check")
+                .await
+                .is_none(),
+            "a root in one room must not resolve for another"
+        );
+        threads.observe(OTHER_ROOM, "$rootB", "$rootB", &env).await;
+        // A later event in room A does not displace room A's first root.
+        threads.observe(TEST_ROOM, "$later", "$later", &env).await;
+        assert_eq!(
+            threads
+                .root_for_task(TEST_ROOM, "source_check")
+                .await
+                .as_deref(),
+            Some("$rootA")
+        );
+        assert_eq!(
+            threads
+                .root_for_task(OTHER_ROOM, "source_check")
+                .await
+                .as_deref(),
+            Some("$rootB")
+        );
+        assert!(threads
+            .root_for_task("!third:x", "source_check")
+            .await
+            .is_none());
+    }
+
+    /// The send path: a `task_id` known only in room A must not thread a send
+    /// to room B (that root doesn't exist there — the message would render
+    /// orphaned); the send becomes room B's root instead.
+    #[tokio::test]
+    async fn send_task_id_threads_only_under_a_root_in_the_same_room() {
+        let (_w, _r, registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        let req = json!({"to": "research_agent", "body": "hi", "task_id": "t"});
+        let env = build_send_envelope("writer_agent", &req).unwrap().env;
+        registry
+            .threads
+            .observe(TEST_ROOM, "$rootA", "$rootA", &env)
+            .await;
+
+        let (root, relates) = resolve_send_thread(&registry, TEST_ROOM, &req, &env).await;
+        assert_eq!(root.as_deref(), Some("$rootA"));
+        assert_eq!(relates.unwrap()["event_id"], "$rootA");
+
+        let (root, relates) = resolve_send_thread(&registry, OTHER_ROOM, &req, &env).await;
+        assert!(root.is_none() && relates.is_none(), "no cross-room thread");
+    }
+
     #[tokio::test]
     async fn thread_state_never_overwrites_an_established_root() {
         // Every subsequent event for the same task_id must thread under the
@@ -2652,6 +2739,7 @@ mod tests {
         let threads = ThreadState::default();
         threads
             .observe(
+                TEST_ROOM,
                 "$root",
                 "$root",
                 &thread_env("research_agent", Some("source_check")),
@@ -2659,13 +2747,17 @@ mod tests {
             .await;
         threads
             .observe(
+                TEST_ROOM,
                 "$root",
                 "$reply1",
                 &thread_env("writer_agent", Some("source_check")),
             )
             .await;
         assert_eq!(
-            threads.root_for_task("source_check").await.as_deref(),
+            threads
+                .root_for_task(TEST_ROOM, "source_check")
+                .await
+                .as_deref(),
             Some("$root")
         );
     }
@@ -2674,7 +2766,12 @@ mod tests {
     async fn thread_state_tracks_latest_event_in_thread() {
         let threads = ThreadState::default();
         threads
-            .observe("$root", "$root", &thread_env("research_agent", Some("t")))
+            .observe(
+                TEST_ROOM,
+                "$root",
+                "$root",
+                &thread_env("research_agent", Some("t")),
+            )
             .await;
         assert_eq!(
             threads.latest_in_thread("$root").await.as_deref(),
@@ -2682,7 +2779,12 @@ mod tests {
         );
 
         threads
-            .observe("$root", "$reply1", &thread_env("writer_agent", Some("t")))
+            .observe(
+                TEST_ROOM,
+                "$root",
+                "$reply1",
+                &thread_env("writer_agent", Some("t")),
+            )
             .await;
         assert_eq!(
             threads.latest_in_thread("$root").await.as_deref(),
@@ -2696,7 +2798,12 @@ mod tests {
         // un-tokened human reply should route to.
         let threads = ThreadState::default();
         threads
-            .observe("$root", "$root", &thread_env("research_agent", Some("t")))
+            .observe(
+                TEST_ROOM,
+                "$root",
+                "$root",
+                &thread_env("research_agent", Some("t")),
+            )
             .await;
         assert_eq!(
             threads.target_for_thread("$root").await.as_deref(),
@@ -2704,7 +2811,12 @@ mod tests {
         );
 
         threads
-            .observe("$root", "$reply1", &thread_env("writer_agent", Some("t")))
+            .observe(
+                TEST_ROOM,
+                "$root",
+                "$reply1",
+                &thread_env("writer_agent", Some("t")),
+            )
             .await;
         assert_eq!(
             threads.target_for_thread("$root").await.as_deref(),
@@ -2718,12 +2830,17 @@ mod tests {
         // a §5.2 routing target.
         let threads = ThreadState::default();
         threads
-            .observe("$root", "$root", &thread_env("*", None))
+            .observe(TEST_ROOM, "$root", "$root", &thread_env("*", None))
             .await;
         assert!(threads.target_for_thread("$root").await.is_none());
 
         threads
-            .observe("$root", "$root", &thread_env("@robb:safehouse.local", None))
+            .observe(
+                TEST_ROOM,
+                "$root",
+                "$root",
+                &thread_env("@robb:safehouse.local", None),
+            )
             .await;
         assert!(threads.target_for_thread("$root").await.is_none());
     }
@@ -2788,14 +2905,14 @@ mod tests {
         let req = json!({"to": "*", "body": "hi", "thread_root": "$humanroot"});
         let env = build_send_envelope("writer_agent", &req).unwrap().env;
         assert!(env.task_id.is_none());
-        let (root, relates) = resolve_send_thread(&registry, &req, &env).await;
+        let (root, relates) = resolve_send_thread(&registry, TEST_ROOM, &req, &env).await;
         assert_eq!(root.as_deref(), Some("$humanroot"));
         let relates = relates.unwrap();
         assert_eq!(relates["rel_type"], "m.thread");
         assert_eq!(relates["event_id"], "$humanroot");
         // No thread_root and no task_id: no relation.
         let req = json!({"to": "*", "body": "hi"});
-        let (root, relates) = resolve_send_thread(&registry, &req, &env).await;
+        let (root, relates) = resolve_send_thread(&registry, TEST_ROOM, &req, &env).await;
         assert!(root.is_none() && relates.is_none());
     }
 
@@ -2894,7 +3011,10 @@ mod tests {
         let (_w, _r, registry) =
             spawn_conn(vec!["writer_agent".to_owned(), "research_agent".to_owned()]).await;
         let env = thread_env("research_agent", None);
-        registry.threads.observe("$root", "$root", &env).await;
+        registry
+            .threads
+            .observe(TEST_ROOM, "$root", "$root", &env)
+            .await;
         // The root event itself: routed via its own id, but no thread_root key.
         let ev = json!({"type": "m.room.message", "event_id": "$root", "sender": "@h:x",
             "content": {"msgtype": "m.text", "body": "start"}});

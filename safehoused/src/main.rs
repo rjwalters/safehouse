@@ -169,6 +169,17 @@ struct Config {
     /// falls through to a broadcast either way; only the ack is suppressed.
     #[serde(default = "default_true")]
     unknown_persona_ack: bool,
+    /// The `msgtype` envelope events are sent with. Default `"notice"`:
+    /// `m.notice`, the Matrix convention for bot output, which clients do not
+    /// notify for — so daemon narration stops pinging every room member. An
+    /// envelope addressed to a Matrix user id stays `m.text` either way so the
+    /// person it is for is still notified. `"text"` restores `m.text` for
+    /// every envelope. Receivers accept both (see
+    /// [`envelope::EnvelopeMsgtype`]), so daemons on either setting share a
+    /// room. Not a schema bump: the new default takes effect without an
+    /// operator edit.
+    #[serde(default)]
+    envelope_msgtype: envelope::EnvelopeMsgtype,
     /// Whether to leave (and forget) a room once the daemon is its only
     /// remaining joined member (issue #201). Default `false` — today's
     /// behavior, in which the bot stays in a room everyone else has left,
@@ -473,6 +484,9 @@ async fn run() -> Result<()> {
     // otherwise come up accepting invites from anyone on any server (#198).
     validate_homeserver_mode(config.homeserver_mode, &config.invite_allowlist)
         .map_err(|err| anyhow::anyhow!(err))?;
+    // Before any handler or RPC can send: every envelope event this process
+    // writes takes its msgtype from here.
+    envelope::set_envelope_msgtype(config.envelope_msgtype);
     // #215: every secret — literal or `*_file` — is resolved here, once,
     // before any homeserver I/O, so a missing/ambiguous/over-permissive
     // reference fails the boot by name instead of halfway through login.
@@ -854,7 +868,13 @@ async fn replay_thread_history(client: &Client, registry: &Registry) {
         match collect_recent_events(&room, THREAD_REPLAY_MAX_EVENTS).await {
             Ok(events) => {
                 if !events.is_empty() {
-                    replay_thread_events(&registry.threads, &registry.personas, &events).await;
+                    replay_thread_events(
+                        &registry.threads,
+                        &registry.personas,
+                        room.room_id().as_str(),
+                        &events,
+                    )
+                    .await;
                     println!(
                         "safehoused: replayed {} event(s) of {} history to rebuild thread state",
                         events.len(),
@@ -909,9 +929,16 @@ async fn collect_recent_events(room: &Room, max: usize) -> Result<Vec<Value>> {
 /// `on_message` does for live events: resolve the thread root, resolve the
 /// currently-addressed agent from the state rebuilt so far, interpret the
 /// envelope (skipping unsupported versions, as the live path drops them), then
-/// observe. Non-`m.room.message` events are ignored. Factored out of the boot
+/// observe. `events` all come from `room_id`, and every observation is recorded
+/// against it, so a `task_id` replayed from one room never supplies the root
+/// for a send to another. Non-`m.room.message` events are ignored. Factored out of the boot
 /// path so it can be unit-tested without a live homeserver.
-async fn replay_thread_events(threads: &rpc::ThreadState, personas: &[String], events: &[Value]) {
+async fn replay_thread_events(
+    threads: &rpc::ThreadState,
+    personas: &[String],
+    room_id: &str,
+    events: &[Value],
+) {
     for parsed in events {
         if parsed.get("type").and_then(Value::as_str) != Some("m.room.message") {
             continue;
@@ -931,7 +958,7 @@ async fn replay_thread_events(threads: &rpc::ThreadState, personas: &[String], e
                 // the live path drops it, so replay must too.
                 envelope::Inbound::UnsupportedVersion(_) => continue,
             };
-        threads.observe(&thread_root, event_id, &env).await;
+        threads.observe(room_id, &thread_root, event_id, &env).await;
     }
 }
 
@@ -1257,7 +1284,7 @@ async fn on_message(
     // (e.g. this daemon's own subsequent `send`) already sees it.
     registry
         .threads
-        .observe(&thread_root, &event_id, &env)
+        .observe(room.room_id().as_str(), &thread_root, &event_id, &env)
         .await;
 
     let push = json!({
@@ -1679,6 +1706,15 @@ mod config_tests {
         assert!(config.unknown_persona_ack);
         let config: Config = toml::from_str(&config_toml("unknown_persona_ack = false\n")).unwrap();
         assert!(!config.unknown_persona_ack);
+    }
+
+    #[test]
+    fn envelope_msgtype_defaults_to_notice_and_can_be_set_to_text() {
+        let config: Config = toml::from_str(&config_toml("")).unwrap();
+        assert_eq!(config.envelope_msgtype, envelope::EnvelopeMsgtype::Notice);
+        let config: Config = toml::from_str(&config_toml("envelope_msgtype = \"text\"\n")).unwrap();
+        assert_eq!(config.envelope_msgtype, envelope::EnvelopeMsgtype::Text);
+        assert!(toml::from_str::<Config>(&config_toml("envelope_msgtype = \"m.text\"\n")).is_err());
     }
 
     #[test]
@@ -2318,6 +2354,9 @@ mod replay_tests {
 
     use super::*;
 
+    const ROOM: &str = "!a:example.org";
+    const OTHER_ROOM: &str = "!b:example.org";
+
     fn personas() -> Vec<String> {
         vec!["writer_agent".to_owned(), "research_agent".to_owned()]
     }
@@ -2370,9 +2409,12 @@ mod replay_tests {
         // thread: the task's root, the latest event, and who's addressed.
         let threads = rpc::ThreadState::default();
         let events = vec![agent_event("$root", None, "research_agent", Some("t"))];
-        replay_thread_events(&threads, &personas(), &events).await;
+        replay_thread_events(&threads, &personas(), ROOM, &events).await;
 
-        assert_eq!(threads.root_for_task("t").await.as_deref(), Some("$root"));
+        assert_eq!(
+            threads.root_for_task(ROOM, "t").await.as_deref(),
+            Some("$root")
+        );
         assert_eq!(
             threads.target_for_thread("$root").await.as_deref(),
             Some("research_agent")
@@ -2398,7 +2440,7 @@ mod replay_tests {
             agent_event("$reply1", Some("$root"), "writer_agent", Some("t")),
             human_thread_reply("$reply2", "$root", "and one more thing"),
         ];
-        replay_thread_events(&threads, &personas(), &events).await;
+        replay_thread_events(&threads, &personas(), ROOM, &events).await;
 
         // Was empty before replay (the bug) — now resolves the last agent
         // addressed, so the un-tokened reply above routed to it, not "*".
@@ -2411,9 +2453,63 @@ mod replay_tests {
             Some("$reply2")
         );
         assert_eq!(
-            threads.root_for_task("t").await.as_deref(),
+            threads.root_for_task(ROOM, "t").await.as_deref(),
             Some("$root"),
             "the first root seen for a task_id must never be overwritten"
+        );
+    }
+
+    /// Replay runs room by room, and a task root replayed from one room must
+    /// not leak into another: the same `task_id` in two rooms gets two roots,
+    /// and a room that never saw the `task_id` has none.
+    #[tokio::test]
+    async fn replay_is_per_room() {
+        let threads = rpc::ThreadState::default();
+        replay_thread_events(
+            &threads,
+            &personas(),
+            ROOM,
+            &[agent_event("$rootA", None, "research_agent", Some("t"))],
+        )
+        .await;
+        assert!(
+            threads.root_for_task(OTHER_ROOM, "t").await.is_none(),
+            "a root replayed from one room must not resolve in another"
+        );
+        replay_thread_events(
+            &threads,
+            &personas(),
+            OTHER_ROOM,
+            &[agent_event("$rootB", None, "research_agent", Some("t"))],
+        )
+        .await;
+        assert_eq!(
+            threads.root_for_task(ROOM, "t").await.as_deref(),
+            Some("$rootA")
+        );
+        assert_eq!(
+            threads.root_for_task(OTHER_ROOM, "t").await.as_deref(),
+            Some("$rootB")
+        );
+        assert!(threads.root_for_task("!c:example.org", "t").await.is_none());
+    }
+
+    /// The replay path reads envelopes regardless of msgtype: a history mixing
+    /// `m.text` (older daemons) and `m.notice` (newer) rebuilds the same index.
+    #[tokio::test]
+    async fn replay_reads_notice_and_text_envelopes() {
+        let threads = rpc::ThreadState::default();
+        let mut root = agent_event("$root", None, "research_agent", Some("t"));
+        root["content"]["msgtype"] = json!("m.notice");
+        let reply = agent_event("$reply", Some("$root"), "writer_agent", Some("t"));
+        replay_thread_events(&threads, &personas(), ROOM, &[root, reply]).await;
+        assert_eq!(
+            threads.root_for_task(ROOM, "t").await.as_deref(),
+            Some("$root")
+        );
+        assert_eq!(
+            threads.target_for_thread("$root").await.as_deref(),
+            Some("writer_agent")
         );
     }
 
@@ -2442,10 +2538,10 @@ mod replay_tests {
             "sender": "@robb:x",
             "content": { "m.relates_to": { "rel_type": "m.annotation", "event_id": "$x" } },
         });
-        replay_thread_events(&threads, &personas(), &[unsupported, reaction]).await;
+        replay_thread_events(&threads, &personas(), ROOM, &[unsupported, reaction]).await;
 
         // Neither event contributed to the index.
-        assert!(threads.root_for_task("t").await.is_none());
+        assert!(threads.root_for_task(ROOM, "t").await.is_none());
         assert!(threads.target_for_thread("$bad").await.is_none());
     }
 
@@ -2459,7 +2555,7 @@ mod replay_tests {
             "sender": "@robb:x",
             "content": { "body": "no event id here" },
         });
-        replay_thread_events(&threads, &personas(), &[malformed]).await;
+        replay_thread_events(&threads, &personas(), ROOM, &[malformed]).await;
         assert!(threads.target_for_thread("$anything").await.is_none());
     }
 }

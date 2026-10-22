@@ -4,7 +4,7 @@
 //! happens (§8). Agents never see Matrix event JSON; they see envelopes.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -576,14 +576,72 @@ pub fn image_caption(from: &str, to: Option<&str>, caption: Option<&str>) -> (St
     }
 }
 
+/// Which `msgtype` the daemon puts on the envelope events it sends (§2).
+///
+/// The default is [`EnvelopeMsgtype::Notice`]: `m.notice` is the Matrix
+/// convention for automated output, and the spec's default push rule
+/// `.m.rule.suppress_notices` keeps clients from notifying every member for
+/// every daemon message — which `m.text` did, making an agent room as loud as
+/// a group chat. `text` is the operator opt-out (`envelope_msgtype = "text"`)
+/// for a room that wants every envelope to notify, as before.
+///
+/// Receivers never filter on `msgtype` — the envelope key, not the msgtype, is
+/// what makes an event a safehouse message (§2) — so daemons sending either
+/// value interoperate, and egress publishes a completion sent as either.
+///
+/// An enum rather than a bare `String` for the same reason as
+/// `HomeserverMode`: a typo'd value is a config parse error, never a silent
+/// fallback.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvelopeMsgtype {
+    /// `m.notice` for bot narration; `m.text` only for an envelope addressed
+    /// to a Matrix user (see [`msgtype_for`]).
+    #[default]
+    Notice,
+    /// `m.text` for every envelope — the pre-notice behaviour.
+    Text,
+}
+
+/// The process-wide [`EnvelopeMsgtype`], set once at boot from config by
+/// [`set_envelope_msgtype`]. Unset (tests, or before boot finishes) reads as
+/// the default.
+static ENVELOPE_MSGTYPE: OnceLock<EnvelopeMsgtype> = OnceLock::new();
+
+/// Install the configured [`EnvelopeMsgtype`]. Only the first call takes
+/// effect; the daemon calls it exactly once, at boot, before any send.
+pub fn set_envelope_msgtype(policy: EnvelopeMsgtype) {
+    let _ = ENVELOPE_MSGTYPE.set(policy);
+}
+
+fn envelope_msgtype() -> EnvelopeMsgtype {
+    ENVELOPE_MSGTYPE.get().copied().unwrap_or_default()
+}
+
+/// The `msgtype` an outgoing `env` is sent with under `policy`.
+///
+/// Under [`EnvelopeMsgtype::Notice`], an envelope whose `to` is a Matrix user
+/// id (`@user:server`) stays `m.text`: it is the one kind of daemon message
+/// written *for a person*, and `.m.rule.suppress_notices` outranks the mention
+/// rules, so as a notice it would never notify the human it is addressed to.
+/// Persona and broadcast (`*`) traffic — the narration — is `m.notice`.
+pub fn msgtype_for(env: &Envelope, policy: EnvelopeMsgtype) -> &'static str {
+    match policy {
+        EnvelopeMsgtype::Text => "m.text",
+        EnvelopeMsgtype::Notice if env.to.starts_with('@') => "m.text",
+        EnvelopeMsgtype::Notice => "m.notice",
+    }
+}
+
 /// Full `m.room.message` content carrying the envelope. `relates_to`, when
 /// present, is native Matrix `m.thread` threading (§2) — see
 /// [`thread_relation`]. Callers that never thread (daemon-generated notices)
-/// pass `None`.
+/// pass `None`. The `msgtype` follows the boot-configured
+/// [`EnvelopeMsgtype`] — see [`msgtype_for`].
 pub fn to_event_content(env: &Envelope, relates_to: Option<Value>) -> Value {
     let (plain, html) = render(env);
     let mut content = json!({
-        "msgtype": "m.text",
+        "msgtype": msgtype_for(env, envelope_msgtype()),
         "body": plain,
         "format": "org.matrix.custom.html",
         "formatted_body": html,
@@ -1609,6 +1667,104 @@ mod tests {
         assert_eq!(relates_to["event_id"], "$root");
         assert_eq!(relates_to["is_falling_back"], true);
         assert_eq!(relates_to["m.in_reply_to"]["event_id"], "$latest");
+    }
+
+    // ---- msgtype: m.notice for narration, both accepted on ingest -------
+
+    #[test]
+    fn envelope_events_default_to_m_notice() {
+        // No `set_envelope_msgtype` in tests: the unset policy is the default.
+        let content = to_event_content(&env("writer_agent", "research_agent", "chat", "hi"), None);
+        assert_eq!(content["msgtype"], "m.notice");
+        let content = to_event_content(&env("writer_agent", "*", "digest", "3 merged"), None);
+        assert_eq!(content["msgtype"], "m.notice");
+    }
+
+    #[test]
+    fn msgtype_for_follows_policy_and_keeps_human_addressed_text() {
+        let narration = env("writer_agent", "research_agent", "handoff", "go");
+        let broadcast = env("writer_agent", "*", "completion", "shipped");
+        let to_human = env("writer_agent", "@alice:example.org", "chat", "need you");
+        assert_eq!(msgtype_for(&narration, EnvelopeMsgtype::Notice), "m.notice");
+        assert_eq!(msgtype_for(&broadcast, EnvelopeMsgtype::Notice), "m.notice");
+        // suppress_notices outranks mention rules: a message for a person
+        // must stay m.text or it never notifies them.
+        assert_eq!(msgtype_for(&to_human, EnvelopeMsgtype::Notice), "m.text");
+        for e in [&narration, &broadcast, &to_human] {
+            assert_eq!(msgtype_for(e, EnvelopeMsgtype::Text), "m.text");
+        }
+    }
+
+    #[test]
+    fn envelope_msgtype_config_values() {
+        #[derive(Deserialize)]
+        struct C {
+            #[serde(default)]
+            m: EnvelopeMsgtype,
+        }
+        let parse = |s: &str| toml::from_str::<C>(s).map(|c| c.m);
+        assert_eq!(parse("").unwrap(), EnvelopeMsgtype::Notice);
+        assert_eq!(parse("m = \"notice\"").unwrap(), EnvelopeMsgtype::Notice);
+        assert_eq!(parse("m = \"text\"").unwrap(), EnvelopeMsgtype::Text);
+        assert!(parse("m = \"emote\"").is_err());
+    }
+
+    /// Mixed daemon versions share rooms: an envelope must parse identically
+    /// whether its sender used `m.text` (older) or `m.notice` (newer), and
+    /// with no msgtype at all.
+    #[test]
+    fn from_event_json_accepts_text_and_notice_envelopes() {
+        let mut parsed = Vec::new();
+        for msgtype in [Some("m.text"), Some("m.notice"), None] {
+            let mut content = envelope_content(1);
+            match msgtype {
+                Some(m) => content["msgtype"] = json!(m),
+                None => {
+                    content.as_object_mut().unwrap().remove("msgtype");
+                }
+            }
+            match from_event_json(&content, "@bot:example.org", &personas(), None) {
+                Inbound::Envelope(env, unknown) => {
+                    assert!(unknown.is_none());
+                    parsed.push(env);
+                }
+                other => panic!("{msgtype:?}: expected Envelope, got {other:?}"),
+            }
+        }
+        assert_eq!(parsed[0].kind, "handoff");
+        let first = serde_json::to_value(&parsed[0]).unwrap();
+        assert!(parsed
+            .iter()
+            .all(|e| serde_json::to_value(e).unwrap() == first));
+    }
+
+    /// A human's notice (some clients and bridges send `m.notice`) is
+    /// synthesized like any other human message.
+    #[test]
+    fn from_event_json_synthesizes_from_human_notice() {
+        let content = json!({ "msgtype": "m.notice", "body": "@research-agent check this" });
+        match from_event_json(&content, "@alice:example.org", &personas(), None) {
+            Inbound::Envelope(env, _) => {
+                assert_eq!(env.to, "research_agent");
+                assert_eq!(env.body, "check this");
+            }
+            other => panic!("expected Envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_parses_from_notice_and_text() {
+        for msgtype in ["m.text", "m.notice"] {
+            let mut content = completion_content(valid_completion_meta());
+            content["msgtype"] = json!(msgtype);
+            match from_event_json(&content, "@bot:example.org", &personas(), None) {
+                Inbound::Envelope(env, _) => {
+                    assert_eq!(env.kind, "completion", "{msgtype}");
+                    assert_eq!(env.meta.as_ref(), Some(&valid_completion_meta()));
+                }
+                other => panic!("{msgtype}: expected Envelope, got {other:?}"),
+            }
+        }
     }
 
     #[test]

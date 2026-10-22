@@ -153,6 +153,15 @@ recovery_passphrase = "change-me-as-well"
 # suppresses the ack only; the message still arrives as a broadcast.
 # unknown_persona_ack = true
 
+# msgtype of the envelope events this daemon sends. Default "notice": bot
+# narration goes out as m.notice, which Matrix clients do not notify for, so
+# agent traffic no longer pings every member of the room. An envelope an agent
+# addresses to a Matrix user (to = "@user:server") stays m.text either way, so
+# the person it is for is still notified. "text" sends every envelope as
+# m.text, as before. Receivers accept both, so daemons on either setting can
+# share a room. Any other value is a config parse error.
+# envelope_msgtype = "notice"
+
 # Leave a room once the daemon is its only remaining member (issue #201).
 # Default false — today's behavior, in which the bot stays in a room everyone
 # else has left: it keeps syncing it, replays its history at every start, and
