@@ -9,7 +9,7 @@ members = ["safehoused", "safehouse-mcp", "spikes/create-claims-room", "spikes/p
 # build too — one flag covers both consumers. Without it, a bare Linux toolchain
 # fails to link with "unable to find library -lsqlite3" unless libsqlite3-dev is
 # installed (see README "Running it" > Prerequisites).
-matrix-sdk = { version = "0.18", features = ["e2e-encryption", "bundled-sqlite"] }
+matrix-sdk = { version = "0.19", features = ["e2e-encryption", "bundled-sqlite"] }
 # "process" + "io-util" are for the optional local transcriber (#200,
 # safehoused/src/transcribe.rs): it pipes decrypted voice-note audio into a
 # configured local subprocess over stdin. "time" bounds that subprocess (and
@@ -30,10 +30,10 @@ serde_json = "1"
 # matrix-sdk; Apache-2.0). Used directly by safehoused/src/transcripts.rs to
 # encrypt stored voice-note transcripts (#231): matrix-sdk-sqlite hashes a
 # custom value's key but writes the value itself in the clear.
-matrix-sdk-store-encryption = "0.18"
+matrix-sdk-store-encryption = "0.19"
 # Already vendored transitively via matrix-sdk-sqlite; used directly here for
 # the mailbox read-cursor store (D17), not for any Matrix state.
-rusqlite = "0.37"
+rusqlite = "0.40"
 # Already vendored transitively via matrix-sdk; used directly here only to
 # consume `Room::parent_spaces()`'s `Stream` (Space hierarchy in `list_rooms`).
 futures-util = { version = "0.3", default-features = false }
