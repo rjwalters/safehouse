@@ -191,6 +191,13 @@ Known trade-off, accepted: once outside DCO'd work is merged, relicensing requir
 contributor's consent. Decided before the repo went public so the first drive-by PR can't land in
 the gap.
 
+**Fleet-authored commits** (ruled 2026-10-23, #242/#245): an agent can't attest, so no agent signs
+off. A fleet PR lands through a replacement commit that the operator authors and signs (cherry-pick
+onto `main` with `-s`), never a force-push of the agent's branch. The rule above is unchanged:
+`dco.yml` has no bot exemption, and a standing blanket attestation for the fleet App was considered
+and rejected, because it would replace a per-commit human attestation with one covering whatever
+the fleet writes.
+
 ## D12 — Homeserver: **tuwunel**, pinned ≥ v1.8.2 (reverses the provisional pick)
 **Decision:** run **tuwunel** ≥ v1.8.2, federation off. Runner-up continuwuity v26.6.2.
 **Switch trigger:** if tuwunel's two-person team stops shipping, or once continuwuity refreshes its
