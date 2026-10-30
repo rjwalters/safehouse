@@ -37,13 +37,16 @@
 //!   op (verify with `!admin users list` / the room's member list if your
 //!   server's behavior differs; this tool does not assume otherwise).
 //!
-//! Best-effort, not a hard gate: `safehoused` keeps its zero-hard-dependency
-//! posture (a host that fails onboarding still runs, just without
-//! coordination — loom ADR-0014), and this tool mirrors that stance for
-//! itself. A missing/ambiguous ack from the admin room is reported as a
-//! warning, not a failure — the command was still sent, and the operator (or
-//! calling script) can verify with `!admin users list` before trusting the
-//! printed credential.
+//! Sending is best-effort, reporting success is not: `safehoused` keeps its
+//! zero-hard-dependency posture (a host that fails onboarding still runs,
+//! just without coordination — loom ADR-0014), so this tool never retries or
+//! gates anything else on the command. But it only prints the credential /
+//! `STATUS=deactivated` block after an ack in the admin room that mentions
+//! the target user. A missing or unrelated reply is an error (non-zero
+//! exit): the command was sent but is unconfirmed, and the operator should
+//! verify with `!admin users list`. Tuwunel v1.8.2 silently ignores admin-room
+//! messages that lack the `!admin` prefix (issue #235), which is exactly the
+//! case this guards against.
 //!
 //! Deliberately NOT a persistent session (matches `create-claims-room`): a
 //! fresh login every run, matrix-sdk's default in-memory store, nothing
@@ -121,9 +124,37 @@ fn render_command(template: &str, user: &str, password: &str) -> String {
 /// issue text itself uses a hyphenated `create-user` — see
 /// `PROVISION_CREATE_CMD_TEMPLATE`'s doc comment below), so this is
 /// deliberately loose: a substring match, not a full parse. Absence of a
-/// match is a warning, never a hard failure (see module doc "Best-effort").
+/// match is treated as unconfirmed by [`ack_verdict`].
 fn ack_mentions_user(reply_body: &str, username: &str) -> bool {
     reply_body.contains(username)
+}
+
+/// Turns the observed admin-room reply (if any) into a verdict. Success
+/// requires an ack that mentions `username`; anything else is an error so the
+/// caller never reports a credential / `STATUS=deactivated` for a command the
+/// server may have ignored (issue #235). Pure and unit-testable.
+fn ack_verdict(ack: Option<(String, String)>, username: &str, timeout_secs: u64) -> Result<()> {
+    match ack {
+        Some((_, body)) if ack_mentions_user(&body, username) => Ok(()),
+        Some((sender, body)) => anyhow::bail!(
+            "reply from {sender} does not mention {username:?} ({body:?}): the command was sent \
+             but is unconfirmed — verify with `!admin users list`"
+        ),
+        None => anyhow::bail!(
+            "no reply observed within {timeout_secs}s: the command was sent but is unconfirmed \
+             — verify with `!admin users list`. (Tuwunel ignores admin-room messages without the \
+             `!admin` prefix; check PROVISION_CREATE_CMD_TEMPLATE if you override it.)"
+        ),
+    }
+}
+
+/// Default admin-room command template for create (`true`) or deactivate.
+fn default_template(is_create: bool) -> &'static str {
+    if is_create {
+        "!admin users create_user {user} {password}"
+    } else {
+        "!admin users deactivate {user}"
+    }
 }
 
 /// Resolves `spec` — a room id (`!...:server`) or a canonical alias
@@ -252,17 +283,12 @@ async fn main() -> Result<()> {
     // The `!admin ` prefix is required: verified 2026-10-15 against a
     // disposable tuwunel v1.8.2 (`docs/research/2026-07-26-homeserver.md`,
     // "Verified: `users deactivate`"), an unprefixed `users ...` message in the
-    // admin room is silently ignored. Underscore form verified live
-    // 2026-07-28 (issue #94). Overridable
-    // because tuwunel's admin-command syntax has moved before and #94's own
-    // curated text uses a hyphenated `create-user` — if your server expects
-    // that form, set this explicitly rather than editing the binary.
-    let default_template = if is_create {
-        "!admin users create_user {user} {password}"
-    } else {
-        "!admin users deactivate {user}"
-    };
-    let cmd_template = optional("PROVISION_CREATE_CMD_TEMPLATE", default_template);
+    // admin room is silently ignored (issue #235). Underscore form verified
+    // live 2026-07-28 (issue #94). Overridable because tuwunel's admin-command
+    // syntax has moved before and #94's own curated text uses a hyphenated
+    // `create-user` — if your server expects another form or prefix, set this
+    // explicitly rather than editing the binary.
+    let cmd_template = optional("PROVISION_CREATE_CMD_TEMPLATE", default_template(is_create));
     let ack_timeout_secs: u64 = optional("PROVISION_ACK_TIMEOUT_SECS", "20")
         .parse()
         .context("PROVISION_ACK_TIMEOUT_SECS must be a non-negative integer")?;
@@ -320,29 +346,14 @@ async fn main() -> Result<()> {
 
     println!(
         "provision-host: waiting up to {ack_timeout_secs}s for a reply in the admin room \
-         (best-effort — see module docs; absence of a reply is not treated as failure)"
+         (an ack mentioning {new_username:?} is required before success is reported)"
     );
-    match wait_for_ack(&client, &mut rx, Duration::from_secs(ack_timeout_secs)).await {
-        Some((sender, body)) => {
-            println!("provision-host: reply from {sender}: {body}");
-            if ack_mentions_user(&body, &new_username) {
-                println!("provision-host: reply mentions {new_username:?} — treating as success");
-            } else {
-                println!(
-                    "provision-host: warning: reply does not mention {new_username:?} — \
-                     verify manually (e.g. `!admin users list`) before trusting the credential \
-                     below"
-                );
-            }
-        }
-        None => {
-            println!(
-                "provision-host: warning: no reply observed within {ack_timeout_secs}s — the \
-                 command was sent, but the ack could not be confirmed. Verify manually before \
-                 trusting the credential below."
-            );
-        }
+    let ack = wait_for_ack(&client, &mut rx, Duration::from_secs(ack_timeout_secs)).await;
+    if let Some((sender, body)) = &ack {
+        println!("provision-host: reply from {sender}: {body}");
     }
+    ack_verdict(ack, &new_username, ack_timeout_secs)?;
+    println!("provision-host: reply mentions {new_username:?} — treating as success");
 
     println!();
     println!("==================================================================");
@@ -400,6 +411,34 @@ mod tests {
     #[test]
     fn ack_mentions_user_rejects_unrelated_reply() {
         assert!(!ack_mentions_user("pong", "bot-a"));
+    }
+
+    #[test]
+    fn default_templates_carry_admin_prefix() {
+        assert_eq!(
+            default_template(true),
+            "!admin users create_user {user} {password}"
+        );
+        assert_eq!(default_template(false), "!admin users deactivate {user}");
+    }
+
+    #[test]
+    fn ack_verdict_ok_when_reply_mentions_user() {
+        let ack = Some(("@admin:x".into(), "User bot-a has been deactivated".into()));
+        assert!(ack_verdict(ack, "bot-a", 20).is_ok());
+    }
+
+    #[test]
+    fn ack_verdict_errors_without_reply() {
+        let err = ack_verdict(None, "bot-a", 0).unwrap_err().to_string();
+        assert!(err.contains("unconfirmed"), "{err}");
+        assert!(err.contains("!admin users list"), "{err}");
+    }
+
+    #[test]
+    fn ack_verdict_errors_on_unrelated_reply() {
+        let ack = Some(("@other:x".into(), "pong".into()));
+        assert!(ack_verdict(ack, "bot-a", 20).is_err());
     }
 
     /// Guards against a `{user}`/`{password}` order swap or dropped
