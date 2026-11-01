@@ -251,6 +251,15 @@ same class of invisible-until-it-bites-you problem, just for the binary instead 
    "the only joined room" shorthand for a destructive op. `reason`, when given, lands on the
    membership event the room's remaining members see.
 
+   **Seeing who is in a room** is the read-only companion (#250): send a `members` op —
+   `{"op": "members", "room": "<id|name|alias>"}`, or from a shell
+   `safehouse-mcp members --room <id|name|alias>` — and the reply lists the room's **joined and
+   invited** members, each as `{"user_id", "membership": "join"|"invite", "display_name"}`, sorted
+   by `user_id`. Left, banned and knocked members are not listed. It is served from the state the
+   sync already holds (no extra homeserver call), resolves `room` like `read` does (the sole joined
+   room when `room` is omitted), and is gated by the same persona `hello`. A bot that treats room
+   membership as its trust boundary compares this list against its allowlist before it acts.
+
    **Leaving automatically when nobody else is left** is opt-in: `leave_when_alone = true`
    (default `false`). The daemon watches `m.room.member` changes, and a room that has been down to
    just this daemon for 10 minutes — measured from the event that emptied it, so a quick
@@ -400,6 +409,7 @@ safehouse-mcp check --consume                  # advances the operator persona's
 safehouse-mcp list-rooms
 safehouse-mcp status                           # liveness one-liner — see below
 safehouse-mcp leave --room fleet-ops           # leave AND forget a room (#201)
+safehouse-mcp members --room fleet-ops         # joined + invited members (#250)
 ```
 
 **Diagnosing "healthy and idle" vs. "cut off" (#85):** `safehouse-mcp status` reports
