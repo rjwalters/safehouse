@@ -27,6 +27,7 @@ use matrix_sdk::{
         api::client::room::create_room::v3::{CreationContent, Request as CreateRoomRequest},
         events::reaction::ReactionEventContent,
         events::relation::Annotation,
+        events::room::member::MembershipState,
         events::room::message::{AddMentions, TextMessageEventContent},
         events::{
             space::{child::SpaceChildEventContent, parent::SpaceParentEventContent},
@@ -36,7 +37,7 @@ use matrix_sdk::{
         serde::Raw,
         OwnedEventId, OwnedServerName, OwnedUserId, RoomId, UInt, UserId,
     },
-    Client, Room, RoomState,
+    Client, Room, RoomMemberships, RoomState,
 };
 use serde_json::{json, Value};
 use tokio::{
@@ -72,6 +73,7 @@ const OPS: &[&str] = &[
     "leave",
     "add_to_space",
     "list_rooms",
+    "members",
     "read",
     "check",
 ];
@@ -978,6 +980,35 @@ async fn handle_op(
             }
             Ok(json!({"ok": true, "rooms": rooms}))
         }
+        "members" => {
+            // Who is in a room (#250): the joined and the invited, which are
+            // the two states that can act in or enter it. A caller that treats
+            // room membership as its trust boundary (claude-bot's operator-room
+            // guard) compares this list against an allowlist before it acts;
+            // `list_rooms` carries only a count and `read` only recent senders,
+            // neither of which is membership. Read-only, so the sole-joined-room
+            // shorthand `resolve_room` offers is fine here (contrast `leave`).
+            // Served from the state the sync already holds: no extra CS-API
+            // round trip.
+            let room = resolve_room(client, req.get("room").and_then(Value::as_str))
+                .context("resolving `room`")?;
+            let present = room
+                .members(RoomMemberships::JOIN | RoomMemberships::INVITE)
+                .await
+                .with_context(|| format!("reading members of {}", room.room_id()))?;
+            let rows = present.iter().map(|m| {
+                (
+                    m.user_id().to_string(),
+                    m.membership().clone(),
+                    m.display_name().map(str::to_owned),
+                )
+            });
+            Ok(json!({
+                "ok": true,
+                "room_id": room.room_id(),
+                "members": members_rows(rows),
+            }))
+        }
         "read" => {
             let room = resolve_room(client, req.get("room").and_then(Value::as_str))?;
             let limit = req
@@ -1648,6 +1679,39 @@ async fn await_room_name_visible(client: &Client, room_id: &RoomId, name: &str) 
     }
 }
 
+/// The `members` reply rows (#250): `join` and `invite` members only, each as
+/// `{user_id, membership, display_name}`, sorted by `user_id` so two readings
+/// of the same room compare equal. Any other membership state (left, banned,
+/// knocked) is dropped here even if the caller handed it in, so the op's
+/// contract does not depend on which states the SDK query was asked for.
+/// Pure, so it is tested without a live room.
+fn members_rows<I>(rows: I) -> Vec<Value>
+where
+    I: IntoIterator<Item = (String, MembershipState, Option<String>)>,
+{
+    let mut kept: Vec<(String, &'static str, Option<String>)> = rows
+        .into_iter()
+        .filter_map(|(user_id, membership, display_name)| {
+            let state = match membership {
+                MembershipState::Join => "join",
+                MembershipState::Invite => "invite",
+                _ => return None,
+            };
+            Some((user_id, state, display_name))
+        })
+        .collect();
+    kept.sort_by(|a, b| a.0.cmp(&b.0));
+    kept.into_iter()
+        .map(|(user_id, membership, display_name)| {
+            json!({
+                "user_id": user_id,
+                "membership": membership,
+                "display_name": display_name,
+            })
+        })
+        .collect()
+}
+
 /// Room by id, name, or alias, or the sole joined room when unambiguous.
 /// Ambiguous specs (more than one match) error rather than guessing.
 fn resolve_room(client: &Client, spec: Option<&str>) -> Result<Room> {
@@ -2198,6 +2262,61 @@ mod tests {
                 .contains("`room` required for `leave`"),
             "{reply}"
         );
+    }
+
+    // --- #250: `members` --------------------------------------------------
+
+    #[test]
+    fn members_rows_keeps_join_and_invite_sorted_and_drops_the_rest() {
+        let rows = members_rows(vec![
+            (
+                "@zed:x".to_owned(),
+                MembershipState::Join,
+                Some("Zed".to_owned()),
+            ),
+            ("@gone:x".to_owned(), MembershipState::Leave, None),
+            ("@banned:x".to_owned(), MembershipState::Ban, None),
+            ("@knock:x".to_owned(), MembershipState::Knock, None),
+            ("@amy:x".to_owned(), MembershipState::Invite, None),
+        ]);
+        assert_eq!(
+            rows,
+            vec![
+                json!({"user_id": "@amy:x", "membership": "invite", "display_name": null}),
+                json!({"user_id": "@zed:x", "membership": "join", "display_name": "Zed"}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn members_reports_unknown_room() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+
+        send(&mut write, json!({"op": "members", "room": "!nope:x"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert!(
+            reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("no joined room matching"),
+            "{reply}"
+        );
+    }
+
+    #[tokio::test]
+    async fn members_requires_hello_first() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(&mut write, json!({"op": "members", "room": "!x:y"})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "hello first");
     }
 
     #[tokio::test]

@@ -206,6 +206,10 @@ fn print_usage(out: &mut impl Write) {
         out,
         "  safehouse-mcp leave --room <id|name|alias> [--reason <text>]   # leave AND forget a room (#201)"
     );
+    let _ = writeln!(
+        out,
+        "  safehouse-mcp members [--room <id|name|alias>]   # who is in a room: joined and invited (#250)"
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "Guards (see README \"Shim-side guards\"):");
     let _ = writeln!(
@@ -239,6 +243,7 @@ fn build_cli_op(sub: &str, args: &[String]) -> Result<Option<Value>> {
         "status" => build_status_op(args)?,
         "invite" => build_invite_op(args)?,
         "leave" => build_leave_op(args)?,
+        "members" => build_members_op(args)?,
         _ => return Ok(None),
     };
     Ok(Some(op))
@@ -399,6 +404,24 @@ fn build_leave_op(args: &[String]) -> Result<Value> {
         }
     }
     anyhow::ensure!(op.get("room").is_some(), "leave: --room is required");
+    Ok(op)
+}
+
+/// Who is in a room (#250): sends the daemon's `members` RPC op, which lists
+/// the joined and invited members. Read-only, so `--room` is optional like
+/// `read`'s: with one joined room the daemon's shorthand picks it.
+fn build_members_op(args: &[String]) -> Result<Value> {
+    let mut op = json!({"op": "members"});
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--room" => {
+                let v = flag_value(args, &mut i, "--room")?;
+                op["room"] = json!(v);
+            }
+            other => bail!("members: unknown argument {other:?}"),
+        }
+    }
     Ok(op)
 }
 
@@ -840,6 +863,22 @@ mod tests {
             json!({"op": "list_rooms"})
         );
         assert!(build_list_rooms_op(&args(&["--room", "x"])).is_err());
+    }
+
+    #[test]
+    fn members_takes_an_optional_room() {
+        assert_eq!(build_members_op(&[]).unwrap(), json!({"op": "members"}));
+        assert_eq!(
+            build_members_op(&args(&["--room", "operator"])).unwrap(),
+            json!({"op": "members", "room": "operator"})
+        );
+        assert!(build_members_op(&args(&["--limit", "3"])).is_err());
+        assert_eq!(
+            build_cli_op("members", &args(&["--room", "!r:x"]))
+                .unwrap()
+                .unwrap(),
+            json!({"op": "members", "room": "!r:x"})
+        );
     }
 
     // ---- `status` subcommand (#85) -----------------------------------------
