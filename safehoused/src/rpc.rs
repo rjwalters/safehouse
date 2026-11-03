@@ -1103,7 +1103,15 @@ async fn handle_op(
                 .filter_map(|event| serde_json::from_str::<Value>(event.raw().json().get()).ok())
                 .collect();
             let messages = read_messages(&events, &own, registry).await?;
-            Ok(json!({"ok": true, "room_id": room.room_id(), "messages": messages}))
+            // #252: events that stayed encrypted produce no row; say how
+            // many, so a caller that counts rows can tell "nothing was
+            // said" from "something was said I can't see".
+            Ok(json!({
+                "ok": true,
+                "room_id": room.room_id(),
+                "messages": messages,
+                "undecryptable": read_undecryptable(&events),
+            }))
         }
         "check" => {
             // Peek mode (no-advance) and `limit`, per the issue spec. Default
@@ -1254,6 +1262,31 @@ async fn read_messages(events: &[Value], own: &str, registry: &Registry) -> Resu
         messages.push(message);
     }
     Ok(messages)
+}
+
+/// How many of `read`'s timeline events stayed encrypted (#252). The
+/// SDK tries to decrypt every `m.room.encrypted` event in the batch; one it
+/// could not is still `m.room.encrypted`, matches no `m.room.message` filter,
+/// and would otherwise vanish from the reply without a trace. Two kinds are
+/// not counted, because neither could ever have been a row: a redacted event
+/// (`unsigned.redacted_because`; deleted, not hidden) and a reaction, whose
+/// `m.annotation` relation an encrypted room keeps in the clear.
+fn read_undecryptable(events: &[Value]) -> u64 {
+    let counted = events.iter().filter(|event| {
+        let encrypted = event.get("type").and_then(Value::as_str) == Some("m.room.encrypted");
+        let redacted = event
+            .get("unsigned")
+            .and_then(|u| u.get("redacted_because"))
+            .is_some();
+        let annotation = event
+            .get("content")
+            .and_then(|c| c.get("m.relates_to"))
+            .and_then(|r| r.get("rel_type"))
+            .and_then(Value::as_str)
+            == Some("m.annotation");
+        encrypted && !redacted && !annotation
+    });
+    counted.count() as u64
 }
 
 /// Resolve the thread a `send` to `room_id` belongs to: `(root,
@@ -3647,6 +3680,34 @@ mod tests {
         assert_eq!(reply["remaining"], 0);
     }
 
+    #[test]
+    fn read_undecryptable_counts_only_hidden_messages() {
+        let sealed = |id: &str| {
+            json!({"type": "m.room.encrypted", "event_id": id, "sender": "@a:example.org",
+                   "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "x"}})
+        };
+        let mut sealed_reply = sealed("$reply");
+        sealed_reply["content"]["m.relates_to"] =
+            json!({"rel_type": "m.thread", "event_id": "$root"});
+        let mut sealed_reaction = sealed("$reaction");
+        sealed_reaction["content"]["m.relates_to"] =
+            json!({"rel_type": "m.annotation", "event_id": "$root"});
+        let mut redacted = sealed("$gone");
+        redacted["content"] = json!({});
+        redacted["unsigned"] = json!({"redacted_because": {"type": "m.room.redaction"}});
+        let events = [
+            message_event("$plain", json!({"msgtype": "m.text", "body": "hi"})),
+            sealed("$hidden"),
+            sealed_reply,
+            sealed_reaction,
+            redacted,
+            json!({"type": "m.room.member", "event_id": "$join", "state_key": "@a:example.org",
+                   "content": {"membership": "join"}}),
+        ];
+        assert_eq!(read_undecryptable(&events), 2);
+        assert_eq!(read_undecryptable(&events[..1]), 0);
+    }
+
     // ---- reactions (#252) ----
 
     #[test]
@@ -4266,6 +4327,31 @@ mod tests {
     }
     const FAKE_REACTION_ID: &str = "$new-reaction";
 
+    /// The room's recent history as `/messages` returns it, newest first
+    /// (#252): one readable message, and one nobody shared the key for.
+    fn fake_messages() -> Value {
+        json!({
+            "start": "t2", "end": "t0",
+            "chunk": [
+                {
+                    "type": "m.room.encrypted", "room_id": FAKE_ROOM,
+                    "sender": "@frank:example.org", "event_id": "$sealed-message",
+                    "origin_server_ts": 6,
+                    "content": {
+                        "algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "AwgAEhAAAAAAAAAAAA",
+                        "session_id": "unknown-session", "sender_key": "unknown-key",
+                        "device_id": "FRANKDEVICE",
+                    },
+                },
+                {
+                    "type": "m.room.message", "room_id": FAKE_ROOM,
+                    "sender": "@alice:example.org", "event_id": FAKE_OTHER_EVENT,
+                    "origin_server_ts": 5, "content": {"msgtype": "m.text", "body": "hi"},
+                },
+            ],
+        })
+    }
+
     /// An annotation of `FAKE_OTHER_EVENT` as the relations API returns it.
     fn annotation(event_id: &str, sender: &str, key: &str, ts: u64) -> Value {
         json!({
@@ -4377,6 +4463,8 @@ mod tests {
                     (200, json!({"event_id": FAKE_REACTION_ID}))
                 } else if m == "PUT" && rest.starts_with("redact/") {
                     (200, json!({"event_id": "$redaction"}))
+                } else if m == "GET" && rest == "messages" {
+                    (200, fake_messages())
                 } else if m == "GET" && rest.starts_with("event/") {
                     match fake_event(&rest["event/".len()..]) {
                         Some(event) => (200, event),
@@ -4737,6 +4825,19 @@ mod tests {
         assert_eq!(reply["truncated"], true);
         // The sealed annotation's key is unknown, so it counts under a filter too.
         assert_eq!(reply["undecryptable"], 1);
+    }
+
+    #[tokio::test]
+    async fn read_reports_the_messages_it_could_not_decrypt() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(&mut write, json!({"op": "read", "room": FAKE_ROOM})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        let rows = reply["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{reply}");
+        assert_eq!(rows[0]["event_id"], FAKE_OTHER_EVENT);
+        assert_eq!(reply["undecryptable"], 1, "{reply}");
     }
 
     #[tokio::test]

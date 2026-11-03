@@ -320,6 +320,16 @@ relation with a string root id (including `is_falling_back: true` replies, and f
 main-timeline events, thread roots themselves, plain `m.in_reply_to` replies, other relation types,
 and malformed thread relations. Purely additive; clients that ignore it see no change.
 
+**`read`'s `undecryptable` count (#252).** Beside `messages`, the `read` reply carries
+`undecryptable`: how many events in the batch the daemon could not decrypt. Such an event yields no
+row, so before this count `read` dropped it without a trace, and a caller that counts rows could not
+tell "nothing was said" from "something was said I can't see". Redacted events and encrypted
+reactions (whose `m.annotation` relation is in the clear) are not counted: neither could ever have
+been a row. A non-zero count is a key gap, never a deletion signal (§7b). A caller that must fail
+closed on missing lines treats `undecryptable > 0` as missing lines. A daemon older than this field
+sends no `undecryptable` key at all, which such a caller should treat as unknown, not as `0`.
+Purely additive; `messages` is unchanged.
+
 ### 7b. Redaction notifications — `redaction` on `check` results
 
 A synced `m.room.redaction` is a **deletion signal**: a member removed a message, and a client that

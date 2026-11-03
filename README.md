@@ -505,6 +505,11 @@ room, unknown event) is `{"ok": false, "error": "<reason>"}`.
 Run `safehouse-mcp --help` for the full flag list. With no subcommand (or on a bare TTY), the
 binary keeps its original behavior unchanged: a stdio MCP server for an MCP client to launch.
 
+**Messages `read` can't decrypt (#252):** the `read` reply carries `undecryptable`, a count of
+events in the batch the daemon could not decrypt and so returned no row for (redacted events and
+reactions aside). A daemon older than the field omits it; treat that as unknown, not zero. See
+[envelope-v1 §7a](docs/protocol/envelope-v1.md#7a-matrix--daemon-observed-matrix-metadata-on-check-results).
+
 **The read-vs-check cursor trap:** `read` is *stateless* — it replays recent room history and
 never touches any persona's mailbox. `check` is *stateful* — it's a specific persona's durable,
 sqlite-backed unread-mail cursor (D16/D17), and by default **consuming** it (a second call
