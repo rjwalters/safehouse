@@ -384,6 +384,56 @@ unchanged. A daemon older than this feature never files these rows, so a client'
 pass simply finds nothing to do — the notification is additive local RPC surface, not a wire
 change.
 
+### 7c. Reading reactions — the `reactions` op
+
+`react` (#220) puts an `m.annotation` reaction on an event; `reactions` (#252) reads an event's
+reactions back. Like §7a/§7b this is local RPC surface, not a wire-envelope change: nothing on the
+Matrix side changes and `v` is untouched. A client that claims a message by reacting to it (say
+with `🤖`) reads the claims back here to see who was first.
+
+```jsonc
+{"op": "reactions", "room": "!room:example.org", "event_id": "$target",
+ "key": "🤖",      // optional: only reactions with exactly this key
+ "limit": 50}      // optional: default 50, capped at 100
+```
+
+```jsonc
+{
+  "ok": true,
+  "room_id": "!room:example.org",
+  "event_id": "$target",
+  "reactions": [
+    {"event_id": "$bob_reaction", "sender": "@bob:example.org", "key": "🤖", "ts": 1767225600000},
+    {"event_id": "$alice_reaction", "sender": "@alice:example.org", "key": "🤖", "ts": 1767225601000}
+  ],
+  "undecryptable": 0,
+  "truncated": false
+}
+```
+
+- **Gate and validation.** Requires `hello`, like `read` and `members`; any allowlisted persona may
+  ask. `room` is mandatory (an event id only means something in its room). `event_id` must be an
+  event id, `key` (when given) obeys `react`'s rule (1–16 bytes of UTF-8, no control characters),
+  and `limit` must be a non-negative integer; larger than 100 is treated as 100. All of this is
+  checked before the room is resolved.
+- **Source.** The homeserver's relations API,
+  `GET /_matrix/client/v1/rooms/{room}/relations/{event_id}/m.annotation`, paged forward from the
+  start of the room. The answer is live, not the daemon's sync cache. One call reads at most 1000
+  annotations; if more remain, `truncated` is `true`.
+- **Rows.** Each row is `event_id` (the reaction's own id), `sender`, `key` and `ts`
+  (`origin_server_ts` in ms). Rows are sorted by `ts`, then `event_id`, and cut to `limit`. No row
+  ever carries a message body, and the target event itself is never fetched.
+- **What is left out.** A redacted reaction (`unsigned.redacted_because`) is no reaction and is not
+  returned or counted. Nor is an event whose decrypted `m.relates_to` is not an `m.annotation` of
+  this `event_id`, or whose key `react` would refuse (so the op cannot carry long text).
+- **Encrypted rooms.** A reaction there is an `m.room.encrypted` event whose `m.relates_to` is in
+  the clear, which is how the homeserver files it under the target. The daemon decrypts each one
+  and takes `key` from the decrypted content. One it cannot decrypt is counted in `undecryptable`
+  instead. Its key is unknown, so it is counted even when the request names a `key`. A client that
+  must not miss a claim treats `undecryptable > 0` as "there may be one I can't see".
+- **`truncated`** is `true` when more matching reactions exist than `limit` allowed, or when the
+  1000-annotation scan stopped before the relations ran out.
+
 ## 8. Rendering rules
 
 The event `body` MUST be legible standing alone, because that is all a human sees. Format:
