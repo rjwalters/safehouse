@@ -21,12 +21,13 @@ use matrix_sdk::{
     deserialized_responses::SyncOrStrippedState,
     room::{
         reply::{EnforceThread, Reply},
-        MessagesOptions, ParentSpace,
+        IncludeRelations, MessagesOptions, ParentSpace, RelationsOptions,
     },
     ruma::{
         api::client::room::create_room::v3::{CreationContent, Request as CreateRoomRequest},
+        api::Direction,
         events::reaction::ReactionEventContent,
-        events::relation::Annotation,
+        events::relation::{Annotation, RelationType},
         events::room::member::MembershipState,
         events::room::message::{AddMentions, TextMessageEventContent},
         events::{
@@ -68,6 +69,7 @@ const OPS: &[&str] = &[
     "fetch_media",
     "react",
     "redact",
+    "reactions",
     "create_room",
     "invite",
     "leave",
@@ -85,6 +87,19 @@ const OPS: &[&str] = &[
 /// issue's, fixed by the protocol: a long ZWJ sequence such as a family emoji
 /// (18 bytes) is over it.
 const MAX_REACTION_KEY_BYTES: usize = 16;
+
+/// How many reactions the `reactions` op returns when the request names no
+/// `limit`, and the most it ever returns (#252).
+const DEFAULT_REACTIONS_LIMIT: u64 = 50;
+const MAX_REACTIONS_LIMIT: u64 = 100;
+
+/// The relations API page size the `reactions` op asks for, and the most
+/// annotations it reads for one call before it stops and reports
+/// `truncated` (#252). The ceiling keeps one request from walking an unbounded
+/// pile of reactions; the page size is the largest a homeserver is likely to
+/// honour.
+const REACTIONS_PAGE: u32 = 100;
+const MAX_REACTIONS_SCANNED: usize = 1000;
 
 /// The `error` a `redact` gets for any target that is not one of this
 /// daemon's own reactions (#220), verbatim: the one error string of the op
@@ -805,6 +820,66 @@ async fn handle_op(
                 "room_id": room.room_id().as_str(),
             }))
         }
+        "reactions" => {
+            // #252: the reactions on one event, read back so a client that
+            // claims a message by reacting to it can see who else did. Read
+            // live from the homeserver's relations API (`/relations/{event}/
+            // m.annotation`), not the sync cache, and gated like `read` and
+            // `members` (`hello` first, any allowlisted persona). Validated
+            // before the room is resolved, as `react` is. Rows carry only
+            // the annotation (sender, key, time), never a message body.
+            //
+            // In an encrypted room a reaction is an `m.room.encrypted` event
+            // with its `m.relates_to` in the clear, which is how the
+            // homeserver files it under the target. `Room::relations`
+            // decrypts each one; one that stays encrypted is counted in
+            // `undecryptable`, never dropped silently (`reaction_rows`).
+            let target = parse_reactions(req)?;
+            let room = resolve_room(client, Some(required_room("reactions", req)?))?;
+            let mut events: Vec<Value> = Vec::new();
+            let mut from: Option<String> = None;
+            let mut unscanned = true;
+            while events.len() < MAX_REACTIONS_SCANNED {
+                let options = RelationsOptions {
+                    from: from.take(),
+                    dir: Direction::Forward,
+                    limit: Some(UInt::from(REACTIONS_PAGE)),
+                    include_relations: IncludeRelations::RelationsOfType(RelationType::Annotation),
+                    recurse: false,
+                };
+                let page = room
+                    .relations(target.event_id.clone(), options)
+                    .await
+                    .context("reading the event's reactions")?;
+                let fetched = page.chunk.len();
+                events.extend(page.chunk.iter().filter_map(|event| {
+                    serde_json::from_str::<Value>(event.raw().json().get()).ok()
+                }));
+                match page.next_batch_token {
+                    // An empty page with a token would loop; treat it as the end.
+                    Some(token) if fetched > 0 => from = Some(token),
+                    _ => {
+                        unscanned = false;
+                        break;
+                    }
+                }
+            }
+            let found = reaction_rows(
+                &events,
+                target.event_id.as_str(),
+                target.key.as_deref(),
+                target.limit,
+                unscanned,
+            );
+            Ok(json!({
+                "ok": true,
+                "room_id": room.room_id().as_str(),
+                "event_id": target.event_id.as_str(),
+                "reactions": found.rows,
+                "undecryptable": found.undecryptable,
+                "truncated": found.truncated,
+            }))
+        }
         "create_room" => {
             let name = req
                 .get("name")
@@ -1028,7 +1103,15 @@ async fn handle_op(
                 .filter_map(|event| serde_json::from_str::<Value>(event.raw().json().get()).ok())
                 .collect();
             let messages = read_messages(&events, &own, registry).await?;
-            Ok(json!({"ok": true, "room_id": room.room_id(), "messages": messages}))
+            // #252: events that stayed encrypted produce no row; say how
+            // many, so a caller that counts rows can tell "nothing was
+            // said" from "something was said I can't see".
+            Ok(json!({
+                "ok": true,
+                "room_id": room.room_id(),
+                "messages": messages,
+                "undecryptable": read_undecryptable(&events),
+            }))
         }
         "check" => {
             // Peek mode (no-advance) and `limit`, per the issue spec. Default
@@ -1179,6 +1262,31 @@ async fn read_messages(events: &[Value], own: &str, registry: &Registry) -> Resu
         messages.push(message);
     }
     Ok(messages)
+}
+
+/// How many of `read`'s timeline events stayed encrypted (#252). The
+/// SDK tries to decrypt every `m.room.encrypted` event in the batch; one it
+/// could not is still `m.room.encrypted`, matches no `m.room.message` filter,
+/// and would otherwise vanish from the reply without a trace. Two kinds are
+/// not counted, because neither could ever have been a row: a redacted event
+/// (`unsigned.redacted_because`; deleted, not hidden) and a reaction, whose
+/// `m.annotation` relation an encrypted room keeps in the clear.
+fn read_undecryptable(events: &[Value]) -> u64 {
+    let counted = events.iter().filter(|event| {
+        let encrypted = event.get("type").and_then(Value::as_str) == Some("m.room.encrypted");
+        let redacted = event
+            .get("unsigned")
+            .and_then(|u| u.get("redacted_because"))
+            .is_some();
+        let annotation = event
+            .get("content")
+            .and_then(|c| c.get("m.relates_to"))
+            .and_then(|r| r.get("rel_type"))
+            .and_then(Value::as_str)
+            == Some("m.annotation");
+        encrypted && !redacted && !annotation
+    });
+    counted.count() as u64
 }
 
 /// Resolve the thread a `send` to `room_id` belongs to: `(root,
@@ -1495,7 +1603,135 @@ fn parse_redact(req: &Value) -> Result<RedactRequest> {
     Ok(RedactRequest { event_id, reason })
 }
 
-/// The `event_id` of a `react`/`redact` request, parsed as a Matrix event id.
+/// A validated `reactions` request (#252).
+#[derive(Debug, PartialEq)]
+struct ReactionsRequest {
+    event_id: OwnedEventId,
+    /// Only reactions with exactly this key, when set.
+    key: Option<String>,
+    /// The most rows to return, already clamped to [`MAX_REACTIONS_LIMIT`].
+    limit: usize,
+}
+
+fn parse_reactions(req: &Value) -> Result<ReactionsRequest> {
+    let event_id = parse_event_id("reactions", req)?;
+    let key = match req.get("key") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(key)) => {
+            // The same rule `react` applies: a key no `react` could send is
+            // one no row can carry (`reaction_rows`), so refuse it up front.
+            validate_reaction_key(key)?;
+            Some(key.clone())
+        }
+        Some(_) => anyhow::bail!("reactions `key` must be a string"),
+    };
+    let limit = match req.get("limit") {
+        None | Some(Value::Null) => DEFAULT_REACTIONS_LIMIT,
+        Some(limit) => limit
+            .as_u64()
+            .context("reactions `limit` must be a non-negative integer")?
+            .min(MAX_REACTIONS_LIMIT),
+    };
+    Ok(ReactionsRequest {
+        event_id,
+        key,
+        limit: limit as usize,
+    })
+}
+
+/// What `reaction_rows` makes of a relations-API result.
+#[derive(Debug)]
+struct FoundReactions {
+    rows: Vec<Value>,
+    undecryptable: u64,
+    truncated: bool,
+}
+
+/// The `reactions` op's rows (#252), from the annotation events the relations
+/// API returned for `target` (decrypted where the daemon could). Split out of
+/// `handle_op` so it is testable without a homeserver.
+///
+/// - A redacted reaction (`unsigned.redacted_because`) is no reaction and is
+///   skipped, counted nowhere.
+/// - An event still `m.room.encrypted` after the decryption attempt is
+///   counted in `undecryptable`. Its key is unknown, so it is counted whether
+///   or not the request filtered on a `key`.
+/// - Otherwise a row needs an `m.reaction` whose `m.relates_to` is an
+///   `m.annotation` of `target` with a key `react` would accept (1–16 bytes,
+///   no control characters): this op is no side door for long text. A
+///   decrypted relation pointing anywhere else is not a reaction on `target`.
+/// - Rows are deduplicated by event id, sorted by `ts` then event id, and cut
+///   to `limit`. `truncated` says more rows exist than were returned, or that
+///   the scan stopped (`unscanned`) before the relations ran out.
+fn reaction_rows(
+    events: &[Value],
+    target: &str,
+    key: Option<&str>,
+    limit: usize,
+    unscanned: bool,
+) -> FoundReactions {
+    let mut seen = HashSet::new();
+    let mut rows: Vec<(u64, String, Value)> = Vec::new();
+    let mut undecryptable = 0u64;
+    for event in events {
+        let redacted = event
+            .get("unsigned")
+            .and_then(|u| u.get("redacted_because"))
+            .is_some();
+        if redacted {
+            continue;
+        }
+        let Some(event_id) = event.get("event_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !seen.insert(event_id) {
+            continue;
+        }
+        match event.get("type").and_then(Value::as_str) {
+            Some("m.room.encrypted") => {
+                undecryptable += 1;
+                continue;
+            }
+            Some("m.reaction") => {}
+            _ => continue,
+        }
+        let Some(relation) = event.get("content").and_then(|c| c.get("m.relates_to")) else {
+            continue;
+        };
+        let field = |name: &str| relation.get(name).and_then(Value::as_str);
+        if field("rel_type") != Some("m.annotation") || field("event_id") != Some(target) {
+            continue;
+        }
+        let Some(found_key) = field("key") else {
+            continue;
+        };
+        if validate_reaction_key(found_key).is_err() || key.is_some_and(|k| k != found_key) {
+            continue;
+        }
+        let (Some(sender), Some(ts)) = (
+            event.get("sender").and_then(Value::as_str),
+            event.get("origin_server_ts").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        rows.push((
+            ts,
+            event_id.to_owned(),
+            json!({"event_id": event_id, "sender": sender, "key": found_key, "ts": ts}),
+        ));
+    }
+    rows.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    let truncated = unscanned || rows.len() > limit;
+    rows.truncate(limit);
+    FoundReactions {
+        rows: rows.into_iter().map(|(_, _, row)| row).collect(),
+        undecryptable,
+        truncated,
+    }
+}
+
+/// The `event_id` of a `react`/`redact`/`reactions` request, parsed as a
+/// Matrix event id.
 fn parse_event_id(op: &str, req: &Value) -> Result<OwnedEventId> {
     let event_id = req
         .get("event_id")
@@ -1505,7 +1741,7 @@ fn parse_event_id(op: &str, req: &Value) -> Result<OwnedEventId> {
         .map_err(|_| anyhow::anyhow!("event_id {event_id:?} is not an event id"))
 }
 
-/// The `room` of a `react`/`redact` request. Mandatory, unlike `send`'s: an
+/// The `room` of a `react`/`redact`/`reactions` request. Mandatory, unlike `send`'s: an
 /// event id only means something inside its room, so `resolve_room`'s "the
 /// sole joined room" shorthand could only ever guess — and for `redact`, as
 /// for `leave`, a guess is a hazard.
@@ -3444,6 +3680,149 @@ mod tests {
         assert_eq!(reply["remaining"], 0);
     }
 
+    #[test]
+    fn read_undecryptable_counts_only_hidden_messages() {
+        let sealed = |id: &str| {
+            json!({"type": "m.room.encrypted", "event_id": id, "sender": "@a:example.org",
+                   "content": {"algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "x"}})
+        };
+        let mut sealed_reply = sealed("$reply");
+        sealed_reply["content"]["m.relates_to"] =
+            json!({"rel_type": "m.thread", "event_id": "$root"});
+        let mut sealed_reaction = sealed("$reaction");
+        sealed_reaction["content"]["m.relates_to"] =
+            json!({"rel_type": "m.annotation", "event_id": "$root"});
+        let mut redacted = sealed("$gone");
+        redacted["content"] = json!({});
+        redacted["unsigned"] = json!({"redacted_because": {"type": "m.room.redaction"}});
+        let events = [
+            message_event("$plain", json!({"msgtype": "m.text", "body": "hi"})),
+            sealed("$hidden"),
+            sealed_reply,
+            sealed_reaction,
+            redacted,
+            json!({"type": "m.room.member", "event_id": "$join", "state_key": "@a:example.org",
+                   "content": {"membership": "join"}}),
+        ];
+        assert_eq!(read_undecryptable(&events), 2);
+        assert_eq!(read_undecryptable(&events[..1]), 0);
+    }
+
+    // ---- reactions (#252) ----
+
+    #[test]
+    fn parse_reactions_defaults_and_clamps() {
+        let req =
+            parse_reactions(&json!({"op": "reactions", "room": "!r:x", "event_id": "$e"})).unwrap();
+        assert_eq!(req.event_id.as_str(), "$e");
+        assert_eq!((req.key, req.limit), (None, 50));
+        let req =
+            parse_reactions(&json!({"room": "!r:x", "event_id": "$e", "key": "🤖", "limit": 1000}))
+                .unwrap();
+        assert_eq!((req.key.as_deref(), req.limit), (Some("🤖"), 100));
+        let req = parse_reactions(&json!({"event_id": "$e", "key": null, "limit": 0})).unwrap();
+        assert_eq!((req.key, req.limit), (None, 0));
+    }
+
+    #[test]
+    fn parse_reactions_refuses_bad_fields() {
+        for (req, expected) in [
+            (json!({}), "reactions requires `event_id`"),
+            (json!({"event_id": "nope"}), "is not an event id"),
+            (
+                json!({"event_id": "$e", "limit": -1}),
+                "non-negative integer",
+            ),
+            (
+                json!({"event_id": "$e", "limit": 2.5}),
+                "non-negative integer",
+            ),
+            (json!({"event_id": "$e", "key": ["🤖"]}), "must be a string"),
+            (
+                json!({"event_id": "$e", "key": "a\n"}),
+                "control characters",
+            ),
+        ] {
+            let err = format!("{:#}", parse_reactions(&req).unwrap_err());
+            assert!(err.contains(expected), "{req}: {err}");
+        }
+    }
+
+    fn reaction(event_id: &str, target: &str, key: &str, ts: u64) -> Value {
+        json!({
+            "type": "m.reaction", "sender": "@a:example.org", "event_id": event_id,
+            "origin_server_ts": ts,
+            "content": {"m.relates_to": {"rel_type": "m.annotation", "event_id": target, "key": key}},
+        })
+    }
+
+    #[test]
+    fn reaction_rows_keeps_only_live_annotations_of_the_target() {
+        let mut redacted = reaction("$redacted", "$t", "🤖", 1);
+        redacted["unsigned"] = json!({"redacted_because": {}});
+        let mut not_annotation = reaction("$ref", "$t", "🤖", 1);
+        not_annotation["content"]["m.relates_to"]["rel_type"] = json!("m.reference");
+        let mut message = reaction("$msg", "$t", "🤖", 1);
+        message["type"] = json!("m.room.message");
+        message["content"]["body"] = json!("a message body");
+        let mut no_ts = reaction("$no-ts", "$t", "🤖", 1);
+        no_ts.as_object_mut().unwrap().remove("origin_server_ts");
+        let events = [
+            reaction("$late", "$t", "🤖", 30),
+            reaction("$b", "$t", "👍", 10),
+            reaction("$a", "$t", "🤖", 10),
+            reaction("$a", "$t", "🤖", 10),
+            reaction("$elsewhere", "$other", "🤖", 1),
+            reaction("$long", "$t", "a key far longer than sixteen bytes", 1),
+            redacted,
+            not_annotation,
+            message,
+            no_ts,
+            json!({"type": "m.room.encrypted", "event_id": "$sealed1", "content": {}}),
+            json!({"type": "m.room.encrypted", "event_id": "$sealed2", "content": {}}),
+            json!({"type": "m.room.encrypted", "event_id": "$sealed2", "content": {}}),
+        ];
+        let found = reaction_rows(&events, "$t", None, 50, false);
+        let ids: Vec<&str> = found
+            .rows
+            .iter()
+            .map(|r| r["event_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["$a", "$b", "$late"]);
+        assert_eq!(
+            found.rows[0],
+            json!({"event_id": "$a", "sender": "@a:example.org", "key": "🤖", "ts": 10})
+        );
+        assert_eq!(found.undecryptable, 2);
+        assert!(!found.truncated);
+        assert!(!serde_json::to_string(&found.rows).unwrap().contains("body"));
+    }
+
+    #[test]
+    fn reaction_rows_filters_by_key_and_truncates() {
+        let events = [
+            reaction("$c", "$t", "🤖", 3),
+            reaction("$x", "$t", "👍", 1),
+            reaction("$b", "$t", "🤖", 2),
+            reaction("$a", "$t", "🤖", 2),
+        ];
+        let found = reaction_rows(&events, "$t", Some("🤖"), 2, false);
+        let ids: Vec<&str> = found
+            .rows
+            .iter()
+            .map(|r| r["event_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["$a", "$b"]);
+        assert!(found.truncated);
+        let all = reaction_rows(&events, "$t", Some("🤖"), 3, false);
+        assert_eq!((all.rows.len(), all.truncated), (3, false));
+        // A scan that stopped before the relations ran out is truncated even
+        // when every row it found fits.
+        assert!(reaction_rows(&events, "$t", Some("🤖"), 3, true).truncated);
+        let none = reaction_rows(&events, "$t", Some("🤖"), 0, false);
+        assert!(none.rows.is_empty() && none.truncated);
+    }
+
     // ---- send_image payload parsing ----
 
     fn png_b64() -> String {
@@ -3751,6 +4130,7 @@ mod tests {
                 .map(|v| v.as_str().unwrap())
                 .collect();
             assert!(ops.contains(&"react") && ops.contains(&"redact"), "{ops:?}");
+            assert!(ops.contains(&"reactions"), "{ops:?}");
             assert!(ops.contains(&"send"), "{ops:?}");
         }
     }
@@ -3833,6 +4213,64 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reactions_requires_hello_first() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "reactions", "room": "!r:x", "event_id": "$e"}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["error"], "hello first");
+    }
+
+    #[tokio::test]
+    async fn reactions_validates_before_resolving_the_room() {
+        let (mut write, mut read, _registry) = spawn_conn(vec!["writer_agent".to_owned()]).await;
+        send(
+            &mut write,
+            json!({"op": "hello", "persona": "writer_agent"}),
+        )
+        .await;
+        recv(&mut read).await;
+        for (req, expected) in [
+            (
+                json!({"op": "reactions", "room": "!nope:x"}),
+                "reactions requires `event_id`",
+            ),
+            (
+                json!({"op": "reactions", "event_id": "$e"}),
+                "`room` required for `reactions`",
+            ),
+            (
+                json!({"op": "reactions", "room": "!nope:x", "event_id": "$e", "limit": "5"}),
+                "`limit` must be a non-negative integer",
+            ),
+            (
+                json!({"op": "reactions", "room": "!nope:x", "event_id": "$e", "key": 1}),
+                "`key` must be a string",
+            ),
+            (
+                json!({"op": "reactions", "room": "!nope:x", "event_id": "$e", "key": ""}),
+                "must not be empty",
+            ),
+            (
+                json!({"op": "reactions", "room": "!nope:x", "event_id": "$e"}),
+                "no joined room matching",
+            ),
+        ] {
+            send(&mut write, req.clone()).await;
+            let reply = recv(&mut read).await;
+            assert_eq!(reply["ok"], false, "{req}");
+            assert!(
+                reply["error"].as_str().unwrap().contains(expected),
+                "{req}: {reply}"
+            );
+        }
+    }
+
     /// A minimal stand-in for a homeserver: plain HTTP/1.1 on a loopback
     /// port (this is the daemon's *outbound* Matrix client talking to its
     /// homeserver — the agent socket stays AF_UNIX, D8), one request per
@@ -3849,6 +4287,8 @@ mod tests {
         method: String,
         /// Percent-decoded, without the query string.
         path: String,
+        /// The raw query string, without the `?`.
+        query: String,
         body: Value,
     }
 
@@ -3887,6 +4327,78 @@ mod tests {
     }
     const FAKE_REACTION_ID: &str = "$new-reaction";
 
+    /// The room's recent history as `/messages` returns it, newest first
+    /// (#252): one readable message, and one nobody shared the key for.
+    fn fake_messages() -> Value {
+        json!({
+            "start": "t2", "end": "t0",
+            "chunk": [
+                {
+                    "type": "m.room.encrypted", "room_id": FAKE_ROOM,
+                    "sender": "@frank:example.org", "event_id": "$sealed-message",
+                    "origin_server_ts": 6,
+                    "content": {
+                        "algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "AwgAEhAAAAAAAAAAAA",
+                        "session_id": "unknown-session", "sender_key": "unknown-key",
+                        "device_id": "FRANKDEVICE",
+                    },
+                },
+                {
+                    "type": "m.room.message", "room_id": FAKE_ROOM,
+                    "sender": "@alice:example.org", "event_id": FAKE_OTHER_EVENT,
+                    "origin_server_ts": 5, "content": {"msgtype": "m.text", "body": "hi"},
+                },
+            ],
+        })
+    }
+
+    /// An annotation of `FAKE_OTHER_EVENT` as the relations API returns it.
+    fn annotation(event_id: &str, sender: &str, key: &str, ts: u64) -> Value {
+        json!({
+            "type": "m.reaction", "room_id": FAKE_ROOM, "sender": sender,
+            "event_id": event_id, "origin_server_ts": ts,
+            "content": {"m.relates_to": {
+                "rel_type": "m.annotation", "event_id": FAKE_OTHER_EVENT, "key": key,
+            }},
+        })
+    }
+
+    /// The relations API's two pages of annotations on `FAKE_OTHER_EVENT`
+    /// (#252): the first holds plain reactions, a redacted one and an encrypted
+    /// one nobody shared the key for; the second, behind `from=page2`, holds
+    /// one more reaction and a repeat of one from the first page.
+    fn fake_annotations(query: &str) -> Value {
+        if query.split('&').any(|kv| kv == "from=page2") {
+            return json!({"chunk": [
+                annotation("$dave-claim", "@dave:example.org", "🤖", 10),
+                annotation("$alice-claim", "@alice:example.org", "🤖", 20),
+            ]});
+        }
+        let mut redacted = annotation("$gone", "@erin:example.org", "🤖", 5);
+        redacted["content"] = json!({});
+        redacted["unsigned"] = json!({"redacted_because": {"type": "m.room.redaction"}});
+        let encrypted = json!({
+            "type": "m.room.encrypted", "room_id": FAKE_ROOM, "sender": "@frank:example.org",
+            "event_id": "$sealed", "origin_server_ts": 1,
+            "content": {
+                "algorithm": "m.megolm.v1.aes-sha2", "ciphertext": "AwgAEhAAAAAAAAAAAA",
+                "session_id": "unknown-session", "sender_key": "unknown-key",
+                "device_id": "FRANKDEVICE",
+                "m.relates_to": {"rel_type": "m.annotation", "event_id": FAKE_OTHER_EVENT},
+            },
+        });
+        json!({
+            "chunk": [
+                annotation("$alice-claim", "@alice:example.org", "🤖", 20),
+                annotation("$bob-claim", "@bob:example.org", "🤖", 10),
+                annotation("$carol-ack", "@carol:example.org", "👍", 15),
+                redacted,
+                encrypted,
+            ],
+            "next_batch": "page2",
+        })
+    }
+
     fn percent_decode(s: &str) -> String {
         let bytes = s.as_bytes();
         let mut out = Vec::with_capacity(bytes.len());
@@ -3905,10 +4417,14 @@ mod tests {
         String::from_utf8(out).expect("utf-8 path")
     }
 
-    fn fake_route(method: &str, path: &str) -> (u16, Value) {
+    fn fake_route(method: &str, path: &str, query: &str) -> (u16, Value) {
         let not_found = json!({"errcode": "M_NOT_FOUND", "error": "not found"});
         let room_prefix = format!("/_matrix/client/v3/rooms/{FAKE_ROOM}/");
+        let relations = format!(
+            "/_matrix/client/v1/rooms/{FAKE_ROOM}/relations/{FAKE_OTHER_EVENT}/m.annotation"
+        );
         match (method, path) {
+            ("GET", p) if p == relations => (200, fake_annotations(query)),
             ("GET", "/_matrix/client/versions") => (
                 200,
                 json!({"versions": ["v1.1", "v1.11"], "unstable_features": {}}),
@@ -3947,6 +4463,8 @@ mod tests {
                     (200, json!({"event_id": FAKE_REACTION_ID}))
                 } else if m == "PUT" && rest.starts_with("redact/") {
                     (200, json!({"event_id": "$redaction"}))
+                } else if m == "GET" && rest == "messages" {
+                    (200, fake_messages())
                 } else if m == "GET" && rest.starts_with("event/") {
                     match fake_event(&rest["event/".len()..]) {
                         Some(event) => (200, event),
@@ -3996,7 +4514,9 @@ mod tests {
             let mut parts = request_line.split_whitespace();
             let method = parts.next().unwrap_or("").to_owned();
             let target = parts.next().unwrap_or("");
-            let path = percent_decode(target.split('?').next().unwrap_or(""));
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let path = percent_decode(path);
+            let query = query.to_owned();
             let mut content_length = 0usize;
             loop {
                 let mut header = String::new();
@@ -4014,8 +4534,13 @@ mod tests {
             let mut body = vec![0; content_length];
             stream.read_exact(&mut body).await?;
             let body = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let (status, reply) = fake_route(&method, &path);
-            log.lock().unwrap().push(FakeRequest { method, path, body });
+            let (status, reply) = fake_route(&method, &path, &query);
+            log.lock().unwrap().push(FakeRequest {
+                method,
+                path,
+                query,
+                body,
+            });
             let reply = reply.to_string();
             let response = format!(
                 "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
@@ -4241,6 +4766,78 @@ mod tests {
             );
         }
         assert!(hs.requests_matching("PUT", "/").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reactions_reads_every_page_of_the_relations_api() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(
+            &mut write,
+            json!({"op": "reactions", "id": 9, "room": FAKE_ROOM, "event_id": FAKE_OTHER_EVENT}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(
+            reply,
+            json!({
+                "ok": true, "id": 9, "room_id": FAKE_ROOM, "event_id": FAKE_OTHER_EVENT,
+                "reactions": [
+                    {"event_id": "$bob-claim", "sender": "@bob:example.org", "key": "🤖", "ts": 10},
+                    {"event_id": "$dave-claim", "sender": "@dave:example.org", "key": "🤖", "ts": 10},
+                    {"event_id": "$carol-ack", "sender": "@carol:example.org", "key": "👍", "ts": 15},
+                    {"event_id": "$alice-claim", "sender": "@alice:example.org", "key": "🤖", "ts": 20},
+                ],
+                "undecryptable": 1,
+                "truncated": false,
+            })
+        );
+        // Live from the relations API, annotations only, oldest first, both
+        // pages; and the target event itself is never fetched.
+        let pages = hs.requests_matching("GET", "/relations/");
+        assert_eq!(pages.len(), 2, "{pages:?}");
+        for page in &pages {
+            assert!(page.path.ends_with("/m.annotation"), "{page:?}");
+            assert!(page.query.split('&').any(|kv| kv == "dir=f"), "{page:?}");
+        }
+        assert!(pages[1].query.split('&').any(|kv| kv == "from=page2"));
+        assert!(hs.requests_matching("GET", "/event/").is_empty());
+    }
+
+    #[tokio::test]
+    async fn reactions_filters_by_key_and_reports_truncation() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(
+            &mut write,
+            json!({"op": "reactions", "room": FAKE_ROOM, "event_id": FAKE_OTHER_EVENT, "key": "🤖", "limit": 2}),
+        )
+        .await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        let ids: Vec<&str> = reply["reactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["event_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["$bob-claim", "$dave-claim"]);
+        assert_eq!(reply["truncated"], true);
+        // The sealed annotation's key is unknown, so it counts under a filter too.
+        assert_eq!(reply["undecryptable"], 1);
+    }
+
+    #[tokio::test]
+    async fn read_reports_the_messages_it_could_not_decrypt() {
+        let hs = FakeHomeserver::start().await;
+        let (mut write, mut read) = spawn_live_conn(&hs).await;
+        send(&mut write, json!({"op": "read", "room": FAKE_ROOM})).await;
+        let reply = recv(&mut read).await;
+        assert_eq!(reply["ok"], true, "{reply}");
+        let rows = reply["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{reply}");
+        assert_eq!(rows[0]["event_id"], FAKE_OTHER_EVENT);
+        assert_eq!(reply["undecryptable"], 1, "{reply}");
     }
 
     #[tokio::test]

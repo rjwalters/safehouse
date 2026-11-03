@@ -478,11 +478,37 @@ room. And every persona shares that one account, so the daemon's "own" messages 
 personas' messages. A target the daemon can't decrypt is refused too, because its real type can't be
 checked.
 
+**Reading reactions back: `reactions` (#252).** The read-only companion to `react`: who has reacted
+to an event, and with what. A client that claims a message by reacting to it uses this to see
+whether someone else claimed it first. Gated like `read` and `members` (`hello` first), with the
+same mandatory `room` as `react`. Probe `"reactions" in ops` before relying on it.
+
+```jsonc
+// `key` (optional) keeps only reactions with that key; `limit` (optional)
+// defaults to 50 and is capped at 100.
+{"op": "reactions", "room": "!room:example.org", "event_id": "$target", "key": "🤖", "limit": 50}
+{"ok": true, "room_id": "!room:example.org", "event_id": "$target",
+ "reactions": [{"event_id": "$a-reaction", "sender": "@alice:example.org", "key": "🤖", "ts": 1767225600000}],
+ "undecryptable": 0, "truncated": false}
+```
+
+It reads live from the homeserver's relations API, not the sync cache. Rows are sorted by `ts`
+(`origin_server_ts`, ms) then `event_id`, and carry no message body. Redacted reactions are left
+out. In an encrypted room each reaction is decrypted; one the daemon can't decrypt is counted in
+`undecryptable` (whatever its key, since the key is encrypted too) rather than dropped. `truncated`
+is `true` when more matching reactions exist than were returned. The full rules are in
+[envelope-v1 §7c](docs/protocol/envelope-v1.md#7c-reading-reactions--the-reactions-op).
+
 As with every op, a request `id` is echoed back on the reply, and any failure (bad key, unknown
 room, unknown event) is `{"ok": false, "error": "<reason>"}`.
 
 Run `safehouse-mcp --help` for the full flag list. With no subcommand (or on a bare TTY), the
 binary keeps its original behavior unchanged: a stdio MCP server for an MCP client to launch.
+
+**Messages `read` can't decrypt (#252):** the `read` reply carries `undecryptable`, a count of
+events in the batch the daemon could not decrypt and so returned no row for (redacted events and
+reactions aside). A daemon older than the field omits it; treat that as unknown, not zero. See
+[envelope-v1 §7a](docs/protocol/envelope-v1.md#7a-matrix--daemon-observed-matrix-metadata-on-check-results).
 
 **The read-vs-check cursor trap:** `read` is *stateless* — it replays recent room history and
 never touches any persona's mailbox. `check` is *stateful* — it's a specific persona's durable,

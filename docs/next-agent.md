@@ -85,7 +85,8 @@ allowlist, enforced in the daemon), `send` (daemon stamps `from`, renders envelo
 `create_room`, `add_to_space`, `list_rooms`, `read`, `check`, `invite` (#39), `leave` (#201), `react`/`redact`
 (#220: an `m.annotation` reaction as the daemon's account, and redaction of the daemon's *own reactions*
 only: an `m.reaction`, no `state_key`, own sender, else `not_own_reaction`. Never state, never messages,
-since all personas share the account. `hello`/`status` advertise every op as `ops`), `send_image` (an inline
+since all personas share the account. `hello`/`status` advertise every op as `ops`), `reactions` (#252: an
+event's reactions read back live from the relations API, decrypted, with an `undecryptable` count), `send_image` (an inline
 base64 PNG/JPEG/WebP/GIF, at most 10 MiB, as an `m.image`, optionally a reply to an event; the caption
 always carries `send`'s `<from> → <to> · image` header, D4's attribution), plus inbound push lines. **`safehouse-mcp`**
 (workspace member) is the keyless stdio MCP shim over it — tools `safehouse_send` /
