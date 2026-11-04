@@ -104,7 +104,7 @@ crypto-store/
 .loom/gh-config-by-owner/
 .loom/gh-config-by-owner.*/
 .loom/gh-config-by-owner-*/
-.loom-local/
+/.loom-local/
 # <<< loom-managed <<<
 
 # repo:handoff session notes (one-shot, never committed)
