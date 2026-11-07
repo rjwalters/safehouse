@@ -3,6 +3,11 @@
 Chronological record of merged PRs and closed issues, maintained by the Guide
 triage agent. Newest first.
 
+### 2026-10-08
+
+- **PR #221**: safehoused: react and redact (own events) ops
+- **Issue #220** (closed): safehoused: react and redact (own events) ops
+
 ### 2026-10-03
 
 - **PR #217**: docs: new-thread voice notes cannot address a persona (#206)
