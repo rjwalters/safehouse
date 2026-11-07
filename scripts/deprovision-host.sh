@@ -4,7 +4,7 @@
 # admin-room automation (issue #94's teardown counterpart to
 # provision-host.sh).
 #
-# Sends `users deactivate <bot>` as the `@safehouse-admin` server-admin bot
+# Sends `!admin users deactivate <bot>` as the `@safehouse-admin` server-admin bot
 # into the Matrix admin room, so ephemeral/decommissioned hosts do not leave
 # a dead account behind. Tuwunel mirrors Synapse's admin-API deactivate
 # semantics, which force-leave every room the account was a member of as

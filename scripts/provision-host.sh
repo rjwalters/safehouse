@@ -4,10 +4,10 @@
 # admin-room automation (issue #94).
 #
 # Mints a new bot account for a fleet host with NO human action on the
-# homeserver: it sends `users create_user <bot> <generated-password>` as
+# homeserver: it sends `!admin users create_user <bot> <generated-password>` as
 # the `@safehouse-admin` server-admin bot into the Matrix admin room (the
 # zero-downtime "run it in the admin room" path documented in
-# docs/research/2026-07-26-homeserver.md), waits best-effort for an ack,
+# docs/research/2026-07-26-homeserver.md), requires an ack,
 # then (if an already-onboarded host's daemon socket is available) sends
 # the existing `invite` op so the new bot's daemon auto-joins the fleet
 # room on its next sync.
