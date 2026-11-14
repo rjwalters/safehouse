@@ -165,8 +165,8 @@ the same secret-storage-based self-signing approach.
 
 **Consequences that are now v0-mandatory, not v1 niceties:**
 - `EncryptionSettings` defaults are **all off**. `auto_enable_cross_signing` and
-  `auto_enable_backups` must be set explicitly, or the daemon works today and gets excluded when
-  Element's rollout lands (~Oct 2026).
+  `auto_enable_backups` must be set explicitly, or the daemon would have been excluded when
+  Element's rollout landed (~Oct 2026; now cleared — see `open-questions.md`).
 - The **recovery passphrase is required config, not `Option`**. It is the *only* headless path back
   after a crypto-store loss: `bootstrap_cross_signing_if_needed` no-ops once a server-side identity
   exists, so without the passphrase a replacement device is permanently unsigned.
