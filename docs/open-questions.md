@@ -139,5 +139,5 @@ Synapse-only (tuwunel shipped MSC3202/4203 in July 2026 — D5 still stands, on 
 the "64–256 MB RAM" target was wrong (**budget 2–4 GB**, clamp cache modifiers). Also produced **D13:
 the daemon uses sync v2, not sliding sync.**
 
-**Deadline to keep in view:** Element's "exclude insecure devices" rollout lands ~**Oct 2026**. A
-daemon without cross-signing bootstrap silently stops working then. That's why D10 is v0, not v1.
+**Deadline (cleared):** Element's "exclude insecure devices" rollout was due ~**Oct 2026** and is now **cleared** (README Status: Element X shows no reduced-trust indicator for the self-signed daemon device, verified on a real phone). A
+daemon would have silently stopped working then. That's why D10 is v0, not v1.
