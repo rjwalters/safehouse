@@ -1,0 +1,8 @@
+# RustSec advisory policy for scripts/check-advisories.sh (issue #261).
+#
+# Every ignored advisory MUST carry a one-line `# reason` comment directly above it, e.g.
+#   # RUSTSEC-0000-0000: not reachable, we never call the affected API; revisit when X releases a fix
+#   "RUSTSEC-0000-0000",
+# An empty list is the expected state.
+[advisories]
+ignore = []
