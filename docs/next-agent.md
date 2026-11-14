@@ -24,7 +24,7 @@ worker again.
 
 ## Decisions already made (don't relitigate without reason)
 
-See `decisions.md` for all seventeen with rationale. The load-bearing ones:
+See `decisions.md` for all nineteen (D1–D19) with rationale. The load-bearing ones:
 
 - **Matrix, not a hand-rolled Signal clone.** Never hand-write crypto — vodozemac via
   matrix-rust-sdk. (D3)
@@ -46,7 +46,7 @@ See `decisions.md` for all seventeen with rationale. The load-bearing ones:
 2. **The recovery passphrase is required config, not `Option`.** It is the only headless path back
    after a crypto-store loss — bootstrap no-ops once a server-side identity exists. Default
    `recovery_reset_allowed: false`; the reset path orphans every room key in backup.
-3. **Pin `matrix-sdk` ≥ 0.18.0.** CVE-2026-45056 (to-device sender-binding, fixed 0.16.1) is directly
+3. **Pin `matrix-sdk` ≥ 0.19 (the workspace `Cargo.toml` requires `0.19`).** CVE-2026-45056 (to-device sender-binding, fixed 0.16.1) is directly
    in our threat model.
 4. **Store passphrase and database directory are coupled.** Persist together, atomically. If the
    session blob is missing but the SQLite store exists, the store is undecryptable — purge and
@@ -91,7 +91,7 @@ base64 PNG/JPEG/WebP/GIF, at most 10 MiB, as an `m.image`, optionally a reply to
 always carries `send`'s `<from> → <to> · image` header, D4's attribution), plus inbound push lines. **`safehouse-mcp`**
 (workspace member) is the keyless stdio MCP shim over it — tools `safehouse_send` /
 `safehouse_create_room` / `safehouse_add_to_space` / `safehouse_list_rooms` / `safehouse_read` /
-`safehouse_check` —
+`safehouse_check` — plus the CLI subcommands `read` / `send` / `check` / `list-rooms` / `status` / `invite` / `leave` / `members` (`build_cli_op` in `safehouse-mcp/src/main.rs`) —
 pulled forward from the v1 plan. Verified live end-to-end: MCP tool call → socket → encrypted room
 → phone, allowlist rejection included. Envelope §7's loop-back rule was refined during
 implementation (own events dispatch to non-author personas; see the note in
@@ -216,7 +216,7 @@ subprocess only** — the audio arrived E2E encrypted and a hosted API would und
 `command[0]` must be an absolute local path and the module opens no socket of its own. Bounded by
 `max_bytes`, `max_seconds`, `timeout_seconds`, and a daemon-wide single-flight slot — with two
 caveats: `max_bytes`'s pre-download check relies on sender-controlled `info.size` (omit/understate
-it and the real memory bound is the homeserver's upload limit, as matrix-sdk 0.18 can't stream or
+it and the real memory bound is the homeserver's upload limit, as matrix-sdk (last verified on 0.18; not re-checked on 0.19) can't stream or
 cap downloads), and transcription is awaited inline in `on_message`, so it stalls the sync loop
 (no event in any room is processed) for up to ~3x `timeout_seconds` (download, slot wait,
 subprocess are sequential); the slot is contended only by the #231 backfill, which yields to live notes. Every failure falls back to the file name plus a visible reason. Optional
