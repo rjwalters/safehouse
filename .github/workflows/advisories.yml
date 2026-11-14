@@ -13,9 +13,13 @@ on:
     branches: [main]
     paths: ["Cargo.lock", "Cargo.toml", "**/Cargo.toml", ".cargo/audit.toml", "scripts/check-advisories.sh", ".github/workflows/advisories.yml"]
 
+permissions:
+  contents: read
+
 concurrency:
-  group: advisories-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # No cancel-in-progress: on main the weekly cron shares github.ref with pushes, and the scheduled
+  # run is the one that catches newly published upstream advisories.
+  group: advisories-${{ github.ref }}-${{ github.event_name }}
 
 jobs:
   advisories:
