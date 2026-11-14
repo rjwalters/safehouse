@@ -525,6 +525,35 @@ comment in [`safehoused/example-config.toml`](safehoused/example-config.toml)); 
 allowlist entry, not special-cased by the daemon, but it keeps operator traffic out of any real
 agent's identity and mailbox.
 
+### Socket ops
+
+Every op the daemon answers, one row per entry in `OPS` (`safehoused/src/rpc.rs`). A test
+(`readme_lists_every_advertised_op`) fails if this table and `OPS` disagree, naming the op. Fields are
+taken from the request parsers in `rpc.rs`. Every op takes an optional `id`, echoed on the reply.
+**`hello`** column: `yes` means the connection must have sent `hello` first (otherwise the reply is
+`hello first`); `status` alone does not need it. `room` is an id, name or alias of a joined room;
+where it is optional, omitting it picks the sole joined room, and where it is marked required that
+shorthand is refused.
+
+| Op | Required fields | Optional fields | `hello` | CLI | Documented in |
+|----|-----------------|-----------------|---------|-----|---------------|
+| `hello` | `persona` | | n/a (it is the handshake) | | [Scripting the socket](#scripting-the-socket), [which ops a daemon answers](#scripting-the-socket) (#220) |
+| `status` | | | no | `status` | [Diagnosing "healthy and idle"](#scripting-the-socket) (#85), `rooms` (#222) |
+| `send` | `to`, `body` | `room`, `type`, `task_id`, `wake`, `meta` (only for `completion`), `thread_root` | yes | `send` | [envelope-v1 §7](docs/protocol/envelope-v1.md) |
+| `send_image` | `image_base64`, `content_type` | `room`, `filename`, `caption`, `to`, `width`, `height`, `reply_to` | yes | | [Status](#status) |
+| `fetch_media` | `event_id` | `room` | yes | | [Status](#status) |
+| `react` | `room` (required), `event_id`, `key` | | yes | | Reactions: `react` and `redact` (#220) |
+| `redact` | `room` (required), `event_id` | `reason` | yes | | Reactions: `react` and `redact` (#220) |
+| `reactions` | `room` (required), `event_id` | `key`, `limit` | yes | | [envelope-v1 §7c](docs/protocol/envelope-v1.md#7c-reading-reactions--the-reactions-op) (#252) |
+| `create_room` | `name` | `space`, `parent`, `invite` | yes | | [Status](#status) |
+| `invite` | `user` | `room` | yes | `invite` | [Unattended host onboarding](#unattended-host-onboarding-issue-94) (#39) |
+| `leave` | `room` (required) | `reason` | yes | `leave` | #201 |
+| `add_to_space` | `space`, `room` | | yes | | [Status](#status) |
+| `list_rooms` | | | yes | `list-rooms` | [Scripting the socket](#scripting-the-socket) |
+| `members` | | `room` | yes | `members` | #250 |
+| `read` | | `room`, `limit` | yes | `read` | [The read-vs-check cursor trap](#scripting-the-socket), #252 |
+| `check` | | `peek`, `limit` | yes | `check` | [The read-vs-check cursor trap](#scripting-the-socket) |
+
 ### Shim-side guards
 
 Three guards live in `safehouse-mcp` itself (`safehouse-mcp/src/guard.rs`, #181), because the shim —

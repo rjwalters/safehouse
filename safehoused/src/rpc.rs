@@ -4856,6 +4856,40 @@ mod tests {
         }
     }
 
+    /// The README's "Socket ops" table has one row per entry in `OPS`, and no
+    /// others (#255). A row's first cell is the backticked op name.
+    #[test]
+    fn readme_lists_every_advertised_op() {
+        let readme = include_str!("../../README.md");
+        let mut in_section = false;
+        let mut rows: Vec<&str> = Vec::new();
+        for line in readme.lines() {
+            if line.starts_with('#') {
+                in_section = line.trim_end() == "### Socket ops";
+                continue;
+            }
+            if !in_section {
+                continue;
+            }
+            let Some(rest) = line.strip_prefix("| `") else {
+                continue;
+            };
+            if let Some((op, _)) = rest.split_once("` |") {
+                rows.push(op);
+            }
+        }
+        let missing: Vec<&str> = OPS.iter().copied().filter(|o| !rows.contains(o)).collect();
+        let extra: Vec<&str> = rows.iter().copied().filter(|r| !OPS.contains(r)).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "README `### Socket ops` table out of step with OPS: missing rows for {missing:?}, rows not in OPS: {extra:?}"
+        );
+        let mut seen = rows.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), rows.len(), "duplicate op rows: {rows:?}");
+    }
+
     // --- #231: voice-note transcripts in `read` ----------------------------
 
     /// A registry whose `read` sees a transcript store and a transcriber that
