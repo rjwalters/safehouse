@@ -103,9 +103,19 @@ online anyway?
 Largely dissolved by Q-G: the daemon accumulates Megolm keys, stays online, and — with
 `BackupDownloadStrategy::OneShot` plus a recovery passphrase — recovers all room keys after a store
 loss. Two landmines to watch during Q-J:
-- **matrix-rust-sdk#5018**, "Megolm session retrieved from backup incorrectly marked as insecure" —
-  an open blocker on Element's exclusion rollout that would hit a daemon restoring history from
-  backup, right in the Oct 2026 window. **Track it.**
+- **matrix-rust-sdk#5018**, "Megolm session retrieved from backup incorrectly marked as insecure"
+  (<https://github.com/matrix-org/matrix-rust-sdk/issues/5018>). **Outcome, checked 2026-11-14:
+  still open** (opened 2025-05-09), with no linked branch or PR and no fixing release. So the fix is
+  **not** included in the `matrix-sdk` `0.19.1` pinned in `Cargo.lock`, and the bug stays open here;
+  re-check when upgrading `matrix-sdk`. Upstream symptom: a session restored from backup is first
+  labelled as from an unknown device with `legacy_session: true`; after a `keys/query` update for the
+  sender it flips to `legacy_session: false`, and with "hide messages from insecure devices" enabled
+  the message is then hidden. **What to look for in the daemon** (inferred from that report, not
+  observed): after a store-loss recovery (`BackupDownloadStrategy::OneShot` plus the recovery
+  passphrase), old messages decrypt at first but their `EncryptionInfo`/shield state degrades to
+  unverified-sender or insecure once the sender's device keys are fetched, and a strict
+  insecure-device filter would drop them. A live store-wipe check (Q-J) should compare shield state
+  before and after the first `keys/query`.
 - The session-file/database consistency invariant: if the session blob is missing but the SQLite
   store exists, the store is undecryptable — purge and cold-start. A half-written state here is the
   most likely way to brick the daemon.
