@@ -41,8 +41,8 @@ See `decisions.md` for all seventeen with rationale. The load-bearing ones:
 
 1. **`EncryptionSettings` defaults are all wrong for us.** `auto_enable_cross_signing: true`,
    `auto_enable_backups: true`, `backup_download_strategy: OneShot` must be set explicitly. A daemon
-   missing these works today and **silently stops working ~Oct 2026** when Element's "exclude
-   insecure devices" rollout lands.
+   missing these would have **silently stopped working** when Element's "exclude insecure devices"
+   rollout landed (~Oct 2026; now cleared — see `open-questions.md`).
 2. **The recovery passphrase is required config, not `Option`.** It is the only headless path back
    after a crypto-store loss — bootstrap no-ops once a server-side identity exists. Default
    `recovery_reset_allowed: false`; the reset path orphans every room key in backup.
