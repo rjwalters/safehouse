@@ -65,7 +65,8 @@ flowchart LR
 
 See [`docs/design.md`](docs/design.md) for the full design, [`docs/decisions.md`](docs/decisions.md)
 for the choices and why, and [`docs/open-questions.md`](docs/open-questions.md) for the question log
-(all answered and live-verified as of 2026-07-26).
+(all answered and live-verified as of 2026-07-26). What comes next is in
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Status
 
