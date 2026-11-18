@@ -256,7 +256,10 @@ same class of invisible-until-it-bites-you problem, just for the binary instead 
    `{"op": "members", "room": "<id|name|alias>"}`, or from a shell
    `safehouse-mcp members --room <id|name|alias>` — and the reply lists the room's **joined and
    invited** members, each as `{"user_id", "membership": "join"|"invite", "display_name"}`, sorted
-   by `user_id`. Left, banned and knocked members are not listed. It is served from the state the
+   by `user_id`. The shim marks `display_name` — the member sets it themselves — the same way it
+   marks room names (see "Shim-side guards" §1): it comes back as `display_name_untrusted` (raw)
+   and `display_name_display` (flattened, capped), with a scoped `untrusted_fields` notice; decide
+   trust from `user_id`. Left, banned and knocked members are not listed. It is served from the state the
    sync already holds (no extra homeserver call), resolves `room` like `read` does (the sole joined
    room when `room` is omitted), and is gated by the same persona `hello`. A bot that treats room
    membership as its trust boundary compares this list against its allowlist before it acts.
@@ -547,7 +550,9 @@ describing its own state and are deliberately left unfenced. `list-rooms` is unf
 that each room's name is the remote-authored `m.room.name` (#185): the shim replaces `name` with
 `name_untrusted` (the raw value, for matching) and `name_display` (flattened to one line with
 control/bidi characters removed and capped at 64 characters), and adds a scoped `untrusted_fields`
-notice — marking the one untrusted field rather than fencing four trustworthy ones.
+notice — marking the one untrusted field rather than fencing four trustworthy ones. `members`
+replies get the same treatment for `display_name`, which the member chooses (#254): it becomes
+`display_name_untrusted` and `display_name_display`, with its own scoped notice.
 
 **2. A credential-shaped body is refused before the socket is opened.** `send` scans the outgoing
 body for PEM private-key blocks, AWS access key ids, known vendor token prefixes (GitHub, GitLab,
