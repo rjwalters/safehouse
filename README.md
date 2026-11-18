@@ -125,6 +125,14 @@ covers the direct `rusqlite` dependency used by the mailbox store, D17), so the 
 requirement is a C toolchain: `sudo apt install build-essential`. (macOS ships one via Xcode Command
 Line Tools.) No `libsqlite3-dev` or other system sqlite package is needed.
 
+**Dependency advisories.** `scripts/check-advisories.sh` checks `Cargo.lock` against the
+[RustSec](https://rustsec.org) advisory database and exits non-zero on a vulnerability (or if
+`cargo-audit` is missing or the database can't be fetched). Install the tool once with
+`cargo install cargo-audit --locked`, then run `scripts/check-advisories.sh` from anywhere in the
+checkout. Intentionally ignored advisories go in [`.cargo/audit.toml`](.cargo/audit.toml), one
+`# reason` line each. CI runs it as its own workflow (`advisories.yml`: weekly, on demand, and when
+`Cargo.lock`/`Cargo.toml` change), separate from the build job.
+
 **Fastest path (recommended): the one-command installer.** On a host that has `git`, `cargo`, and a
 reachable homeserver, from a checkout of this repo:
 

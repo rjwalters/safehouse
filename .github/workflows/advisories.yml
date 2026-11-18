@@ -1,0 +1,43 @@
+name: Advisories
+
+# Separate from ci.yml on purpose: a newly published RustSec advisory must not turn an unrelated
+# PR's build job red. Runs weekly, on demand, and when the dependency graph changes.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["Cargo.lock", "Cargo.toml", "**/Cargo.toml", ".cargo/audit.toml", "scripts/check-advisories.sh", ".github/workflows/advisories.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["Cargo.lock", "Cargo.toml", "**/Cargo.toml", ".cargo/audit.toml", "scripts/check-advisories.sh", ".github/workflows/advisories.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  # No cancel-in-progress: on main the weekly cron shares github.ref with pushes, and the scheduled
+  # run is the one that catches newly published upstream advisories.
+  group: advisories-${{ github.ref }}-${{ github.event_name }}
+
+jobs:
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: shellcheck
+        run: shellcheck scripts/check-advisories.sh
+      - name: install cargo-audit
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-audit"
+          gh release download cargo-audit/v0.23.0 -R rustsec/rustsec \
+            -p 'cargo-audit-x86_64-unknown-linux-gnu-*.tgz' -O "$RUNNER_TEMP/ca.tgz"
+          tar xzf "$RUNNER_TEMP/ca.tgz" -C "$RUNNER_TEMP/cargo-audit" --strip-components=1
+          echo "$RUNNER_TEMP/cargo-audit" >> "$GITHUB_PATH"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: check advisories
+        run: scripts/check-advisories.sh
