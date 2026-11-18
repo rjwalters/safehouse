@@ -10,6 +10,11 @@ on:
   merge_group:
     types: [checks_requested]
 
+# Least privilege: the single job only reads the checkout and inspects
+# commit messages — contents: read is all it needs (issue #274).
+permissions:
+  contents: read
+
 jobs:
   dco:
     name: sign-off check

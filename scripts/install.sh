@@ -25,7 +25,10 @@
 # SAFEHOUSE_ADMIN_PASSWORD/SAFEHOUSE_ADMIN_ROOM are set when writing a FRESH config, this
 # script calls scripts/provision-host.sh to mint the bot account via Matrix admin-room
 # automation instead of prompting for one — no human action on the homeserver, and
-# allow_registration stays false throughout. Without that env, account creation is still
+# allow_registration stays false throughout. The minted password is handed over via a
+# 0600 file (PROVISION_PASSWORD_FILE, created exclusively by the provisioner and deleted
+# here after the value is read into the config) — never via the terminal or the captured
+# log (issue #274). Without that env, account creation is still
 # a manual admin action on the server — see the pointer printed near the top of a run, or
 # docs/research/2026-07-26-homeserver.md#creating-a-user-on-an-already-running-server
 #
@@ -216,21 +219,42 @@ else
 		[ -n "${SAFEHOUSE_ADMIN_PASSWORD:-}" ] && [ -n "${SAFEHOUSE_ADMIN_ROOM:-}" ]; then
 		step "Minting the bot account via admin-room automation (scripts/provision-host.sh, #94)"
 		HOST_LABEL=${SAFEHOUSE_HOST_LABEL:-$(hostname -s 2>/dev/null || hostname)}
+		# The minted password travels by 0600 file, never by a stream or a
+		# captured log (issue #274): pick a path, let the provisioner create
+		# it exclusively at 0600 (it refuses an existing file), read the
+		# value back from the file, then delete it. The captured provisioner
+		# output holds no credential, so `cat`-ing it on failure is safe.
+		PASSWORD_FILE=$(mktemp "${TMPDIR:-/tmp}/safehoused-password.XXXXXX")
+		rm -f "$PASSWORD_FILE"
+		trap 'rm -f "${PASSWORD_FILE:-}"' EXIT
+		export PROVISION_PASSWORD_FILE="$PASSWORD_FILE"
 		PROV_OUT=$(mktemp "${TMPDIR:-/tmp}/safehoused-provision.XXXXXX")
 		if "$SCRIPT_DIR/provision-host.sh" --host "$HOST_LABEL" >"$PROV_OUT" 2>&1; then
-			cat "$PROV_OUT"
-			USERNAME=$(grep -E '^USERNAME=' "$PROV_OUT" | tail -1 | cut -d= -f2-)
-			PASSWORD=$(grep -E '^PASSWORD=' "$PROV_OUT" | tail -1 | cut -d= -f2-)
-			rm -f "$PROV_OUT"
-			[ -n "$USERNAME" ] && [ -n "$PASSWORD" ] ||
-				die "provision-host.sh did not print USERNAME/PASSWORD — see output above."
+			USERNAME=$(grep -E '^USERNAME=' "$PROV_OUT" | tail -1 | cut -d= -f2- || true)
+			[ -n "$USERNAME" ] || {
+				rm -f "$PROV_OUT"
+				die "provision-host.sh did not print USERNAME — see output above."
+			}
+			[ -f "$PASSWORD_FILE" ] || {
+				rm -f "$PROV_OUT"
+				die "provision-host.sh did not write the password file $PASSWORD_FILE — see output above."
+			}
+			[ -s "$PASSWORD_FILE" ] || {
+				rm -f "$PROV_OUT"
+				die "password file $PASSWORD_FILE is empty — see output above."
+			}
+			PASSWORD=$(cat "$PASSWORD_FILE")
+			rm -f "$PASSWORD_FILE"
 			ok "minted bot account $USERNAME via admin-room automation"
+			info "(password came in via a 0600 file, is now in the config below; file deleted)"
 		else
 			cat "$PROV_OUT" >&2
 			rm -f "$PROV_OUT"
 			die "admin-room account creation failed — see output above, or unset SAFEHOUSE_ADMIN_*
      to fall back to manual entry."
 		fi
+		rm -f "$PROV_OUT"
+		unset PROVISION_PASSWORD_FILE
 	else
 		printf 'Bot username (login only — no @, no :server) [safehouse-bot]: '
 		read -r USERNAME
@@ -320,7 +344,9 @@ step "Verifying boot (login, cross-signing, recovery)"
 stop_service
 
 VERIFY_LOG=$(mktemp "${TMPDIR:-/tmp}/safehoused-verify.XXXXXX")
-trap 'rm -f "$VERIFY_LOG"' EXIT
+# Chained (not replaced): PASSWORD_FILE is empty/unset unless this run
+# provisioned an account, and its file is already gone on the success path.
+trap 'rm -f "${PASSWORD_FILE:-}" "$VERIFY_LOG"' EXIT
 
 "$BIN" "$CONFIG" >"$VERIFY_LOG" 2>&1 &
 VERIFY_PID=$!

@@ -300,6 +300,18 @@ export SAFEHOUSE_FLEET_ROOM='!fleet-room-id:example.com'
 scripts/provision-host.sh --host studio
 ```
 
+**The minted password never touches a terminal or a log (issue #274).** The provisioner writes it
+straight to a `0600` file — the path from `PROVISION_PASSWORD_FILE` if you export one (the file
+must not already exist; it is created exclusively and never overwritten), otherwise a fresh file it
+creates in `$TMPDIR` — and prints only `PASSWORD_FILE=<path>` (plus `USERNAME=<bot>`), so the
+credential cannot leak into scrollback, an agent-session capture, or a CI log. Admin-room replies
+are echoed with any line mentioning a password redacted. `scripts/provision-host.sh` captures the
+provisioner's stdout instead of `tee`-ing it, and in standalone use leaves the password file in
+place for you to deliver out of band (e.g. `scp`, or
+`ssh host 'umask 077; cat > bot-password' < "$PASSWORD_FILE"`). `scripts/install.sh` consumes it
+automatically: it hands over its own `PROVISION_PASSWORD_FILE`, reads the value into the 0600
+config, and deletes the file — the value is never echoed to the terminal.
+
 `scripts/install.sh` calls this automatically when `SAFEHOUSE_ADMIN_*` is present in the
 environment and it is writing a fresh config — see "Running it" above. The manual walkthrough in
 steps 1–4 below remains the documented fallback: it always works, requires no admin-room setup, and
