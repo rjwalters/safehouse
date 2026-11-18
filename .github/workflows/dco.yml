@@ -3,6 +3,12 @@ name: DCO
 on:
   pull_request:
     branches: [main]
+  # Merge queue: re-verify sign-off on the combined queue tree. The
+  # merge group's own SHAs (below) cover every non-merge commit the
+  # queue introduces; GitHub's intermediate merge commits are already
+  # exempt (rev-list --no-merges), matching the DCO app.
+  merge_group:
+    types: [checks_requested]
 
 jobs:
   dco:
@@ -11,11 +17,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full history of the merge-group commit (the checkout default
+          # for merge_group events), so base..head rev-list resolves.
           fetch-depth: 0
       - name: Verify Signed-off-by on every commit
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # pull_request: the PR's own base/head. merge_group: the merge
+          # group's base/head — no PR number exists on that event, and
+          # none is needed; the check only consumes SHAs.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
 
