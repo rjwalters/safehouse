@@ -17,7 +17,9 @@
 //! from the environment at runtime, never baked in — same convention as
 //! `spikes/create-claims-room`), posts the create-user (or deactivate)
 //! command into the admin room, and does a best-effort wait for a reply
-//! before printing the minted credential. It does **not** invite the new bot
+//! before writing the minted credential to a `0600` file whose path it
+//! prints — the value itself never reaches stdout/stderr (issue #274). It
+//! does **not** invite the new bot
 //! into the fleet room — that is a *different* actor (an already-onboarded
 //! host's own daemon, over its unix socket, which is the identity that is
 //! actually a member of the fleet room) and is the second step `scripts/
@@ -28,7 +30,11 @@
 //!
 //! - `create` (onboarding): mints `safehoused-<host>` (or an explicit
 //!   `PROVISION_NEW_USERNAME` override) with a freshly generated password
-//!   unless `PROVISION_NEW_PASSWORD` is set, via `users create_user`.
+//!   unless `PROVISION_NEW_PASSWORD` is set, via `users create_user`. The
+//!   password is written to `PROVISION_PASSWORD_FILE` if that is set
+//!   (created exclusively — an existing file is refused, never overwritten),
+//!   else to a fresh 0600 file in `$TMPDIR`, and only `PASSWORD_FILE=<path>`
+//!   is printed.
 //! - `deactivate` (decommission, #94 acceptance criterion "teardown path"):
 //!   runs `users deactivate` for the host's bot account. Tuwunel mirrors
 //!   Synapse's admin-API deactivate semantics, which force the account to
@@ -43,7 +49,7 @@
 //! itself. A missing/ambiguous ack from the admin room is reported as a
 //! warning, not a failure — the command was still sent, and the operator (or
 //! calling script) can verify with `!admin users list` before trusting the
-//! printed credential.
+//! minted credential.
 //!
 //! Deliberately NOT a persistent session (matches `create-claims-room`): a
 //! fresh login every run, matrix-sdk's default in-memory store, nothing
@@ -53,7 +59,17 @@
 //! directly — see those scripts and the README's operator-setup section for
 //! the full onboarding/decommission flow.
 
-use std::{env, fmt::Write as _, fs, sync::Arc, time::Duration};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::{
+    env,
+    fmt::Write as _,
+    fs,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
@@ -94,15 +110,93 @@ fn generate_password() -> Result<String> {
 }
 
 fn generate_password_from(source: &mut impl std::io::Read) -> Result<String> {
-    let mut buf = [0u8; 32];
-    source
-        .read_exact(&mut buf)
-        .context("reading randomness for generated password")?;
-    let mut hex = String::with_capacity(64);
+    random_hex_from(source, 32)
+}
+
+/// Hex-encodes `bytes` fresh random bytes read from `source`.
+fn random_hex_from(source: &mut impl std::io::Read, bytes: usize) -> Result<String> {
+    let mut buf = vec![0u8; bytes];
+    source.read_exact(&mut buf).context("reading randomness")?;
+    let mut hex = String::with_capacity(bytes * 2);
     for byte in buf {
         write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(hex)
+}
+
+/// Replaces every line of `body` that mentions a password (case-insensitive)
+/// with a fixed redaction marker, so echoing the admin bot's reply to the
+/// terminal can never surface a credential the server may have included in
+/// it (create-user replies are observed to carry `password: <value>`).
+fn redact_reply_lines(body: &str) -> String {
+    body.lines()
+        .map(|line| {
+            if line.to_lowercase().contains("password") {
+                "[redacted: this line mentioned a password]".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The create-mode summary block: username and the path of the file holding
+/// the minted password — never the value itself.
+fn create_summary(homeserver: &str, username: &str, password_file: &Path) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "HOMESERVER={homeserver}");
+    let _ = writeln!(out, "USERNAME={username}");
+    let _ = writeln!(out, "PASSWORD_FILE={}", password_file.display());
+    out
+}
+
+/// Writes `password` to `path` — or, when `path` is `None`, to a fresh file
+/// this function creates in `$TMPDIR` — creating it exclusively (`create_new`:
+/// an existing file is refused, never overwritten or truncated) at mode 0600.
+/// Returns the path written. This is the only place the minted password
+/// leaves the process: a file, never a stream.
+fn write_password_file(path: Option<&Path>, password: &str) -> Result<PathBuf> {
+    if let Some(path) = path {
+        write_exclusive(path, password).with_context(|| {
+            format!(
+                "not writing the password: {} must name a file that does not exist yet \
+                 (created exclusively, never overwritten)",
+                path.display()
+            )
+        })?;
+        Ok(path.to_owned())
+    } else {
+        for _ in 0..3 {
+            let mut file = fs::File::open("/dev/urandom")
+                .context("opening /dev/urandom to name the password file")?;
+            let random = random_hex_from(&mut file, 8).context("naming the password file")?;
+            let candidate = env::temp_dir().join(format!("provision-host-password-{random}"));
+            match write_exclusive(&candidate, password) {
+                Ok(()) => return Ok(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("creating a password file in {}", env::temp_dir().display())
+                    })
+                }
+            }
+        }
+        anyhow::bail!(
+            "could not create a unique password file in {}",
+            env::temp_dir().display()
+        )
+    }
+}
+
+/// Creates `path` exclusively at 0600 and writes `contents` into it.
+fn write_exclusive(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())
 }
 
 /// Substitutes `{user}`/`{password}` in the configured admin-room command
@@ -237,7 +331,8 @@ async fn main() -> Result<()> {
         env::var("PROVISION_NEW_USERNAME").unwrap_or_else(|_| derive_username(&host));
 
     // Only `create` needs a password: it is minted (or read from an
-    // explicit override) here and printed for delivery to the new host.
+    // explicit override) here and written to a 0600 file for delivery to
+    // the new host — never printed.
     // `deactivate` never touches a password — the account is being retired,
     // not logged into.
     let new_password = if is_create {
@@ -318,20 +413,38 @@ async fn main() -> Result<()> {
     .await
     .context("sending admin command")?;
 
+    // The command is away, so the account now exists server-side: the minted
+    // password leaves the process the only safe way — into a 0600 file. A
+    // send failure above means no password file is ever left behind.
+    let password_file_path = if is_create {
+        let caller_path = env::var_os("PROVISION_PASSWORD_FILE").map(PathBuf::from);
+        Some(
+            write_password_file(caller_path.as_deref(), &new_password).context(
+                "writing the minted password to a 0600 file (PROVISION_PASSWORD_FILE if set, \
+                 else a fresh file in $TMPDIR)",
+            )?,
+        )
+    } else {
+        None
+    };
+
     println!(
         "provision-host: waiting up to {ack_timeout_secs}s for a reply in the admin room \
          (best-effort — see module docs; absence of a reply is not treated as failure)"
     );
     match wait_for_ack(&client, &mut rx, Duration::from_secs(ack_timeout_secs)).await {
         Some((sender, body)) => {
-            println!("provision-host: reply from {sender}: {body}");
+            println!(
+                "provision-host: reply from {sender}: {}",
+                redact_reply_lines(&body)
+            );
             if ack_mentions_user(&body, &new_username) {
                 println!("provision-host: reply mentions {new_username:?} — treating as success");
             } else {
                 println!(
                     "provision-host: warning: reply does not mention {new_username:?} — \
-                     verify manually (e.g. `!admin users list`) before trusting the credential \
-                     below"
+                     verify manually (e.g. `!admin users list`) before trusting the minted \
+                     credential"
                 );
             }
         }
@@ -339,7 +452,7 @@ async fn main() -> Result<()> {
             println!(
                 "provision-host: warning: no reply observed within {ack_timeout_secs}s — the \
                  command was sent, but the ack could not be confirmed. Verify manually before \
-                 trusting the credential below."
+                 trusting the minted credential."
             );
         }
     }
@@ -347,15 +460,18 @@ async fn main() -> Result<()> {
     println!();
     println!("==================================================================");
     if is_create {
-        println!("HOMESERVER={homeserver}");
-        println!("USERNAME={new_username}");
-        println!("PASSWORD={new_password}");
+        let file = password_file_path
+            .as_deref()
+            .expect("create mode always writes a password file");
+        print!("{}", create_summary(&homeserver, &new_username, file));
         println!("==================================================================");
         println!(
-            "Deliver USERNAME/PASSWORD to the new host out of band — never write them to a \
-             committed file. The new host consumes these as its normal `username`/`password` \
-             config fields (see safehoused/example-config.toml); scripts/install.sh wires them \
-             in automatically when SAFEHOUSE_ADMIN_* env is present (see README)."
+            "Deliver USERNAME and the password file at {} to the new host out of band — \
+             the password value itself never appears on a stream. The new host consumes \
+             them as its normal `username`/`password` config fields (see \
+             safehoused/example-config.toml); scripts/install.sh wires them in \
+             automatically when SAFEHOUSE_ADMIN_* env is present (see README).",
+            file.display()
         );
     } else {
         println!("HOMESERVER={homeserver}");
@@ -376,6 +492,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn render_command_substitutes_both_placeholders() {
@@ -436,5 +554,83 @@ mod tests {
     fn generate_password_from_errors_on_short_read() {
         let mut source: &[u8] = &[0x01u8; 4]; // fewer than the 32 bytes required
         assert!(generate_password_from(&mut source).is_err());
+    }
+
+    /// The admin bot's reply can echo the minted credential (`password:
+    /// hunter2` in this file's own fixture) — echoing that reply to a
+    /// captured terminal would leak it. The redaction must remove the value.
+    #[test]
+    fn redact_reply_lines_removes_the_password_value() {
+        let reply = "Created user with user_id: @bot-a:example.com and password: hunter2";
+        let redacted = redact_reply_lines(reply);
+        assert!(
+            !redacted.contains("hunter2"),
+            "echoed reply leaked the password value: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_reply_lines_is_case_insensitive_and_keeps_clean_lines() {
+        let reply = "pong\nPASSWORD=hunter2\nnote: Password: hunter2 rotated\nbye";
+        let redacted = redact_reply_lines(reply);
+        assert!(!redacted.contains("hunter2"));
+        let lines: Vec<&str> = redacted.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "pong");
+        assert_eq!(lines[3], "bye");
+    }
+
+    /// The value must be unprintable by construction: the summary takes the
+    /// password's *file path*, not the value, and carries no `PASSWORD=` line
+    /// a downstream consumer could grep the credential out of.
+    #[test]
+    fn create_summary_prints_the_file_path_and_never_the_value() {
+        let summary = create_summary(
+            "https://matrix.example.com",
+            "safehoused-studio",
+            Path::new("/tmp/pw-file"),
+        );
+        assert!(summary.contains("HOMESERVER=https://matrix.example.com"));
+        assert!(summary.contains("USERNAME=safehoused-studio"));
+        assert!(summary.contains("PASSWORD_FILE=/tmp/pw-file"));
+        assert!(
+            !summary.contains("PASSWORD="),
+            "summary carries a PASSWORD= line: {summary}"
+        );
+    }
+
+    #[test]
+    fn write_password_file_writes_exclusive_at_0600_and_refuses_existing() {
+        let path = env::temp_dir().join(format!("provision-host-test-{}-a", std::process::id()));
+        let _ = fs::remove_file(&path);
+        let written = write_password_file(Some(&path), "hunter2").expect("fresh path must succeed");
+        assert_eq!(written, path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hunter2");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "password file must be 0600"
+        );
+        fs::write(&path, "do not clobber").unwrap();
+        assert!(
+            write_password_file(Some(&path), "other").is_err(),
+            "an existing file must be refused, never overwritten"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "do not clobber");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_password_file_creates_its_own_0600_tmp_file() {
+        let written = write_password_file(None, "hunter2").expect("self-chosen path must succeed");
+        assert!(written.starts_with(env::temp_dir()));
+        assert_eq!(fs::read_to_string(&written).unwrap(), "hunter2");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&written).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_file(&written);
     }
 }

@@ -12,6 +12,12 @@ on:
   merge_group:
     types: [checks_requested]
 
+# Least privilege: every job here only reads the checkout (fmt, cargo
+# build/clippy/test, shellcheck, script dry-runs) — nothing publishes or
+# writes back, so contents: read is all any job needs (issue #274).
+permissions:
+  contents: read
+
 concurrency:
   # PR and push runs keep their current groups (per-branch, superseded
   # runs cancel). A merge-group run is keyed by the merge group's
